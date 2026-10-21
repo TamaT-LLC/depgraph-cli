@@ -4192,6 +4192,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn issue_599_completed_store(path: &Path) -> Result<String> {
         let mut store = Store::open(path)?;
         let scan_id = stage_protocol_fixture(
@@ -4203,9 +4204,13 @@ mod tests {
         store.current_snapshot_id()?.context("snapshot")
     }
 
+    #[cfg(unix)]
     #[test]
     fn issue_599_read_cache_reuses_unchanged_store_reads_and_rechecks_after_a_change() -> Result<()>
     {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temporary = tempfile::tempdir()?;
         let path = temporary.path().join("graph.db");
         let snapshot_id = issue_599_completed_store(&path)?;
@@ -4311,6 +4316,55 @@ mod tests {
                 snapshot_hits: 0,
                 snapshot_loads: 1,
             }
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_read_cache_never_records_a_read_of_a_file_renamed_away() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let replacement = temporary.path().join("replacement.db");
+        let snapshot_id = issue_599_completed_store(&path)?;
+        assert_eq!(issue_599_completed_store(&replacement)?, snapshot_id);
+        // The replacement carries the same snapshot and stored seal, but one of
+        // its sealed rows was changed afterwards.
+        {
+            let writer = Store::open(&replacement)?;
+            writer.connection.execute(
+                "UPDATE nodes SET display_name=display_name || '-tampered'
+                  WHERE rowid=(SELECT MIN(rowid) FROM nodes)",
+                [],
+            )?;
+        }
+        for sidecar in ["-wal", "-shm", "-journal"] {
+            let mut name = replacement.as_os_str().to_owned();
+            name.push(sidecar);
+            assert!(!Path::new(&name).exists(), "{sidecar} left behind");
+        }
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        let renamed_away = Store::open_read_only(&path)?;
+        std::fs::rename(&replacement, &path)?;
+        // This handle still reads the original, intact file, but the path now
+        // names the replacement, so it bypasses the cache entirely.
+        renamed_away.completed_snapshot_details(&snapshot_id)?;
+        renamed_away.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+        let error = Store::open_read_only(&path)?
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("the replacement must fail its storage seal");
+        assert!(
+            error.to_string().contains("storage seal mismatch"),
+            "{error:#}"
         );
         read_cache::set_read_cache_enabled_for_test(false);
         Ok(())

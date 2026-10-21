@@ -6,13 +6,16 @@
 //! reconstructs the whole snapshot from SQLite, which takes seconds on a large
 //! store (Issue #599).
 //!
-//! Both kinds of reuse are bound to a [`StoreFileToken`]: the identity and
-//! modification stamps of the store file and its WAL file, the first 100 bytes
-//! of the database header (whose change counter moves on every commit in
-//! rollback-journal mode) and the WAL-index header in the `-shm` file (whose
-//! change counter and frame count move on every WAL commit). Any commit,
-//! checkpoint, WAL reset, file replacement or out-of-band write changes the
-//! token, so a cached result is never reused across a change to the store:
+//! Both kinds of reuse are bound to a [`StoreFileToken`]: the `stat` stamps
+//! (identity, size, modification and inode change times) of the store file and
+//! its WAL file, and a commit generation read from `PRAGMA data_version` on a
+//! read-only watcher connection kept open on the store. SQLite moves that
+//! counter whenever any connection, in this process or another, commits. Any
+//! commit, checkpoint, WAL reset, file replacement or out-of-band write
+//! changes the token, so a cached result is never reused across a change to
+//! the store. The token is only taken when the reading connection still has
+//! the file its path names (`SQLITE_FCNTL_HAS_MOVED`), so a result read from a
+//! renamed-away file is never recorded under the state of its replacement:
 //!
 //! * a storage seal recorded as verified is trusted only while the token equals
 //!   the store state the verification read; and
@@ -29,12 +32,24 @@
 //! files' current state.
 //!
 //! Reuse is off unless the process opts in with [`enable_read_cache`], and it
-//! applies only to read-only connections on a file-backed store, so a writer
-//! that changes rows inside an open transaction always recomputes the seal.
+//! applies only to read-only connections on a file-backed store on Unix, so a
+//! writer that changes rows inside an open transaction always recomputes the
+//! seal.
+//!
+//! What this keeps from the per-read seal check: any change made through
+//! SQLite, any replacement of the file, and any out-of-band write that moves
+//! the file's size, modification time or inode change time is caught on the
+//! next read. What it does not keep: an out-of-band rewrite of the database
+//! body that leaves all of those unchanged, for example one landing within
+//! the same timestamp tick as the read that verified the seal on a file
+//! system with coarse timestamps, or a path switched to another device's file
+//! that happens to have the same inode number (SQLite compares only inode
+//! numbers for `SQLITE_FCNTL_HAS_MOVED`). The seal is an integrity check
+//! stored in the same file, not a defence against a writer who can also
+//! rewrite it, so a long-lived reader accepts this in exchange for not
+//! hashing the whole snapshot on every request.
 
 use std::{
-    fs::File,
-    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
@@ -42,7 +57,7 @@ use std::{
     },
 };
 
-use rusqlite::{Connection, MAIN_DB};
+use rusqlite::{Connection, MAIN_DB, OpenFlags, ffi};
 
 use crate::GraphSnapshot;
 
@@ -88,6 +103,11 @@ pub(crate) struct ReadCacheCounts {
     pub(crate) snapshot_hits: usize,
     pub(crate) snapshot_loads: usize,
 }
+
+/// Serializes the tests that enable the cache: the cache and the watcher are
+/// process-wide, so another such test could change the generation under them.
+#[cfg(test)]
+pub(crate) static TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn take_read_cache_counts_for_test() -> ReadCacheCounts {
@@ -141,60 +161,81 @@ fn cache() -> MutexGuard<'static, ReadCache> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Change stamp of one file: identity (where the platform exposes it), size
-/// and modification time.
+/// Change stamp of one file, taken with `stat` alone: identity and inode
+/// change time (where the platform exposes them), size and modification time.
+///
+/// The file is never opened here. On Unix, closing any descriptor of a file
+/// releases every POSIX advisory lock this process holds on it, including the
+/// locks SQLite connections on other threads rely on, so reading the store
+/// files outside SQLite could let a writer or checkpointer change pages under
+/// an open read transaction. The inode change time cannot be set back by
+/// `touch` or `cp -p`, so an in-place rewrite that restores the modification
+/// time still changes the stamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FileStamp {
     identity: (u64, u64),
+    changed: (i64, i64),
     size: u64,
     modified: std::time::Duration,
 }
 
 impl FileStamp {
-    fn of(file: &File) -> std::io::Result<Self> {
-        let metadata = file.metadata()?;
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
         #[cfg(unix)]
-        let identity = {
+        let (identity, changed) = {
             use std::os::unix::fs::MetadataExt as _;
-            (metadata.dev(), metadata.ino())
+            (
+                (metadata.dev(), metadata.ino()),
+                (metadata.ctime(), metadata.ctime_nsec()),
+            )
         };
         #[cfg(not(unix))]
-        let identity = (0, 0);
+        let (identity, changed) = ((0, 0), (0, 0));
         let modified = metadata
-            .modified()?
+            .modified()
+            .ok()?
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(std::io::Error::other)?;
-        Ok(Self {
+            .ok()?;
+        Some(Self {
             identity,
+            changed,
             size: metadata.len(),
             modified,
         })
     }
 }
 
-/// Observable state of a store's files; see the module documentation.
+/// Observable state of a store; see the module documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoreFileToken {
     database: FileStamp,
-    database_header: Vec<u8>,
     wal: Option<FileStamp>,
-    wal_index_header: Option<Vec<u8>>,
+    /// Changes whenever the watcher connection observes a commit by any
+    /// connection, in this process or another one.
+    generation: u64,
 }
 
 impl StoreFileToken {
-    fn observe(path: &Path) -> Option<Self> {
-        let (database, database_header) = stamp_and_prefix(path, 100)?;
-        let wal = sidecar(path, "-wal")
-            .and_then(|path| stamp_and_prefix(&path, 32))
-            .map(|(stamp, _)| stamp);
-        // Both copies of the WAL-index header (2 x 48 bytes).
-        let wal_index_header =
-            sidecar(path, "-shm").and_then(|path| stamp_and_prefix(&path, 96).map(|(_, h)| h));
+    /// Observes the store at `path` that `connection` reads.
+    ///
+    /// Returns `None` when the state cannot be tied to the file `connection`
+    /// reads: the path was renamed or replaced under it, the file changed while
+    /// being observed, or SQLite could not report its commit counter.
+    fn observe(path: &Path, connection: &Connection) -> Option<Self> {
+        let database = FileStamp::of(path)?;
+        let wal = sidecar(path, "-wal").and_then(|path| FileStamp::of(&path));
+        let generation = commit_generation(path)?;
+        // The reading connection still has the file the path names, and the
+        // path named the same file across the whole observation, so the
+        // watcher, the stamps and `connection` all describe one file.
+        if has_moved(connection)? || FileStamp::of(path).as_ref() != Some(&database) {
+            return None;
+        }
         Some(Self {
             database,
-            database_header,
             wal,
-            wal_index_header,
+            generation,
         })
     }
 }
@@ -205,18 +246,105 @@ fn sidecar(path: &Path, suffix: &str) -> Option<PathBuf> {
     Some(path.with_file_name(name))
 }
 
-fn stamp_and_prefix(path: &Path, length: u64) -> Option<(FileStamp, Vec<u8>)> {
-    let file = File::open(path).ok()?;
-    let stamp = FileStamp::of(&file).ok()?;
-    let mut prefix = Vec::new();
-    file.take(length).read_to_end(&mut prefix).ok()?;
-    Some((stamp, prefix))
+/// A read-only connection kept open on one store to read `PRAGMA
+/// data_version`, which changes between two reads on the same connection
+/// whenever any other connection committed in between. SQLite tracks this
+/// itself from the WAL-index or the database header, under its own locks.
+struct Watcher {
+    path: PathBuf,
+    connection: Connection,
+    data_version: i64,
+    generation: u64,
+}
+
+struct WatchState {
+    watcher: Option<Watcher>,
+    last_generation: u64,
+}
+
+static WATCH: Mutex<WatchState> = Mutex::new(WatchState {
+    watcher: None,
+    last_generation: 0,
+});
+
+/// The commit generation of the store at `path`: unchanged between two calls
+/// only if no connection committed to that store in between.
+fn commit_generation(path: &Path) -> Option<u64> {
+    let mut state = WATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *state;
+    let reusable = state.watcher.as_ref().is_some_and(|watcher| {
+        watcher.path == path && has_moved(&watcher.connection) == Some(false)
+    });
+    if !reusable {
+        // Closing a SQLite connection goes through SQLite's VFS, which keeps
+        // the locks other connections in this process hold on the file.
+        state.watcher = None;
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .ok()?;
+        // Never wait for a writer while holding the process-wide lock: a busy
+        // store just bypasses the cache for this read.
+        connection.busy_timeout(std::time::Duration::ZERO).ok()?;
+        let data_version = data_version(&connection)?;
+        if has_moved(&connection)? {
+            return None;
+        }
+        state.last_generation += 1;
+        state.watcher = Some(Watcher {
+            path: path.to_owned(),
+            connection,
+            data_version,
+            generation: state.last_generation,
+        });
+    }
+    let watcher = state.watcher.as_mut()?;
+    let Some(observed) = data_version(&watcher.connection) else {
+        state.watcher = None;
+        return None;
+    };
+    if observed != watcher.data_version {
+        state.last_generation += 1;
+        watcher.data_version = observed;
+        watcher.generation = state.last_generation;
+    }
+    Some(watcher.generation)
+}
+
+fn data_version(connection: &Connection) -> Option<i64> {
+    connection
+        .query_row("PRAGMA data_version", [], |row| row.get(0))
+        .ok()
+}
+
+/// Whether the file `connection` has open is no longer the one its path names
+/// (`SQLITE_FCNTL_HAS_MOVED`), or `None` when SQLite cannot tell.
+fn has_moved(connection: &Connection) -> Option<bool> {
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: the handle stays valid while `connection` is borrowed, and the
+    // connection is only used from this thread for the call. The database name
+    // is NUL-terminated, and SQLITE_FCNTL_HAS_MOVED writes one int to the
+    // pointer it is given.
+    let status = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&raw mut moved).cast(),
+        )
+    };
+    (status == ffi::SQLITE_OK).then_some(moved != 0)
 }
 
 /// The store path of a connection that may use the cache, or `None` when the
 /// cache is disabled, the store is in memory, or the connection can write.
 fn cacheable_path(connection: &Connection) -> Option<PathBuf> {
-    if !enabled() {
+    // Tying a token to the file a connection reads needs the file identity and
+    // `SQLITE_FCNTL_HAS_MOVED`, which only the Unix VFS provides.
+    if !cfg!(unix) || !enabled() {
         return None;
     }
     if !connection.is_readonly(MAIN_DB).ok()? {
@@ -251,7 +379,7 @@ pub(crate) struct BeforeRead(Option<(PathBuf, StoreFileToken)>);
 
 pub(crate) fn observe_before_read(connection: &Connection) -> BeforeRead {
     BeforeRead(cacheable_path(connection).and_then(|path| {
-        let token = StoreFileToken::observe(&path)?;
+        let token = StoreFileToken::observe(&path, connection)?;
         Some((path, token))
     }))
 }
@@ -289,7 +417,7 @@ pub(crate) fn pin_read(connection: &Connection, before: BeforeRead) -> PinnedRea
             row.get::<_, i64>(0)
         })
         .is_err()
-        || StoreFileToken::observe(&path).as_ref() != Some(&token)
+        || StoreFileToken::observe(&path, connection).as_ref() != Some(&token)
     {
         return inactive;
     }
@@ -333,7 +461,7 @@ fn read_state(connection: &Connection) -> Option<ReadState> {
             })
         });
     }
-    let token = StoreFileToken::observe(&path)?;
+    let token = StoreFileToken::observe(&path, connection)?;
     Some(ReadState {
         path,
         token,
@@ -342,9 +470,10 @@ fn read_state(connection: &Connection) -> Option<ReadState> {
 }
 
 impl ReadState {
-    /// Whether work done since this state was taken saw exactly that state.
-    fn still_current(&self) -> bool {
-        self.pinned || StoreFileToken::observe(&self.path).as_ref() == Some(&self.token)
+    /// Whether work done on `connection` since this state was taken saw
+    /// exactly that state.
+    fn still_current(&self, connection: &Connection) -> bool {
+        self.pinned || StoreFileToken::observe(&self.path, connection).as_ref() == Some(&self.token)
     }
 }
 
@@ -373,7 +502,7 @@ where
         return Ok(());
     }
     verify()?;
-    if state.still_current() {
+    if state.still_current(connection) {
         let mut cache = cache();
         cache
             .seals
@@ -421,7 +550,7 @@ where
     drop(stale);
     count(|counts| counts.snapshot_loads += 1);
     let snapshot = Arc::new(load()?);
-    if state.still_current() {
+    if state.still_current(connection) {
         cache().snapshot = Some(CachedSnapshot {
             path: state.path,
             snapshot_id: snapshot_id.to_owned(),
