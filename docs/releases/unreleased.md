@@ -34,7 +34,7 @@ Go worker が出す file node（通常の Go ソース、アセンブリ、`//go
 
 ## Go の symbol / type に宣言元の位置を持たせ、health の location に行番号を出す
 
-Go worker が出す symbol（名前付き、ローカル、クロージャ、package の初期化）と type のノードに、宣言元ファイルのリポジトリ相対パス `source_path` と、宣言の範囲 `source_span`（`start_line` / `start_column` / `end_line` / `end_column`、1 始まり）を記録する（[#596](https://github.com/TamaT-LLC/depgraph-cli/issues/596)）。Rust / Web worker の symbol / type と同じ形で、値は `declares` relation の evidence と同じ位置になる。generic の instance は、もとの generic の宣言の位置を持つ。
+Go worker が出す symbol（名前付き、ローカル、クロージャ、package の初期化）と type のノードに、宣言元ファイルのリポジトリ相対パス `source_path` と、宣言の範囲 `source_span`（`start_line` / `start_column` / `end_line` / `end_column`、1 始まり）を記録する（[#596](https://github.com/TamaT-LLC/depgraph-cli/issues/596)）。Rust / Web worker の symbol / type と同じ形で、値は `declares` relation の evidence と同じ位置になる。generic の instance は、もとの generic の宣言の位置を持つ。package 単位に分割した scan で、ある unit が別の unit の package の symbol / type を参照するとき（依存側は export data から読む）も、その unit は宣言元の unit と同じ `source_path` / `source_span` を出す。分割の仕方によってノードの property は変わらない。
 これまで Go の symbol / type は宣言元のパスも行番号も property に持たなかったため、hotspot と `unused-export` / `unused-type` の `location` が null で、Git churn は 0 だった。
 
 あわせて core の health が、入れ子の `source_span` から行・列を読むようにする。これまで `unused-export` / `unused-type` はトップレベルの `start_line` などしか読まず、hotspot は行番号を常に空にしていたため、Rust / Web の symbol / type も `location` にパスしかなかった。
