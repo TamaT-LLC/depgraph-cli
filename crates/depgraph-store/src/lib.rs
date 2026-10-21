@@ -5093,6 +5093,10 @@ mod tests {
                 || false,
             )
             .expect_err("paged projection must reject the same build delta corruption");
+        let node_id = base.nodes[0].id.clone();
+        store
+            .find_completed_snapshot_node(&snapshot_id, &node_id, || false)
+            .expect_err("single-node projection must reject the same build delta corruption");
         Ok(())
     }
 
@@ -5126,6 +5130,10 @@ mod tests {
                 || false,
             )
             .expect_err("paged projection must reject non-node snapshot tampering");
+        let node_id = store.load_snapshot("scan-golden")?.nodes[0].id.clone();
+        store
+            .find_completed_snapshot_node(&snapshot_id, &node_id, || false)
+            .expect_err("single-node projection must reject non-node snapshot tampering");
         Ok(())
     }
 
