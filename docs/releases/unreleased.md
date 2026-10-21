@@ -13,6 +13,26 @@ v0.7.1 で MCP のエラー応答に原因の詳細を含めた（[#565](https:/
 - impact、health、hotspot、snapshot diff、policy、export の上限超過の `RESOURCE_EXHAUSTED` に `kind: "resource_limit"` の details を付ける。`limit` に `impact_nodes` / `impact_edges`（`max_nodes` / `max_edges` で広げられる）、`impact_path_steps`、`changed_paths`、`health_findings`、`health_finding_items`、`health_manifests`、`artifact_items`、`artifact_work_items`、`export_nodes` / `export_edges`（`max_nodes` / `max_edges`）を追加する。health と hotspot の作業量の上限は、既存の `preprocessing_work_items` として返す。
 - `graph_export` のセレクターに一致するノードがない場合は、依存一覧と同じく `NOT_FOUND`（`argument: "selector"`、`reason: "no_matching_node"`）を返す。これまでは details のない `INVALID_ARGUMENT` だった。CLI の `export` も、上限やセレクターの失敗を同じ文言で示す。終了コードは変えない。
 
+## 既定の max_traversal で cycles と unresolved が失敗する問題を直す
+
+約 250 ファイル規模のリポジトリでも、CLI の `depgraph unresolved` / `depgraph cycles` と MCP の `graph_unresolved_list` / `graph_cycles_list` が、既定の `max_traversal`（50,000）のまま `RESOURCE_EXHAUSTED` で失敗していた問題を直す（[#617](https://github.com/TamaT-LLC/depgraph-cli/issues/617)、[#618](https://github.com/TamaT-LLC/depgraph-cli/issues/618)）。
+どちらも、返す件数とは関係なく snapshot 全体の索引（全 node・edge・evidence・site・profile correlation）を `max_traversal` で数えていた。生成したフィクスチャ（node 25,251、site 23,500 のうち unresolved 6,750、edge 30,000、evidence 53,500）では、索引だけで unresolved が 130,501、file 単位の cycles が 55,751 になり、既定値を超えていた。`limit` / `--max-items` で絞っても減らなかった。
+
+- snapshot の索引、cycle 探索の node ごとの手順、結果の組み立ては、`max_traversal` ではなく固定の上限（16,000,000。hotspot の作業量の上限と同じ値）で数える。上のフィクスチャで unresolved は 187,751、file 単位の cycles は 57,301 になる。
+- `cycles` / `graph_cycles_list` の `max_traversal` は、cycle 探索が訪れる依存 edge の数を数える（依存一覧の `max_traversal` と同じ意味）。上のフィクスチャの file 単位では 750。
+- `unresolved` / `graph_unresolved_list` の `max_traversal` は、`--kind` / `kinds` に一致した unresolved site の数を数える。上のフィクスチャでは 6,750。
+- 上限に当たったときは、MCP の `RESOURCE_EXHAUSTED` に `{"kind":"resource_limit","limit":"traversal_items","maximum":…,"argument":"max_traversal"}` を付け、unresolved では一致した site の数を `observed` に入れる。引数を上げれば通る場合の `remediation` は `increase_limit` になる。固定の上限に当たった場合は `limit: "preprocessing_work_items"` と `narrow_query` を返す。CLI のメッセージにも上限名と値を出す（例: `request exhausted a service resource limit: max_traversal=6749 (observed 6750)`）。終了コードは 3 のまま。
+- 範囲外の `max_traversal` には許される範囲を示す。CLI は `invalid service input: max_traversal must be in 1..=1000000`（終了コード 2 のまま）、MCP は `INVALID_ARGUMENT` の `details`（`kind: "argument"`、`reason: "out_of_range"`）に任意フィールド `minimum` / `maximum` を付ける。CLI では `deps` / `dependents` / `why` も同じメッセージになる。
+- #618 の「CLI の `depgraph cycles` は成功し、MCP の `graph_cycles_list` は失敗する」という食い違いは、計測時に CLI と MCP が別々の scan（別の Store と snapshot）を読んでいたことによる。CLI と MCP は同じ既定値で同じ関数を呼ぶので、作業量が 50,000 付近の snapshot では、snapshot のわずかな差で結果が分かれ得る。上のフィクスチャでも、file あたりの symbol を 40 にすると（node 10,251）修正前の file 単位の cycles は 40,751 で通り、100 にすると（node 25,251）55,751 で失敗した。同じ Store では CLI と MCP が同じ cycle を返すことを回帰テストで確かめた。
+
+互換性:
+
+- 既定値（50,000）と上限（1,000,000）は変えない。`deps` / `dependents` / `impact` / `why` の作業量の数え方と既定値も変えない。
+- `cycles` / `unresolved` の `max_traversal` の意味が変わる。unresolved は、一致した site の数が従来の組み立ての作業量より少ないので、従来の値で通っていた要求はそのまま通り、より小さな値（例: unresolved site 1 件の snapshot に `max_traversal: 1`）でも通るようになる。cycles も多くの場合はより小さな値で通るが、node 数に比べて edge の多い cycle では、順方向・逆方向・代表 cycle の探索で訪れる edge の合計が従来の段階ごとの作業量を上回り、従来通っていた値で上限に当たることがある。
+- `graph_cycles_list` / `graph_unresolved_list` の上限超過は、details のない `RESOURCE_EXHAUSTED`（`narrow_query`）から、details 付きの `RESOURCE_EXHAUSTED`（多くは `increase_limit`）に変わる。site ごとの evidence 数などの構造上の上限は、従来どおり details なしで返す。
+- core の `DepgraphServiceError` に variant `ArgumentOutOfRange` が加わる。範囲外の `max_traversal` は `InvalidInput` ではなくこの variant になる。網羅的に match している `depgraph-core` の利用者は更新が要る。
+- `depgraph-mcp-tools` の `AgentErrorDetails::Argument` に任意フィールド `minimum` / `maximum` が加わる。範囲を持たない値のシリアライズ結果は従来と同じ。`deny_unknown_fields` で Deserialize している古い crate の利用者は、受け取るために crate を更新する。shared schema（`depgraph-mcp-tools-v1`）と tool catalog の digest が変わる。`contract_version` は変えない。
+
 ## Go の file node にリポジトリ相対パスを持たせる
 
 Go worker が出す file node（通常の Go ソース、アセンブリ、`//go:embed` の対象）に、リポジトリ相対パスの `path` property を記録する（[#591](https://github.com/TamaT-LLC/depgraph-cli/issues/591)）。

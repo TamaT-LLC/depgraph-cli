@@ -60,10 +60,11 @@ pub use crate::service_lifecycle::{DoctorRequest, DoctorResponse, ProfilePlanReq
 pub use crate::service_limits::{
     MAX_CYCLE_NODE_IDS, MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_EVIDENCE_ITEMS,
     MAX_GRAPH_PHASE_COVERAGE_ITEMS, MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
-    MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_EVIDENCE_PER_FINDING,
-    MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, MAX_HEALTH_MANIFEST_BYTES, MAX_HEALTH_MANIFESTS,
-    MAX_HEALTH_PLANNER_ROWS, MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH,
-    MAX_HEALTH_RANGES, MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
+    MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS, MAX_HEALTH_BLOCKERS_PER_FINDING, MAX_HEALTH_CHURN_COMMITS,
+    MAX_HEALTH_EVIDENCE_PER_FINDING, MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS,
+    MAX_HEALTH_MANIFEST_BYTES, MAX_HEALTH_MANIFESTS, MAX_HEALTH_PLANNER_ROWS,
+    MAX_HEALTH_RANGE_CHECKPOINT_BYTES, MAX_HEALTH_RANGE_RESPLIT_DEPTH, MAX_HEALTH_RANGES,
+    MAX_HEALTH_REMEDIATIONS_PER_FINDING, MAX_HEALTH_SUPPRESSIONS_PER_FINDING,
     MAX_HEALTH_TOTAL_MANIFEST_BYTES, MAX_HOTSPOT_PATH_BYTES, MAX_IMPACT_MATERIALIZED_PATH_STEPS,
     MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
 };
@@ -793,6 +794,14 @@ pub enum DepgraphServiceError {
     },
     #[error("policy input is invalid")]
     PolicyInput,
+    /// `InvalidInput` for a numeric request argument outside its accepted
+    /// range, naming the argument and the range (Issue #617).
+    #[error("invalid service input: {argument} must be in {minimum}..={maximum}")]
+    ArgumentOutOfRange {
+        argument: &'static str,
+        minimum: u64,
+        maximum: u64,
+    },
     #[error("requested service resource was not found")]
     NotFound,
     #[error("request conflicts with the current service state")]
@@ -845,6 +854,7 @@ impl DepgraphServiceError {
             Self::CapabilityDenied { .. } => DepgraphServiceErrorCategory::Authorization,
             Self::InvalidRepositoryPath { .. }
             | Self::InvalidInput
+            | Self::ArgumentOutOfRange { .. }
             | Self::ProfilePlan { .. }
             | Self::GraphQuery { .. }
             | Self::BoundedQueryInput { .. }
@@ -916,15 +926,17 @@ impl DepgraphServiceError {
 /// Service bounds that `DepgraphServiceError::ResourceLimitExceeded` names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DepgraphResourceLimit {
-    /// Edge visits of one graph traversal, set by the request's
+    /// Edge visits of one graph traversal or cycle search, or the unresolved
+    /// sites one unresolved listing returns, set by the request's
     /// `max_traversal` (CLI `--max-traversal`).
     MaxTraversal,
     /// Snapshot edges dependency traversal inspects while building its
     /// adjacency, bounded by the fixed interactive traversal ceiling.
     AdjacencyEdgeInspection,
     /// Snapshot-wide preprocessing work items: selector resolution, path
-    /// search adjacency, traversal postprocessing, and the per-phase health
-    /// analysis budget.
+    /// search adjacency, traversal postprocessing, the per-phase health
+    /// analysis budget, hotspot analysis, and the snapshot indexing of cycle
+    /// and unresolved listing.
     PreprocessingWorkItems,
     /// Unique nodes an impact traversal keeps, set by its `max_nodes`.
     ImpactNodes,

@@ -6826,7 +6826,9 @@ fn dependency_and_path_cli_reject_traversal_above_the_shared_maximum() {
             .args(arguments)
             .assert()
             .code(2)
-            .stderr(predicate::str::contains("invalid service input"));
+            .stderr(predicate::str::contains(
+                "invalid service input: max_traversal must be in 1..=1000000",
+            ));
     }
 }
 

@@ -593,6 +593,14 @@ pub enum AgentErrorDetails {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         argument: Option<AgentToken>,
         reason: AgentArgumentReason,
+        /// Smallest accepted value of an `out_of_range` numeric argument,
+        /// when the server knows it (Issue #617).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum: Option<u64>,
+        /// Largest accepted value of an `out_of_range` numeric argument,
+        /// when the server knows it (Issue #617).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        maximum: Option<u64>,
     },
     /// Where a bounded graph query failed to parse or type-check. The query
     /// text is never echoed; `line`, `column`, and `byte_offset` locate the
@@ -630,6 +638,20 @@ impl AgentErrorDetails {
         Self::Argument {
             argument: argument.and_then(|name| AgentToken::parse(name).ok()),
             reason,
+            minimum: None,
+            maximum: None,
+        }
+    }
+
+    /// An `out_of_range` numeric argument with its accepted range
+    /// (Issue #617).
+    #[must_use]
+    pub fn argument_out_of_range(argument: &str, minimum: u64, maximum: u64) -> Self {
+        Self::Argument {
+            argument: AgentToken::parse(argument).ok(),
+            reason: AgentArgumentReason::OutOfRange,
+            minimum: Some(minimum),
+            maximum: Some(maximum),
         }
     }
 }

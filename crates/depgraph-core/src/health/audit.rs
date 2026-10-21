@@ -367,7 +367,10 @@ fn cycle_identities(
 fn map_cycle_error(error: DepgraphServiceError) -> HealthAnalysisError {
     match error {
         DepgraphServiceError::Cancelled => HealthAnalysisError::Cancelled,
-        DepgraphServiceError::ResourceExhausted => HealthAnalysisError::ResourceExhausted,
+        DepgraphServiceError::ResourceExhausted
+        | DepgraphServiceError::ResourceLimitExceeded { .. } => {
+            HealthAnalysisError::ResourceExhausted
+        }
         _ => HealthAnalysisError::Integrity,
     }
 }

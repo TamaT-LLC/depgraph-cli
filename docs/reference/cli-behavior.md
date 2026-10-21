@@ -63,6 +63,17 @@ framing). A traversal-limit result has no continuation after its admitted result
 `--max-traversal` or narrow filters. `--all` preserves the legacy complete
 query shape, while `export` remains the streaming full-graph interface.
 
+For `cycles`, `--max-traversal` (default 50,000) bounds the dependency edges
+the cycle search visits. For `unresolved`, it bounds the unresolved sites that
+match `--kind`; `--max-items` only pages those matches. Both commands also
+index the whole snapshot, which is bounded separately by a fixed 16,000,000
+work items rather than by `--max-traversal`. A request that hits a bound exits
+with code 3 and names it, for example
+`request exhausted a service resource limit: max_traversal=50000 (observed 61234)`,
+where `observed` is the number of matching unresolved sites. A
+`--max-traversal` outside `1..=1000000` exits with code 2 and
+`invalid service input: max_traversal must be in 1..=1000000`.
+
 ## Profile planning
 
 `profiles plan` is read-only and uses only a bounded static inventory. Its human

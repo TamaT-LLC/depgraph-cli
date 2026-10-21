@@ -2087,6 +2087,12 @@ fn issue_565_errors_name_the_limit_the_argument_and_a_missing_node() {
         if let Some(argument) = argument {
             expected["argument"] = json!(argument);
         }
+        // An out-of-range max_traversal also carries its accepted range
+        // (Issue #617).
+        if argument == Some("max_traversal") {
+            expected["minimum"] = json!(1);
+            expected["maximum"] = json!(1_000_000);
+        }
         assert_eq!(error["details"], expected, "request {id}");
         assert!(!error.to_string().contains("PRIVATE_DETAIL"));
     }
@@ -11885,4 +11891,226 @@ fn issue_566_import_names_fan_in_and_context_summary_are_opt_in() {
         "path_prefixes"
     );
     mcp.finish();
+}
+
+#[path = "../../depgraph-core/tests/support/issue_617_fixture.rs"]
+mod issue_617_fixture;
+
+/// Issues #617 / #618: on a snapshot of about 250 files, the CLI and MCP list
+/// unresolved sites and cycles with the default `max_traversal`, return the
+/// same cycles, and name the bound when a request is too small.
+#[test]
+fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_by_default() {
+    use issue_617_fixture::{Issue617Shape, seed_issue_617_graph};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let shape = Issue617Shape::MID_SIZED;
+    let mut store = Store::open(&store_path).unwrap();
+    seed_issue_617_graph(&mut store, &root, shape).unwrap();
+    drop(store);
+    let unresolved_count = shape.files * shape.unresolved_per_file;
+    let cycle_count = shape.files / shape.ring;
+    let ring_edge_visits = shape.files * 3;
+
+    let cli = |arguments: &[&str]| {
+        let binary = AssertCommand::cargo_bin("depgraph").unwrap();
+        Command::new(binary.get_program())
+            .args(binary.get_args())
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store_path)
+            .args(arguments)
+            .output()
+            .unwrap()
+    };
+    let cli_json = |arguments: &[&str]| {
+        let output = cli(arguments);
+        assert!(
+            output.status.success(),
+            "CLI {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+
+    // CLI with the default max_traversal.
+    let cli_unresolved = cli_json(&["unresolved", "--max-items", "5", "--json"]);
+    assert_eq!(cli_unresolved["items"].as_array().unwrap().len(), 5);
+    assert_eq!(cli_unresolved["total_items"], unresolved_count as u64);
+    assert_eq!(
+        cli_unresolved["traversed_items"], unresolved_count as u64,
+        "{cli_unresolved}"
+    );
+    let cli_cycles = cli_json(&["cycles", "--json"]);
+    let cli_cycle_ids = cli_cycles["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{cli_cycles}"))
+        .iter()
+        .map(|cycle| cycle["node_ids"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(cli_cycle_ids.len(), cycle_count);
+
+    // MCP with the default max_traversal.
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let arguments = |extra: Value| {
+        let mut arguments = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        for (key, value) in extra.as_object().unwrap() {
+            arguments[key] = value.clone();
+        }
+        arguments
+    };
+    let success_of = |result: &Value| -> Value {
+        assert_eq!(result["isError"], false, "{result}");
+        assert_tool_text_matches_structured(result);
+        shared.validate(&result["structuredContent"]).unwrap();
+        result["structuredContent"]["result"].clone()
+    };
+    let error_of = |result: &Value| -> Value {
+        assert_eq!(result["isError"], true, "{result}");
+        assert_tool_text_matches_structured(result);
+        shared.validate(&result["structuredContent"]).unwrap();
+        result["structuredContent"]["error"].clone()
+    };
+    let unresolved = success_of(&interactive_tool_call(
+        &mut mcp,
+        2,
+        "graph_unresolved_list",
+        arguments(json!({"limit": 5})),
+    ));
+    assert_eq!(unresolved["items"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        unresolved["total_items"], unresolved_count as u64,
+        "{unresolved}"
+    );
+    let cycles = success_of(&interactive_tool_call(
+        &mut mcp,
+        3,
+        "graph_cycles_list",
+        arguments(json!({"level": "file", "limit": 100})),
+    ));
+    let mcp_cycle_ids = cycles["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|cycle| cycle["node_ids"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mcp_cycle_ids, cli_cycle_ids,
+        "CLI and MCP return the same cycles"
+    );
+    for level in ["package", "symbol"] {
+        success_of(&interactive_tool_call(
+            &mut mcp,
+            4,
+            "graph_cycles_list",
+            arguments(json!({"level": level})),
+        ));
+    }
+
+    // A max_traversal below the matching unresolved sites names the bound and
+    // how many sites matched.
+    assert_eq!(
+        error_of(&interactive_tool_call(
+            &mut mcp,
+            5,
+            "graph_unresolved_list",
+            arguments(json!({"max_traversal": unresolved_count - 1})),
+        )),
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "traversal_items",
+                "maximum": unresolved_count - 1,
+                "observed": unresolved_count,
+                "argument": "max_traversal"
+            }
+        })
+    );
+    assert_eq!(
+        error_of(&interactive_tool_call(
+            &mut mcp,
+            6,
+            "graph_cycles_list",
+            arguments(json!({"max_traversal": ring_edge_visits - 1})),
+        )),
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "traversal_items",
+                "maximum": ring_edge_visits - 1,
+                "argument": "max_traversal"
+            }
+        })
+    );
+    for (id, name) in [(7, "graph_unresolved_list"), (8, "graph_cycles_list")] {
+        assert_eq!(
+            error_of(&interactive_tool_call(
+                &mut mcp,
+                id,
+                name,
+                arguments(json!({"max_traversal": 1_000_001})),
+            )),
+            json!({
+                "code": "INVALID_ARGUMENT",
+                "category": "input",
+                "retryable": false,
+                "remediation": "correct_input",
+                "details": {
+                    "kind": "argument",
+                    "argument": "max_traversal",
+                    "reason": "out_of_range",
+                    "minimum": 1,
+                    "maximum": 1_000_000
+                }
+            }),
+            "{name}"
+        );
+    }
+
+    // The CLI names the same bounds, with the resource exit code 3 and the
+    // invalid input exit code 2.
+    let unresolved_short = (unresolved_count - 1).to_string();
+    let cycles_short = (ring_edge_visits - 1).to_string();
+    for (arguments, code, message) in [
+        (
+            vec!["unresolved", "--max-traversal", unresolved_short.as_str()],
+            3,
+            format!(
+                "request exhausted a service resource limit: max_traversal={unresolved_short} \
+                 (observed {unresolved_count})"
+            ),
+        ),
+        (
+            vec!["cycles", "--max-traversal", cycles_short.as_str()],
+            3,
+            format!("request exhausted a service resource limit: max_traversal={cycles_short}"),
+        ),
+        (
+            vec!["unresolved", "--max-traversal", "10000000"],
+            2,
+            "invalid service input: max_traversal must be in 1..=1000000".to_owned(),
+        ),
+    ] {
+        let output = cli(&arguments);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{arguments:?}: {stderr}");
+        assert!(stderr.contains(&message), "{arguments:?}: {stderr}");
+    }
 }

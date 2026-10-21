@@ -964,7 +964,21 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Hotspot limits | Issue #590でhotspotの上限はhealth共通の値から専用の値に変わった。`health_hotspots_list`の作業量は`MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS`（16,000,000）、subject数と返却件数は`MAX_HOTSPOT_SUBJECTS`（250,000）で、detailsの`limit`は`preprocessing_work_items` / `health_findings`のまま、`maximum`はこの専用の値を返す |
 | Remediation | `increase_limit`は引数で広げられ、上限値がその引数の最大値（`max_traversal`とimpactの`max_nodes` / `max_edges`は1,000,000、exportは50,000 / 100,000）未満のときだけ。`DepgraphResourceLimit::argument_ceiling`で判定する |
 | Export selector | `graph_export`のselector解決失敗を依存一覧と同じ`SelectorResolutionFailure`のtag付きgraph query errorにし、`NOT_FOUND` / `no_matching_node`を返す |
-| Not in scope | `graph_cycles_list` / `graph_unresolved_list`のphase作業量、bounded query、lifecycle、repository操作の`ResourceExhausted`はdetailsなしのまま |
+| Not in scope | `graph_cycles_list` / `graph_unresolved_list`のphase作業量、bounded query、lifecycle、repository操作の`ResourceExhausted`はdetailsなしのまま（`graph_cycles_list` / `graph_unresolved_list`はIssue #617 / #618でdetailsを返すようになった） |
+
+## Issue #617 / #618 cycle and unresolved work bounds
+
+`graph_cycles_list` / `graph_unresolved_list`（CLI `cycles` / `unresolved`）は、snapshot全体の索引（全node・edge・evidence・site・profile correlation）を`max_traversal`（既定50,000）で数えていたため、約250ファイルの規模で既定値のまま`RESOURCE_EXHAUSTED`になった。依存一覧と同じく、requestが求める分だけを`max_traversal`で数える。
+
+| Area | Evidence |
+| --- | --- |
+| Snapshot scan | 索引、cycle探索のnodeごとの手順、結果の組み立てを、固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000、hotspotの作業量上限と同じ値）で数える。超えたら`preprocessing_work_items`（`argument`なし、`narrow_query`） |
+| Cycles | `max_traversal`はcycle探索が訪れる隣接edgeの数（Kosarajuの順方向・逆方向、代表cycleのBFS）。超えたら`traversal_items`、`argument: "max_traversal"`。必要な総数は分からないので`observed`は返さない |
+| Unresolved | `max_traversal`は`kinds`に一致したunresolved siteの数。組み立てる前に数え、超えたら`traversal_items`と`observed`（一致した数）を返す。`limit` / `cursor`はページングだけで、上限には効かない |
+| Remediation | `increase_limit`は、上限値が引数の最大値（1,000,000）未満で、かつ`observed`があればそれも最大値以下のとき。`observed`が最大値を超えるunresolvedは`narrow_query` |
+| Out of range | 範囲外の`max_traversal`は、core が`DepgraphServiceError::ArgumentOutOfRange { argument, minimum, maximum }`（`invalid service input: max_traversal must be in 1..=1000000`）、MCPが`argument` variantに任意field `minimum` / `maximum`を付けた`INVALID_ARGUMENT`を返す。範囲を持たない`argument`は変更前とbyte単位で同一 |
+| Health audit | health の cycle 検出は従来どおり自前の分析予算を cancellation callback で数え、cycle の上限超過（`ResourceLimitExceeded`を含む）を分析の`ResourceExhausted`へ写す |
+| Deterministic artifacts | shared schema（`argument`の`minimum` / `maximum`）、catalog JSON（`max_traversal`の説明）、各SHA-256 fixtureを再生成する |
 
 ## Issue #568 standard schema formats
 

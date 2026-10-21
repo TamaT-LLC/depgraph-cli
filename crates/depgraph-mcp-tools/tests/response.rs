@@ -291,6 +291,81 @@ fn issue_565_resource_limits_name_the_bound_the_work_and_the_argument() {
 }
 
 #[test]
+fn issue_617_unresolved_and_cycle_limits_and_out_of_range_arguments_are_named() {
+    use depgraph_core::DepgraphResourceLimit;
+
+    // Unresolved listing reports how many sites matched; a larger
+    // max_traversal succeeds while that count fits under the ceiling.
+    assert_eq!(
+        mapped_error(&DepgraphServiceError::resource_limit(
+            DepgraphResourceLimit::MaxTraversal,
+            50_000,
+            Some(61_234),
+        )),
+        json!({
+            "code": "RESOURCE_EXHAUSTED",
+            "category": "resource",
+            "retryable": false,
+            "remediation": "increase_limit",
+            "details": {
+                "kind": "resource_limit",
+                "limit": "traversal_items",
+                "maximum": 50_000,
+                "observed": 61_234,
+                "argument": "max_traversal"
+            }
+        })
+    );
+    // More matches than the ceiling admits: raising cannot help.
+    let beyond = mapped_error(&DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::MaxTraversal,
+        50_000,
+        Some(1_000_001),
+    ));
+    assert_eq!(beyond["remediation"], "narrow_query");
+    assert_eq!(beyond["details"]["argument"], "max_traversal");
+    // The cycle search does not know the total edge visits it needs.
+    let cycles = mapped_error(&DepgraphServiceError::resource_limit(
+        DepgraphResourceLimit::MaxTraversal,
+        50_000,
+        None,
+    ));
+    assert_eq!(cycles["remediation"], "increase_limit");
+    assert!(cycles["details"].get("observed").is_none(), "{cycles}");
+
+    let out_of_range = DepgraphServiceError::ArgumentOutOfRange {
+        argument: "max_traversal",
+        minimum: 1,
+        maximum: 1_000_000,
+    };
+    assert_eq!(
+        mapped_error(&out_of_range),
+        json!({
+            "code": "INVALID_ARGUMENT",
+            "category": "input",
+            "retryable": false,
+            "remediation": "correct_input",
+            "details": {
+                "kind": "argument",
+                "argument": "max_traversal",
+                "reason": "out_of_range",
+                "minimum": 1,
+                "maximum": 1_000_000
+            }
+        })
+    );
+    // Argument details without a range keep their previous wire shape.
+    assert_eq!(
+        serde_json::to_value(depgraph_mcp_tools::AgentErrorDetails::argument(
+            Some("limit"),
+            depgraph_mcp_tools::AgentArgumentReason::OutOfRange,
+        ))
+        .unwrap(),
+        json!({"kind": "argument", "argument": "limit", "reason": "out_of_range"})
+    );
+}
+
+#[test]
 fn issue_581_impact_health_and_artifact_limits_are_named() {
     use depgraph_core::DepgraphResourceLimit;
 

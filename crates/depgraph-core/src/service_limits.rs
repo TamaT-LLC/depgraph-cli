@@ -33,6 +33,23 @@ pub const MAX_IMPACT_MATERIALIZED_PATH_STEPS: usize = 50_000;
 pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
     crate::query::MAX_INTERACTIVE_QUERY_TRAVERSAL;
 
+/// Maximum snapshot-wide work of one cycle or unresolved listing: indexing
+/// every node, edge, evidence record, site, and profile correlation, the
+/// per-node steps of the cycle search, and the materialization of the
+/// returned items.
+///
+/// Each snapshot record is visited a bounded number of times, so this work
+/// grows with the snapshot rather than with the request, and the ceiling is
+/// the one hotspot analysis uses for its whole-snapshot work
+/// ([`MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS`]). Request `max_traversal` bounds only what the request asks for: the edge visits of
+/// the cycle search and the unresolved sites returned. Counting the whole
+/// snapshot against `max_traversal` (default 50,000) made both listings fail
+/// on a snapshot of about 250 files (Issues #617 / #618). A generated snapshot
+/// of that shape (23,500 sites, 6,750 of them unresolved, 30,000 edges,
+/// 53,500 evidence records, 25,251 nodes) uses 187,751 items for unresolved
+/// listing and 57,301 for file-level cycles.
+pub const MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS: usize = 16_000_000;
+
 /// Maximum findings in one health response or one analyzed range. Summary
 /// counts may span more ranges without retaining all of their finding bodies.
 pub const MAX_HEALTH_FINDINGS: usize = 10_000;

@@ -359,6 +359,18 @@ fn map_service_error(source: &DepgraphServiceError) -> AgentError {
             AgentRemediation::CorrectInput,
             query_diagnostic_details(diagnostic),
         ),
+        DepgraphServiceError::ArgumentOutOfRange {
+            argument,
+            minimum,
+            maximum,
+        } => AgentError::new(
+            AgentErrorCode::InvalidArgument,
+            false,
+            AgentRemediation::CorrectInput,
+            Some(AgentErrorDetails::argument_out_of_range(
+                argument, *minimum, *maximum,
+            )),
+        ),
         DepgraphServiceError::InvalidInput
         | DepgraphServiceError::ProfilePlan { .. }
         | DepgraphServiceError::RuntimeTraceInput { .. }
@@ -557,10 +569,12 @@ fn map_resource_limit(
         DepgraphResourceLimit::OutputBytes => AgentResourceLimit::OutputBytes,
     };
     let argument = limit.argument();
+    // Raising the argument helps only below its ceiling, and only when the
+    // work that was needed (when known) fits under that ceiling.
     let raisable = argument.is_some()
-        && limit
-            .argument_ceiling()
-            .is_some_and(|ceiling| maximum < ceiling);
+        && limit.argument_ceiling().is_some_and(|ceiling| {
+            maximum < ceiling && observed.is_none_or(|observed| observed <= ceiling)
+        });
     AgentError::new(
         AgentErrorCode::ResourceExhausted,
         false,
