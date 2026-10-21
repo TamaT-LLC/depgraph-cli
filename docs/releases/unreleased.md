@@ -33,6 +33,21 @@ v0.7.1 で MCP のエラー応答に原因の詳細を含めた（[#565](https:/
 - core の `DepgraphServiceError` に variant `ArgumentOutOfRange` が加わる。範囲外の `max_traversal` は `InvalidInput` ではなくこの variant になる。網羅的に match している `depgraph-core` の利用者は更新が要る。
 - `depgraph-mcp-tools` の `AgentErrorDetails::Argument` に任意フィールド `minimum` / `maximum` が加わる。範囲を持たない値のシリアライズ結果は従来と同じ。`deny_unknown_fields` で Deserialize している古い crate の利用者は、受け取るために crate を更新する。shared schema（`depgraph-mcp-tools-v1`）と tool catalog の digest が変わる。`contract_version` は変えない。
 
+## HIR を通した大きな Store で deps / dependents が失敗する問題を直す
+
+Rust HIR を通した depgraph-cli 自身の Store で、CLI の `depgraph deps` / `depgraph dependents` が selector に関係なく `request exhausted a service resource limit`（終了コード 3）で失敗していた問題を直す（[#620](https://github.com/TamaT-LLC/depgraph-cli/issues/620)）。`--max-traversal 1000000` を付けても同じだった。同じ経路を通る `depgraph why` / `depgraph impact` と、MCP の `graph_dependencies_list` / `graph_dependents_list` / `graph_path_get` / `graph_impact_get` も同じ理由で失敗していた。
+
+返す edge の evidence と profile correlation を集めるとき、snapshot の全 evidence・全 profile correlation・全 profile entry を 1 回ずつ走査する。この走査を、返す edge に比例する作業と同じ上限（1,000,000）で数えていた。HIR を通した depgraph-cli 自身の Store（evidence 795,912、profile correlation 120,263、その edge ID 209,051、profile entry 89）では、走査だけで 1,245,578 になり、返す edge が 12 本でも上限を超えていた。
+
+- snapshot 全体の走査は、cycles / unresolved の索引と同じ固定の上限（16,000,000）で数える。返す edge に比例する作業（evidence の集約と複製、path step の組み立てなど）は、従来どおり 1,000,000 で数える。上の Store で `crates/depgraph-core/src/config.rs` の `deps` は 2,012、`dependents` は 194 になる。
+- 上限に当たったときは、どちらの上限かを示す。CLI は `request exhausted a service resource limit: preprocessing_work_items=<上限>`（終了コード 3 のまま）、MCP は `RESOURCE_EXHAUSTED` に `{"kind":"resource_limit","limit":"preprocessing_work_items","maximum":…}` と `narrow_query` を付ける。従来は上限名のない `RESOURCE_EXHAUSTED` だった。
+- 返す node・edge・path step・evidence・correlation の内容と順序は変わらない。修正前のコードで記録した依存一覧と path の digest が一致することを回帰テストで確かめた。
+
+互換性:
+
+- 既定値と上限の値は変えない。`--max-traversal` / `max_traversal` の意味も変えない。
+- `deps` / `dependents` / `why` / `impact` の後処理の上限超過は、details のない `RESOURCE_EXHAUSTED` から `preprocessing_work_items` の details 付きに変わる。edge ごとの evidence 数などの構造上の上限は、従来どおり details なしで返す。
+
 ## Go の file node にリポジトリ相対パスを持たせる
 
 Go worker が出す file node（通常の Go ソース、アセンブリ、`//go:embed` の対象）に、リポジトリ相対パスの `path` property を記録する（[#591](https://github.com/TamaT-LLC/depgraph-cli/issues/591)）。

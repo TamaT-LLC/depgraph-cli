@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use crate::edge_kind_selection::EdgeKindFilter;
 use crate::service_limits::{
     MAX_GRAPH_EVIDENCE_ITEMS, MAX_GRAPH_PHASE_COVERAGE_ITEMS,
-    MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_UNRESOLVED_CORRELATION_REASONS,
+    MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
+    MAX_UNRESOLVED_CORRELATION_REASONS,
 };
 
 pub const INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION: &str = "depgraph-interactive-query-page-v1";
@@ -92,6 +93,11 @@ pub(crate) fn preprocessing_work_limit(error: &anyhow::Error) -> Option<usize> {
     error
         .downcast_ref::<SelectorPreprocessingExhausted>()
         .map(|exhausted| exhausted.maximum)
+        .or_else(|| {
+            error
+                .downcast_ref::<QueryPostprocessingWorkExhausted>()
+                .map(|exhausted| exhausted.maximum)
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -101,6 +107,15 @@ struct SelectorPreprocessingCancelled;
 #[derive(Debug, thiserror::Error)]
 #[error("graph path-step postprocessing exceeded its service bound")]
 struct QueryPostprocessingExhausted;
+
+/// Path-step postprocessing used up one of its work budgets: the work that
+/// grows with the selected edges, or the fixed ceiling of the snapshot-wide
+/// evidence and profile scans. `maximum` names the budget that was hit.
+#[derive(Debug, thiserror::Error)]
+#[error("graph path-step postprocessing exceeded {maximum} work items")]
+struct QueryPostprocessingWorkExhausted {
+    maximum: usize,
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph path-step postprocessing was cancelled")]
@@ -116,6 +131,9 @@ pub(crate) fn is_resource_exhausted(error: &anyhow::Error) -> bool {
         .is_some()
         || error
             .downcast_ref::<QueryPostprocessingExhausted>()
+            .is_some()
+        || error
+            .downcast_ref::<QueryPostprocessingWorkExhausted>()
             .is_some()
 }
 
@@ -1487,9 +1505,39 @@ pub(crate) enum QueryPostprocessingStage {
 
 const QUERY_POSTPROCESSING_STAGE_COUNT: usize = 18;
 
+impl QueryPostprocessingStage {
+    /// Stages that visit every evidence record, profile correlation, or
+    /// profile entry of the snapshot once, whatever edges the request
+    /// selected.
+    const fn is_snapshot_scan(self) -> bool {
+        matches!(
+            self,
+            Self::EvidenceScan
+                | Self::CorrelationRecord
+                | Self::CorrelationPhase
+                | Self::CorrelationEdge
+                | Self::ProfileEntry
+        )
+    }
+}
+
+/// Work of path-step postprocessing, counted against two budgets.
+///
+/// The snapshot-wide scans (every evidence record, profile correlation, and
+/// profile entry, once per request) grow with the snapshot, so they count
+/// against the fixed [`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`] ceiling, as the
+/// snapshot indexing of cycle and unresolved listing does (Issues #617 /
+/// #618). Every other step grows with the selected edges and what they carry,
+/// and counts against the caller's `maximum`. Counting the scans against
+/// `maximum` made `deps` / `dependents` fail on any selector of a Rust HIR
+/// snapshot: depgraph-cli itself has 795,912 evidence records and 209,051
+/// correlated edge IDs, so the scans alone used 1,245,578 of the 1,000,000
+/// items (Issue #620).
 pub(crate) struct QueryPostprocessingWork {
     used: usize,
     maximum: usize,
+    scanned: usize,
+    scan_maximum: usize,
     stage_counts: [usize; QUERY_POSTPROCESSING_STAGE_COUNT],
     #[cfg(test)]
     cancel_after: Option<(QueryPostprocessingStage, usize)>,
@@ -1497,9 +1545,15 @@ pub(crate) struct QueryPostprocessingWork {
 
 impl QueryPostprocessingWork {
     fn new(maximum: usize) -> Self {
+        Self::with_scan_maximum(maximum, MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS)
+    }
+
+    fn with_scan_maximum(maximum: usize, scan_maximum: usize) -> Self {
         Self {
             used: 0,
             maximum,
+            scanned: 0,
+            scan_maximum,
             stage_counts: [0; QUERY_POSTPROCESSING_STAGE_COUNT],
             #[cfg(test)]
             cancel_after: None,
@@ -1513,10 +1567,8 @@ impl QueryPostprocessingWork {
         completed_steps: usize,
     ) -> Self {
         Self {
-            used: 0,
-            maximum,
-            stage_counts: [0; QUERY_POSTPROCESSING_STAGE_COUNT],
             cancel_after: Some((stage, completed_steps)),
+            ..Self::new(maximum)
         }
     }
 
@@ -1534,10 +1586,15 @@ impl QueryPostprocessingWork {
         }) {
             return Err(QueryPostprocessingCancelled.into());
         }
-        if self.used >= self.maximum {
-            return Err(QueryPostprocessingExhausted.into());
+        let (used, maximum) = if stage.is_snapshot_scan() {
+            (&mut self.scanned, self.scan_maximum)
+        } else {
+            (&mut self.used, self.maximum)
+        };
+        if *used >= maximum {
+            return Err(QueryPostprocessingWorkExhausted { maximum }.into());
         }
-        self.used += 1;
+        *used += 1;
         self.stage_counts[stage as usize] += 1;
         Ok(())
     }
@@ -1545,6 +1602,11 @@ impl QueryPostprocessingWork {
     #[cfg(test)]
     fn used(&self) -> usize {
         self.used
+    }
+
+    #[cfg(test)]
+    fn scanned(&self) -> usize {
+        self.scanned
     }
 
     #[cfg(test)]
@@ -1743,6 +1805,8 @@ pub(crate) struct PathStepMaterializer<'a> {
 }
 
 impl<'a> PathStepMaterializer<'a> {
+    /// `maximum_work` bounds the work that grows with `edges`; the
+    /// snapshot-wide scans count against [`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`].
     pub(crate) fn new<I>(
         snapshot: &'a GraphSnapshot,
         filter: &GraphQueryFilter,
@@ -1753,7 +1817,25 @@ impl<'a> PathStepMaterializer<'a> {
     where
         I: IntoIterator<Item = &'a EdgeRecord>,
     {
-        let mut work = QueryPostprocessingWork::new(maximum_work);
+        Self::with_work(
+            snapshot,
+            filter,
+            edges,
+            QueryPostprocessingWork::new(maximum_work),
+            is_cancelled,
+        )
+    }
+
+    fn with_work<I>(
+        snapshot: &'a GraphSnapshot,
+        filter: &GraphQueryFilter,
+        edges: I,
+        mut work: QueryPostprocessingWork,
+        is_cancelled: &mut impl FnMut() -> bool,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = &'a EdgeRecord>,
+    {
         let mut selected_edge_ids = BTreeSet::new();
         for edge in edges {
             work.step(QueryPostprocessingStage::EdgeSelection, is_cancelled)?;
@@ -2536,12 +2618,15 @@ mod tests {
         assert!(is_cancelled(&error));
         assert_eq!(work.stage_count(QueryPostprocessingStage::EvidenceScan), 3);
 
+        // The two evidence scan steps count against the snapshot scan
+        // ceiling, so the request work is the 12 steps of selecting,
+        // collecting, and cloning the edge's two records (Issue #620).
         graph.evidence.truncate(2);
         let exact = materialize_path_steps_bounded_cancellable(
             &graph,
             &GraphQueryFilter::default(),
             &[&graph.edges[0]],
-            14,
+            12,
             &mut || false,
         )?;
         assert_eq!(exact[0].evidence.len(), 2);
@@ -2549,7 +2634,7 @@ mod tests {
             &graph,
             &GraphQueryFilter::default(),
             &[&graph.edges[0]],
-            13,
+            11,
             &mut || false,
         )
         .expect_err("one less than the exact evidence postprocessing work must reject");
@@ -3301,5 +3386,115 @@ mod tests {
             serde_json::to_value(cycles(&graph, CycleLevel::File)).unwrap(),
             serde_json::to_value(cycles_from_topology(&topology, CycleLevel::File)).unwrap()
         );
+    }
+
+    /// Issue #620: a Rust HIR snapshot of depgraph-cli itself has 795,912
+    /// evidence records and 209,051 correlated edge IDs, so the snapshot-wide
+    /// scans of path-step postprocessing alone used 1,245,578 work items and
+    /// every `deps` / `dependents` failed against the 1,000,000 budget. The
+    /// generated snapshot below scans more than that budget; the steps of the
+    /// selected edges stay identical to those of the same graph without the
+    /// unrelated records.
+    #[test]
+    fn issue_620_snapshot_wide_scans_do_not_count_against_the_request_work() -> Result<()> {
+        const UNRELATED_EVIDENCE: usize = 600_000;
+        const UNRELATED_CORRELATED_EDGES: usize = 420_000;
+        let mut small = snapshot();
+        small.evidence = vec![
+            evidence("edge", "e0", 1, "a.rs"),
+            evidence("edge", "e0", 0, "a.rs"),
+            evidence("site", "s0", 0, "a.rs"),
+        ];
+        small.profile_matrix.correlations = vec![correlation(vec!["e0".to_owned()], 2)];
+        small.profile_matrix.entries = vec![profile_entry(2, 1, 1)];
+
+        let mut large = small.clone();
+        // Records of other owners, shaped only by what the scans visit; empty
+        // strings keep the fixture's memory proportional to the record count.
+        let unrelated = EvidenceRecord {
+            owner_type: "site".to_owned(),
+            ..evidence("", "", 0, "")
+        };
+        large
+            .evidence
+            .extend(std::iter::repeat_n(unrelated, UNRELATED_EVIDENCE));
+        let mut unrelated_correlation = correlation(Vec::new(), 0);
+        unrelated_correlation.id = "correlation:unrelated".to_owned();
+        unrelated_correlation.edge_ids_by_phase = BTreeMap::from([(
+            "semantic".to_owned(),
+            vec![String::new(); UNRELATED_CORRELATED_EDGES],
+        )]);
+        large
+            .profile_matrix
+            .correlations
+            .insert(0, unrelated_correlation);
+
+        let scans = large.evidence.len()
+            + large.profile_matrix.correlations.len() * 2
+            + 1
+            + UNRELATED_CORRELATED_EDGES
+            + large.profile_matrix.entries.len();
+        assert!(scans > MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS);
+
+        for reverse in [false, true] {
+            let selector = if reverse { "id:b" } else { "id:a" };
+            let expected = traverse_bounded_filtered(
+                &small,
+                selector,
+                false,
+                reverse,
+                &Default::default(),
+                1,
+            )?;
+            let actual = traverse_bounded_filtered(
+                &large,
+                selector,
+                false,
+                reverse,
+                &Default::default(),
+                1,
+            )?;
+            assert!(actual.complete);
+            assert_eq!(
+                serde_json::to_value(&actual.result)?,
+                serde_json::to_value(&expected.result)?
+            );
+            assert_eq!(actual.result.steps[0].evidence.len(), 2);
+            assert_eq!(actual.result.steps[0].observed_difference_reasons.len(), 2);
+            assert_eq!(actual.result.steps[0].phase_coverage.len(), 2);
+        }
+
+        // The request work is what the one selected edge carries; the scans
+        // count against the fixed snapshot scan ceiling, exactly.
+        let materialize = |work: QueryPostprocessingWork| -> Result<(PathStep, usize, usize)> {
+            let mut materializer = PathStepMaterializer::with_work(
+                &large,
+                &GraphQueryFilter::default(),
+                [&large.edges[0]],
+                work,
+                &mut || false,
+            )?;
+            let step = materializer.materialize(&large.edges[0], &mut || false)?;
+            Ok((step, materializer.work.used(), materializer.work.scanned()))
+        };
+        let (_, used, scanned) = materialize(QueryPostprocessingWork::new(
+            MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        ))?;
+        assert_eq!(scanned, scans);
+        assert!(used < 32, "request work {used}");
+        let (step, _, _) = materialize(QueryPostprocessingWork::with_scan_maximum(used, scans))?;
+        assert_eq!(step.edge.id, "e0");
+        for (maximum, scan_maximum, exhausted) in
+            [(used - 1, scans, used - 1), (used, scans - 1, scans - 1)]
+        {
+            let error = materialize(QueryPostprocessingWork::with_scan_maximum(
+                maximum,
+                scan_maximum,
+            ))
+            .expect_err("one item under either budget rejects the complete path");
+            assert!(is_resource_exhausted(&error));
+            assert_eq!(preprocessing_work_limit(&error), Some(exhausted));
+        }
+        Ok(())
     }
 }

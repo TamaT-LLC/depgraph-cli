@@ -36,7 +36,9 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 /// Maximum snapshot-wide work of one cycle or unresolved listing: indexing
 /// every node, edge, evidence record, site, and profile correlation, the
 /// per-node steps of the cycle search, and the materialization of the
-/// returned items.
+/// returned items. The path steps of dependency listing, path explanation,
+/// and impact count their scans of every evidence record, profile
+/// correlation, and profile entry against it too (Issue #620).
 ///
 /// Each snapshot record is visited a bounded number of times, so this work
 /// grows with the snapshot rather than with the request, and the ceiling is
@@ -47,7 +49,9 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 /// on a snapshot of about 250 files (Issues #617 / #618). A generated snapshot
 /// of that shape (23,500 sites, 6,750 of them unresolved, 30,000 edges,
 /// 53,500 evidence records, 25,251 nodes) uses 187,751 items for unresolved
-/// listing and 57,301 for file-level cycles.
+/// listing and 57,301 for file-level cycles. The path-step scans of a Rust HIR
+/// snapshot of depgraph-cli itself (795,912 evidence records, 120,263
+/// correlations with 209,051 edge IDs, 89 profile entries) use 1,245,578.
 pub const MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS: usize = 16_000_000;
 
 /// Maximum findings in one health response or one analyzed range. Summary
