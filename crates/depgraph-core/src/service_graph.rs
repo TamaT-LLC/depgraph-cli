@@ -707,7 +707,7 @@ impl DepgraphService {
         }
         Ok(ImpactServiceResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             impact: result,
         })
     }
@@ -747,7 +747,7 @@ impl DepgraphService {
         }
         Ok(ChangedSetImpactServiceResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             impact: result,
         })
     }
@@ -783,7 +783,7 @@ impl DepgraphService {
         }
         Ok(CyclesResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             cycles,
         })
     }
@@ -802,7 +802,7 @@ impl DepgraphService {
         }
         Ok(UnresolvedServiceResult {
             snapshot_id,
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             items,
         })
     }
@@ -1606,10 +1606,12 @@ fn validate_filter(filter: &GraphQueryFilter) -> DepgraphServiceResult<()> {
     Ok(())
 }
 
+/// Loads the pinned snapshot. A completed snapshot is shared with the read
+/// cache of a long-lived reader instead of being copied (Issue #599).
 pub(crate) fn load_pinned_snapshot(
     request: &mut SnapshotReadRequest,
     cancellation: &CancellationToken,
-) -> DepgraphServiceResult<GraphSnapshot> {
+) -> DepgraphServiceResult<std::sync::Arc<GraphSnapshot>> {
     if cancellation.is_cancelled() {
         return Err(DepgraphServiceError::Cancelled);
     }
@@ -1619,8 +1621,8 @@ pub(crate) fn load_pinned_snapshot(
     let loaded = request.store().interruptible_read(
         move || cancellation_check.is_cancelled(),
         |store| match attempt_id {
-            Some(attempt_id) => store.load_snapshot(&attempt_id),
-            None => store.load_completed_snapshot(&snapshot_id),
+            Some(attempt_id) => store.load_snapshot(&attempt_id).map(std::sync::Arc::new),
+            None => store.load_completed_snapshot_shared(&snapshot_id),
         },
     );
     if cancellation.is_cancelled() {

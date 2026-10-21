@@ -3911,6 +3911,127 @@ fn cursor_paging_stays_pinned_when_current_snapshot_advances_concurrently() {
 }
 
 #[test]
+fn issue_599_repeated_reads_match_a_fresh_server_and_never_serve_a_changed_store_from_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let first_snapshot = seed_issue_300_store(&store_path, &root);
+    let calls = |snapshot: &str| {
+        [
+            ("get_context", json!({})),
+            ("snapshot_get", json!({"snapshot": snapshot})),
+            (
+                "agent_nodes_list",
+                json!({"snapshot": snapshot, "query": "node:", "match_mode": "prefix"}),
+            ),
+            (
+                "agent_node_get",
+                json!({"snapshot": snapshot, "node_id": "node:alpha"}),
+            ),
+            ("agent_sites_list", json!({"snapshot": snapshot})),
+            (
+                "agent_edges_list",
+                json!({"snapshot": snapshot, "node_id": "node:alpha", "direction": "both"}),
+            ),
+            (
+                "graph_dependencies_list",
+                json!({"snapshot": snapshot, "selector": "id:node:alpha"}),
+            ),
+        ]
+        .map(|(name, mut arguments)| {
+            arguments["contract_version"] = json!("depgraph-mcp-tools-v1");
+            (name, arguments)
+        })
+    };
+    let fresh_results = |snapshot: &str| {
+        calls(snapshot)
+            .into_iter()
+            .map(|(name, arguments)| {
+                call_tool_once_with_capabilities(&root, &store_path, &[], name, arguments)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    let mut long_lived_results = |mcp: &mut InteractiveMcp, snapshot: &str| {
+        calls(snapshot)
+            .into_iter()
+            .map(|(name, arguments)| {
+                id += 1;
+                interactive_tool_call(mcp, id, name, arguments)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A second round is served from the reused reads and must equal both the
+    // first round and a server that has never read this store.
+    let expected = fresh_results("current");
+    for result in &expected {
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    assert_eq!(long_lived_results(&mut mcp, "current"), expected);
+    assert_eq!(long_lived_results(&mut mcp, "current"), expected);
+
+    // A new completed snapshot becomes current while the server keeps running.
+    let advanced_snapshot = seed_issue_302_store(&store_path, &root);
+    assert_ne!(advanced_snapshot, first_snapshot);
+    let advanced = long_lived_results(&mut mcp, "current");
+    assert_eq!(advanced, fresh_results("current"));
+    assert_ne!(advanced, expected);
+    assert_eq!(
+        advanced[0]["structuredContent"]["snapshot_id"],
+        json!(advanced_snapshot)
+    );
+    assert_eq!(
+        long_lived_results(&mut mcp, &first_snapshot),
+        fresh_results(&first_snapshot)
+    );
+
+    // Tampering with a sealed row of the first snapshot after its seal was
+    // verified (and reused) must still fail closed on the next read.
+    let connection = Connection::open(&store_path).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE nodes SET display_name='crate::alpha::tampered'
+              WHERE scan_id='issue-300' AND id='node:alpha'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+    id += 1;
+    let tampered = interactive_tool_call(
+        &mut mcp,
+        id,
+        "agent_node_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": first_snapshot,
+            "node_id": "node:alpha"
+        }),
+    );
+    assert_eq!(tampered["isError"], true, "{tampered}");
+    assert_eq!(
+        tampered,
+        call_tool_once_with_capabilities(
+            &root,
+            &store_path,
+            &[],
+            "agent_node_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "snapshot": first_snapshot,
+                "node_id": "node:alpha"
+            }),
+        )
+    );
+    mcp.finish();
+}
+
+#[test]
 fn issue_300_handler_maps_oversized_utf8_query_to_a_typed_error() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
@@ -10328,7 +10449,8 @@ fn seed_issue_580_store(path: &Path, root: &Path) -> String {
         .replace(']', "%5D");
     assert!(ISSUE_580_EXPRESSION.len() > 256);
     for (id, kind, locator, display_name, properties) in [
-        // Rust file nodes: the path lives only in the `file:` locator.
+        // A Rust file node from a Store scanned before Issue #577: the path
+        // lives only in the `file:` locator.
         (
             "file:sha256:0580a",
             "file",
@@ -10336,12 +10458,20 @@ fn seed_issue_580_store(path: &Path, root: &Path) -> String {
             "crates/core/src/lib.rs".to_owned(),
             json!({"language": "rust"}),
         ),
+        // Rust (since #577) and Go (since #591) file nodes also record `path`.
         (
             "file:sha256:0580b",
             "file",
             "file:crates/core/src/model.rs".to_owned(),
             "crates/core/src/model.rs".to_owned(),
-            json!({"language": "rust"}),
+            json!({"language": "rust", "path": "crates/core/src/model.rs"}),
+        ),
+        (
+            "file:sha256:0580h",
+            "file",
+            "file:workers/go/cmd/worker/main.go".to_owned(),
+            "workers/go/cmd/worker/main.go".to_owned(),
+            json!({"language": "go", "path": "workers/go/cmd/worker/main.go"}),
         ),
         // Web file nodes use `file://`.
         (
@@ -10593,6 +10723,7 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
         "unknown_target:sha256:0580e",
         "external_system:sha256:0580f",
         "module:sha256:0580g",
+        "file:sha256:0580h",
     ];
     for tool in ["get_context", "repository_list"] {
         call(tool, json!({}));
@@ -10700,6 +10831,102 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
         call("health_finding_get", json!({"finding_id": finding["id"]}));
     }
     call("health_hotspots_list", json!({}));
+
+    mcp.finish();
+    assert_eq!(before, store_invariant(&store_path));
+}
+
+#[test]
+fn issue_601_agent_node_get_reads_repository_path_from_node_properties() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    seed_issue_580_store(&store_path, &root);
+    let before = store_invariant(&store_path);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let output_schemas = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| {
+            (
+                tool["name"].as_str().unwrap().to_owned(),
+                jsonschema::draft202012::new(&tool["outputSchema"]).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut id = 2;
+    let mut call = |name: &str, arguments: Value| {
+        id += 1;
+        let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
+        full.as_object_mut()
+            .unwrap()
+            .extend(arguments.as_object().unwrap().clone());
+        let result = interactive_tool_call(&mut mcp, id, name, full);
+        assert_eq!(result["isError"], false, "{name} {arguments}: {result}");
+        output_schemas[name]
+            .validate(&result["structuredContent"])
+            .unwrap_or_else(|error| panic!("{name} output: {error}"));
+        result["structuredContent"]["result"].clone()
+    };
+
+    for (node_id, locator_shape, repository_path) in [
+        // Web file node: `file://` locator, path only in the `path` property.
+        ("file:sha256:0580c", "file://", "workers/web/src/index.ts"),
+        // Rust and Go file nodes with a `path` property and a `file:` locator.
+        ("file:sha256:0580b", "file:", "crates/core/src/model.rs"),
+        (
+            "file:sha256:0580h",
+            "file:",
+            "workers/go/cmd/worker/main.go",
+        ),
+        // A file node from an older Store without `path` keeps the locator
+        // fallback.
+        ("file:sha256:0580a", "file:", "crates/core/src/lib.rs"),
+    ] {
+        let node = call("agent_node_get", json!({"node_id": node_id}));
+        assert_eq!(node["id"], node_id);
+        assert_eq!(node["kind"], "file");
+        assert_eq!(
+            node["repository_path"], repository_path,
+            "{locator_shape} {node}"
+        );
+        let dependencies = call(
+            "graph_dependencies_list",
+            json!({"selector": format!("id:{node_id}")}),
+        );
+        assert_eq!(
+            node, dependencies["root"],
+            "agent_node_get and the dependency root must agree for {node_id}"
+        );
+    }
+
+    // Nodes without a path keep omitting `repository_path`.
+    for node_id in ["external:sha256:0580d", "module:sha256:0580g"] {
+        let node = call("agent_node_get", json!({"node_id": node_id}));
+        assert!(node.get("repository_path").is_none(), "{node}");
+    }
+
+    // `agent_nodes_list` keeps its closed four-field summary.
+    let listed = call(
+        "agent_nodes_list",
+        json!({"query": "file:sha256:0580c", "match_mode": "exact"}),
+    );
+    assert_eq!(
+        listed["items"],
+        json!([{
+            "id": "file:sha256:0580c",
+            "kind": "file",
+            "locator": "id:file:sha256:0580c",
+            "display_name": "workers/web/src/index.ts"
+        }]),
+        "{listed}"
+    );
 
     mcp.finish();
     assert_eq!(before, store_invariant(&store_path));

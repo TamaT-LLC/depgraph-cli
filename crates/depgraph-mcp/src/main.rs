@@ -3213,34 +3213,11 @@ fn execute_catalog_read_tool(
             let resolved_snapshot_id =
                 service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
             let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
-            let found = service.find_nodes_page(
-                &resolved_snapshot_id,
-                node_id.as_str(),
-                NodeMatchMode::Exact,
-                &[],
-                0,
-                service.config().limits().max_page_items(),
-                cancellation,
-            )?;
-            let matches = found
-                .nodes()
-                .iter()
-                .filter(|node| node.id() == node_id.as_str())
-                .collect::<Vec<_>>();
-            let node = match matches.as_slice() {
-                [node] => AgentNode::try_from(*node)
-                    .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?,
-                [] => {
-                    return Err(ToolExecutionFailure::Service(
-                        DepgraphServiceError::NotFound,
-                    ));
-                }
-                _ => {
-                    return Err(ToolExecutionFailure::Service(
-                        DepgraphServiceError::Integrity,
-                    ));
-                }
-            };
+            // Read the node's properties too: a Web file node keeps its path
+            // only in the `path` property, not in its `file://` locator (#601).
+            let found = service.get_node(&resolved_snapshot_id, node_id.as_str(), cancellation)?;
+            let node = AgentNode::try_from(&found)
+                .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),
@@ -4875,6 +4852,10 @@ async fn run(args: Args) -> Result<()> {
     let server = RequestScopedDepgraphMcpServer {
         inner: build_server(&args)?,
     };
+    // Every read opens a fresh read-only store handle. Let them share verified
+    // seals and the reconstructed completed snapshot while the store files are
+    // unchanged, instead of re-reading the whole snapshot per call (Issue #599).
+    depgraph_core::enable_read_cache();
     let state = Arc::new(TransportState::default());
     let transport =
         BoundedStdioTransport::new(tokio::io::stdin(), tokio::io::stdout(), Arc::clone(&state));

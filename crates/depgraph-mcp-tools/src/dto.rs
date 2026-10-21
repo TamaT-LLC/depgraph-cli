@@ -3561,16 +3561,19 @@ impl TryFrom<&depgraph_core::query::TraversalPageItem> for AgentPathStep {
     }
 }
 
-impl TryFrom<&depgraph_core::service::NodeProjection> for AgentNode {
+impl TryFrom<&depgraph_core::service::NodeDetailProjection> for AgentNode {
     type Error = ContractBuildError;
 
-    fn try_from(source: &depgraph_core::service::NodeProjection) -> Result<Self, Self::Error> {
+    fn try_from(
+        source: &depgraph_core::service::NodeDetailProjection,
+    ) -> Result<Self, Self::Error> {
+        let node = source.node();
         agent_node_from_fields(
-            source.id(),
-            source.kind(),
-            source.locator(),
-            source.display_name(),
-            &serde_json::Value::Null,
+            node.id(),
+            node.kind(),
+            node.locator(),
+            node.display_name(),
+            source.properties(),
         )
     }
 }
