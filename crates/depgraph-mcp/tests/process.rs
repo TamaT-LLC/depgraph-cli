@@ -3911,6 +3911,127 @@ fn cursor_paging_stays_pinned_when_current_snapshot_advances_concurrently() {
 }
 
 #[test]
+fn issue_599_repeated_reads_match_a_fresh_server_and_never_serve_a_changed_store_from_cache() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("store.sqlite");
+    fs::create_dir(&root).unwrap();
+    let first_snapshot = seed_issue_300_store(&store_path, &root);
+    let calls = |snapshot: &str| {
+        [
+            ("get_context", json!({})),
+            ("snapshot_get", json!({"snapshot": snapshot})),
+            (
+                "agent_nodes_list",
+                json!({"snapshot": snapshot, "query": "node:", "match_mode": "prefix"}),
+            ),
+            (
+                "agent_node_get",
+                json!({"snapshot": snapshot, "node_id": "node:alpha"}),
+            ),
+            ("agent_sites_list", json!({"snapshot": snapshot})),
+            (
+                "agent_edges_list",
+                json!({"snapshot": snapshot, "node_id": "node:alpha", "direction": "both"}),
+            ),
+            (
+                "graph_dependencies_list",
+                json!({"snapshot": snapshot, "selector": "id:node:alpha"}),
+            ),
+        ]
+        .map(|(name, mut arguments)| {
+            arguments["contract_version"] = json!("depgraph-mcp-tools-v1");
+            (name, arguments)
+        })
+    };
+    let fresh_results = |snapshot: &str| {
+        calls(snapshot)
+            .into_iter()
+            .map(|(name, arguments)| {
+                call_tool_once_with_capabilities(&root, &store_path, &[], name, arguments)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    let mut long_lived_results = |mcp: &mut InteractiveMcp, snapshot: &str| {
+        calls(snapshot)
+            .into_iter()
+            .map(|(name, arguments)| {
+                id += 1;
+                interactive_tool_call(mcp, id, name, arguments)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A second round is served from the reused reads and must equal both the
+    // first round and a server that has never read this store.
+    let expected = fresh_results("current");
+    for result in &expected {
+        assert_eq!(result["isError"], false, "{result}");
+    }
+    assert_eq!(long_lived_results(&mut mcp, "current"), expected);
+    assert_eq!(long_lived_results(&mut mcp, "current"), expected);
+
+    // A new completed snapshot becomes current while the server keeps running.
+    let advanced_snapshot = seed_issue_302_store(&store_path, &root);
+    assert_ne!(advanced_snapshot, first_snapshot);
+    let advanced = long_lived_results(&mut mcp, "current");
+    assert_eq!(advanced, fresh_results("current"));
+    assert_ne!(advanced, expected);
+    assert_eq!(
+        advanced[0]["structuredContent"]["snapshot_id"],
+        json!(advanced_snapshot)
+    );
+    assert_eq!(
+        long_lived_results(&mut mcp, &first_snapshot),
+        fresh_results(&first_snapshot)
+    );
+
+    // Tampering with a sealed row of the first snapshot after its seal was
+    // verified (and reused) must still fail closed on the next read.
+    let connection = Connection::open(&store_path).unwrap();
+    let changed = connection
+        .execute(
+            "UPDATE nodes SET display_name='crate::alpha::tampered'
+              WHERE scan_id='issue-300' AND id='node:alpha'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(connection);
+    id += 1;
+    let tampered = interactive_tool_call(
+        &mut mcp,
+        id,
+        "agent_node_get",
+        json!({
+            "contract_version": "depgraph-mcp-tools-v1",
+            "snapshot": first_snapshot,
+            "node_id": "node:alpha"
+        }),
+    );
+    assert_eq!(tampered["isError"], true, "{tampered}");
+    assert_eq!(
+        tampered,
+        call_tool_once_with_capabilities(
+            &root,
+            &store_path,
+            &[],
+            "agent_node_get",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "snapshot": first_snapshot,
+                "node_id": "node:alpha"
+            }),
+        )
+    );
+    mcp.finish();
+}
+
+#[test]
 fn issue_300_handler_maps_oversized_utf8_query_to_a_typed_error() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("repository");
