@@ -2791,14 +2791,15 @@ fn issue_566_import_groups_validate_kinds_and_counts() {
         "AgentImportGroup",
         import_group(vec![import_evidence()], 1),
     );
-    // A count below the listed facts, or above it without a full list, is rejected.
+    // A count below the listed facts is rejected; a larger count marks a list
+    // trimmed to the name bound or to the page byte budget.
     assert!(
         serde_json::from_value::<AgentImportGroup>(import_group(vec![import_evidence()], 0))
             .is_err()
     );
     assert!(
         serde_json::from_value::<AgentImportGroup>(import_group(vec![import_evidence()], 2))
-            .is_err()
+            .is_ok()
     );
     let full = vec![import_evidence(); MAX_AGENT_IMPORT_GROUP_NAMES];
     assert!(serde_json::from_value::<AgentImportGroup>(import_group(full.clone(), 300)).is_ok());

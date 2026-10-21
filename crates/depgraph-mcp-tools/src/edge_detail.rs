@@ -24,8 +24,13 @@ pub const MAX_AGENT_IMPORT_GROUP_EDGE_KINDS: usize = 64;
 /// Byte budget of one `detail: "imports"` page. A hub file can import hundreds
 /// of names, so the page ends early with a cursor instead of exceeding the result
 /// size an Agent host accepts (Claude Code rejected a 76,164-character result in
-/// Issue #566). One group lists at most 256 names and stays well below it.
+/// Issue #566). A group whose names alone exceed the page is trimmed to
+/// [`AGENT_IMPORT_GROUP_BYTES`] so every page holds at least one group.
 pub const AGENT_IMPORT_GROUPS_PAGE_BYTES: u32 = 48 * 1024;
+/// Largest serialized group: the page budget less room for the page fields and a
+/// cursor of the largest accepted size.
+pub const AGENT_IMPORT_GROUP_BYTES: usize =
+    AGENT_IMPORT_GROUPS_PAGE_BYTES as usize - crate::MAX_CURSOR_BYTES - 256;
 
 /// Requested output granularity of `agent_edges_list`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, JsonSchema, PartialEq, Serialize)]
@@ -173,7 +178,8 @@ pub struct AgentImportGroup {
     /// Number of grouped edge records.
     #[schemars(range(min = 1))]
     edge_count: u64,
-    /// Distinct import facts, sorted by specifier and local name; at most 256.
+    /// Distinct import facts, sorted by specifier and local name; at most 256, and
+    /// fewer when the group would not fit in one page.
     #[schemars(length(max = 256))]
     imports: Vec<AgentImportEvidence>,
     /// Number of distinct import facts; larger than the length of imports when the
@@ -202,7 +208,6 @@ impl AgentImportGroup {
             || edge_count < u64::try_from(edge_kinds.len()).unwrap_or(u64::MAX)
             || imports.len() > MAX_AGENT_IMPORT_GROUP_NAMES
             || import_count < listed
-            || (import_count > listed && imports.len() != MAX_AGENT_IMPORT_GROUP_NAMES)
         {
             return Err(ContractBuildError::DependencyDetailState);
         }
@@ -249,14 +254,7 @@ impl AgentImportGroup {
         let import_count = group
             .import_count()
             .saturating_sub(u64::try_from(dropped).unwrap_or(u64::MAX));
-        // A truncated list that lost a fact no longer fills the bound, so keep the
-        // count consistent with what is listed.
-        let import_count = if imports.len() == MAX_AGENT_IMPORT_GROUP_NAMES {
-            import_count
-        } else {
-            u64::try_from(imports.len()).unwrap_or(u64::MAX)
-        };
-        Self::new(
+        let mut projected = Self::new(
             source.id().clone(),
             source.repository_path().cloned(),
             target.id().clone(),
@@ -265,7 +263,33 @@ impl AgentImportGroup {
             group.edge_count(),
             imports,
             import_count,
-        )
+        )?;
+        projected.trim_to_bytes(AGENT_IMPORT_GROUP_BYTES);
+        Ok(projected)
+    }
+
+    /// Drops trailing import facts until the compact JSON of the group fits in
+    /// `max_bytes`, keeping `import_count`. The result depends only on the group,
+    /// so pages and cursors stay deterministic.
+    fn trim_to_bytes(&mut self, max_bytes: usize) {
+        let size = |value: &Self| serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len());
+        if size(self) <= max_bytes {
+            return;
+        }
+        let imports = std::mem::take(&mut self.imports);
+        let mut used = size(self);
+        let mut kept = 0;
+        for import in &imports {
+            // One more element costs its bytes and a separating comma.
+            let cost = serde_json::to_vec(import).map_or(usize::MAX, |bytes| bytes.len()) + 1;
+            match used.checked_add(cost) {
+                Some(next) if next <= max_bytes => used = next,
+                _ => break,
+            }
+            kept += 1;
+        }
+        self.imports = imports;
+        self.imports.truncate(kept);
     }
 
     #[must_use]
@@ -445,5 +469,66 @@ impl JsonSchema for AgentEdgesOutput {
             "description": "detail=full (default) is the legacy page of complete edges without a detail field; summary carries its detail tag and an edges page without evidence bodies; imports carries its detail tag and a page of file-level import groups with their import names.",
             "oneOf": [full, summary, imports]
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AgentImportBindingKind, AgentImportSpecifier, AgentLabel};
+
+    fn group_with_long_names(count: usize) -> AgentImportGroup {
+        let specifier = format!("@scope/{}", "a".repeat(900));
+        let imports = (0..count)
+            .map(|index| {
+                AgentImportEvidence::new(
+                    AgentImportSpecifier::parse(&specifier).unwrap(),
+                    Some(AgentImportBindingKind::Named),
+                    Some(AgentLabel::parse(format!("name{index:03}{}", "b".repeat(200))).unwrap()),
+                    None,
+                    false,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        AgentImportGroup::new(
+            AgentId::parse("file:a").unwrap(),
+            None,
+            AgentId::parse("file:b").unwrap(),
+            None,
+            vec![AgentToken::parse("imports").unwrap()],
+            1,
+            imports,
+            300,
+        )
+        .unwrap()
+    }
+
+    // Issue #566: a group larger than one page is trimmed so the page can still
+    // hold it and paging advances, and the count keeps the total.
+    #[test]
+    fn oversized_group_is_trimmed_to_fit_one_page() {
+        let mut group = group_with_long_names(MAX_AGENT_IMPORT_GROUP_NAMES);
+        assert!(serde_json::to_vec(&group).unwrap().len() > AGENT_IMPORT_GROUP_BYTES);
+        group.trim_to_bytes(AGENT_IMPORT_GROUP_BYTES);
+        let bytes = serde_json::to_vec(&group).unwrap().len();
+        assert!(bytes <= AGENT_IMPORT_GROUP_BYTES, "{bytes}");
+        assert!(!group.imports().is_empty());
+        assert!(group.imports().len() < MAX_AGENT_IMPORT_GROUP_NAMES);
+        assert_eq!(group.import_count(), 300);
+        // The trimmed group still satisfies the contract and is deterministic.
+        let value = serde_json::to_value(&group).unwrap();
+        assert_eq!(
+            serde_json::from_value::<AgentImportGroup>(value).unwrap(),
+            group
+        );
+        let mut again = group_with_long_names(MAX_AGENT_IMPORT_GROUP_NAMES);
+        again.trim_to_bytes(AGENT_IMPORT_GROUP_BYTES);
+        assert_eq!(again, group);
+
+        let mut small = group_with_long_names(2);
+        let before = small.clone();
+        small.trim_to_bytes(AGENT_IMPORT_GROUP_BYTES);
+        assert_eq!(small, before);
     }
 }
