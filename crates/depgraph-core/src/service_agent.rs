@@ -17,6 +17,18 @@ use crate::service::{
     ResolvedSnapshotId, SnapshotLocator,
 };
 
+// Import groups and the fan-in ranking reuse the private snapshot and evidence
+// helpers below (Issue #566).
+#[path = "service_agent_fan_in.rs"]
+mod fan_in;
+#[path = "service_agent_imports.rs"]
+mod imports;
+pub use fan_in::{FanInEntry, FanInRanking};
+pub use imports::{
+    DEFAULT_IMPORT_GROUP_EDGE_KINDS, GraphImportGroupsPageResult, GraphNodeFields,
+    ImportGroupProjection, MAX_IMPORT_GROUP_NAMES,
+};
+
 pub const MAX_FIND_NODES_QUERY_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -75,6 +75,9 @@ macro_rules! public_page_item {
 
 public_result!(
     AgentCompletedSnapshot,
+    crate::AgentContextOutput,
+    crate::AgentContextSummary,
+    crate::AgentEdgesImportsResponse,
     AgentDependenciesOutput,
     AgentDependenciesSummaryResponse,
     AgentDependencyPathsResponse,
@@ -115,6 +118,8 @@ public_result!(
 );
 public_page_item!(
     AgentCycle,
+    crate::AgentFanInItem,
+    crate::AgentImportGroup,
     AgentDependencyPath,
     AgentEdgeSummary,
     AgentEdge,
