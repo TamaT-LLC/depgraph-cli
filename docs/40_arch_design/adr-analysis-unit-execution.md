@@ -96,7 +96,7 @@ A caller may configure an explicit total budget in `.depgraph.toml`:
 ```toml
 [scan]
 worker_timeout_seconds = 300
-max_worker_memory_bytes = 2147483648
+max_worker_memory_bytes = 6442450944
 max_concurrent_units = 2
 max_unit_source_files = 2048
 # Pre-split byte budgets (see adr-presplit-analysis-planning.md).

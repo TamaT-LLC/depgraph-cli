@@ -28,63 +28,96 @@ const TYPESCRIPT_PROJECT_METADATA_KEYS: [&str; 8] = [
 /// Wire profiles identify individual executions. Graph profiles identify one
 /// logical unit and stage, independently of batching and execution order.
 /// Worker-provided aliases are checked against the adapter's identity contract.
+/// Ingestion applies [`SourceBatchAliases`] pass by pass instead.
+#[cfg(test)]
 pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()> {
-    let mut aliases = BTreeMap::new();
-    let mut web_profiles = BTreeSet::new();
-    for event in events.iter() {
-        if event["event"] != "profile_declared"
-            || event["profile"]["properties"]["analysis_unit_contract"] != V2
-        {
-            continue;
-        }
-        let profile = &event["profile"];
-        let properties = &profile["properties"];
-        let string = |key: &str| {
-            properties[key]
-                .as_str()
-                .with_context(|| format!("source-batch profile is missing {key}"))
-        };
-        let base = string("analysis_base_profile_id")?;
-        let unit = string("analysis_unit_id")?;
-        let stage = string("analysis_stage")?;
-        let logical = string("analysis_logical_profile_id")?;
-        let expected = match profile["language"].as_str() {
-            Some("go") => stable_id_from_value(
-                "profile",
-                &json!({
-                    "kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":[base,unit,stage],
-                }),
-            ),
-            Some("web") => stable_id_from_value(
-                "profile",
-                &json!({
-                    "base_profile":base, "contract_version":V2, "stage":stage, "unit_id":unit,
-                }),
-            ),
-            _ => anyhow::bail!("source-batch profile has an unsupported adapter"),
-        };
-        ensure!(
-            logical == expected,
-            "source-batch logical profile does not match its unit and stage"
-        );
-        if profile["language"] == "web" {
-            web_profiles.insert(logical.to_owned());
-        }
-        let wire = profile["id"]
-            .as_str()
-            .context("source-batch profile is missing its wire ID")?;
-        ensure!(
-            aliases
-                .insert(wire.to_owned(), logical.to_owned())
-                .is_none(),
-            "duplicate source-batch profile alias"
-        );
-    }
-    if aliases.is_empty() {
+    let Some(aliases) = SourceBatchAliases::collect(events.iter())? else {
         return Ok(());
-    }
+    };
     for event in events {
-        rewrite_profile_references(event, &aliases);
+        aliases.normalize(event)?;
+    }
+    Ok(())
+}
+
+/// The logical profile aliases a stream's source-batch profile declarations
+/// establish. Collecting them reads only the declarations, so a caller that
+/// keeps graph events compact can normalize each event separately (#598).
+pub(crate) struct SourceBatchAliases {
+    aliases: BTreeMap<String, String>,
+    web_profiles: BTreeSet<String>,
+}
+
+impl SourceBatchAliases {
+    /// Returns `None` when the stream declares no source-batch profile, in
+    /// which case normalization leaves every event unchanged.
+    pub(crate) fn collect<'a>(events: impl IntoIterator<Item = &'a Value>) -> Result<Option<Self>> {
+        let mut aliases = BTreeMap::new();
+        let mut web_profiles = BTreeSet::new();
+        for event in events {
+            if event["event"] != "profile_declared"
+                || event["profile"]["properties"]["analysis_unit_contract"] != V2
+            {
+                continue;
+            }
+            let profile = &event["profile"];
+            let properties = &profile["properties"];
+            let string = |key: &str| {
+                properties[key]
+                    .as_str()
+                    .with_context(|| format!("source-batch profile is missing {key}"))
+            };
+            let base = string("analysis_base_profile_id")?;
+            let unit = string("analysis_unit_id")?;
+            let stage = string("analysis_stage")?;
+            let logical = string("analysis_logical_profile_id")?;
+            let expected = match profile["language"].as_str() {
+                Some("go") => stable_id_from_value(
+                    "profile",
+                    &json!({
+                        "kind":"profile", "workspace":"go-analysis-unit-v2-logical", "parts":[base,unit,stage],
+                    }),
+                ),
+                Some("web") => stable_id_from_value(
+                    "profile",
+                    &json!({
+                        "base_profile":base, "contract_version":V2, "stage":stage, "unit_id":unit,
+                    }),
+                ),
+                _ => anyhow::bail!("source-batch profile has an unsupported adapter"),
+            };
+            ensure!(
+                logical == expected,
+                "source-batch logical profile does not match its unit and stage"
+            );
+            if profile["language"] == "web" {
+                web_profiles.insert(logical.to_owned());
+            }
+            let wire = profile["id"]
+                .as_str()
+                .context("source-batch profile is missing its wire ID")?;
+            ensure!(
+                aliases
+                    .insert(wire.to_owned(), logical.to_owned())
+                    .is_none(),
+                "duplicate source-batch profile alias"
+            );
+        }
+        if aliases.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            aliases,
+            web_profiles,
+        }))
+    }
+
+    pub(crate) fn normalize(&self, event: &mut Value) -> Result<()> {
+        let Self {
+            aliases,
+            web_profiles,
+        } = self;
+        rewrite_profile_references(event, aliases);
         if event["event"] == "node_upsert"
             && is_shared_web_node(&event["node"])
             && let Some(profile) = event["node"]["properties"]["profile_id"].as_str()
@@ -171,8 +204,8 @@ pub(crate) fn normalize_source_batch_profiles(events: &mut [Value]) -> Result<()
                 );
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn is_shared_web_node(node: &Value) -> bool {

@@ -25,7 +25,8 @@ Go・Webのスキャンは、先にディレクトリとworkspaceを調べてか
 | `max_unit_source_bytes` | 8 MiB |
 | `max_context_source_bytes` | 64 MiB |
 | `max_concurrent_units` | 2 |
-| `max_worker_memory_bytes` | 2 GiB |
+| `max_worker_memory_bytes` | 6 GiB |
+| `max_protocol_bytes` | 1 GiB |
 | `worker_timeout_seconds` | 無進捗 300 秒 |
 
 全体の時間予算が必要な場合は`total_budget_seconds`を指定します。

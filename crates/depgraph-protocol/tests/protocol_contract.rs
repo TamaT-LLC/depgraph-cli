@@ -41,6 +41,65 @@ fn golden_stream_contains_and_validates_all_nine_event_types() {
     );
 }
 
+/// A validator that does not retain graph events still accepts the same
+/// stream, observes every accepted event in stream order, and keeps the same
+/// upsert maps; it only drops the graph events from its retained prefix (#598).
+#[test]
+fn graph_event_retention_opt_out_observes_the_same_canonical_stream() {
+    for fixture in [
+        GOLDEN,
+        include_str!("fixtures/protocol-v1.semantic.golden.ndjson"),
+        include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson"),
+        include_str!("fixtures/protocol-v1.cross-language.golden.ndjson"),
+    ] {
+        let retained = validate_ndjson(Cursor::new(fixture)).expect("fixture validates");
+        let mut validator = ProtocolValidator::new().without_graph_event_retention();
+        let mut observed = Vec::new();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            let event: ProtocolEvent = serde_json::from_str(line).expect("fixture event");
+            validator
+                .push_observed(event, |event| observed.push(event.clone()))
+                .expect("fixture event validates");
+        }
+        let detached = validator.finish().expect("fixture completes");
+        assert_eq!(observed, retained.events);
+        assert_eq!(
+            detached.events,
+            retained
+                .events
+                .iter()
+                .filter(|event| !matches!(
+                    event,
+                    ProtocolEvent::NodeUpsert(_)
+                        | ProtocolEvent::EdgeUpsert(_)
+                        | ProtocolEvent::DependencySite(_)
+                        | ProtocolEvent::Diagnostic(_)
+                ))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(detached.profiles, retained.profiles);
+        assert_eq!(detached.nodes, retained.nodes);
+        assert_eq!(detached.edges, retained.edges);
+        assert_eq!(detached.sites, retained.sites);
+        assert_eq!(detached.diagnostics, retained.diagnostics);
+    }
+}
+
+#[test]
+fn graph_event_retention_opt_out_does_not_observe_a_rejected_event() {
+    let mut validator = ProtocolValidator::new().without_graph_event_retention();
+    let mut lines = GOLDEN.lines();
+    let started: ProtocolEvent =
+        serde_json::from_str(lines.next().expect("golden has scan_started")).expect("event");
+    let mut observed = 0;
+    validator
+        .push_observed(started.clone(), |_| observed += 1)
+        .expect("scan_started validates");
+    assert!(validator.push_observed(started, |_| observed += 1).is_err());
+    assert_eq!(observed, 1);
+}
+
 #[test]
 fn json_schema_is_draft_2020_12_and_lists_full_and_delta_events() {
     let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema must be valid JSON");

@@ -21,7 +21,8 @@ work after validating its inputs and worker compatibility. There is no default
 whole-scan deadline. Each worker has inactivity, memory, output, and concurrency
 limits. In `.depgraph.toml`, `[scan]` supports `max_unit_source_files` (default 2,048),
 `max_unit_source_bytes` (8 MiB), `max_context_source_bytes` (64 MiB),
-`max_concurrent_units` (2), `max_worker_memory_bytes` (2 GiB), and
+`max_concurrent_units` (2), `max_worker_memory_bytes` (6 GiB),
+`max_protocol_bytes` (1 GiB), and
 `worker_timeout_seconds` (300 seconds without progress). Set
 `total_budget_seconds` when an explicit whole-scan time budget is needed.
 `scan --split-plan [--json]` explains, without launching workers, each execution
