@@ -23,7 +23,7 @@ use crate::{
     config::Config,
     scan::ScanCacheMode,
     worker::{
-        AdapterKind, WorkerOutput, WorkerSpec, WorkerUnitInput, execute_worker_unit,
+        AdapterKind, WorkerEvents, WorkerOutput, WorkerSpec, WorkerUnitInput, execute_worker_unit,
         replay_analysis_checkpoint,
     },
 };
@@ -656,7 +656,8 @@ where
     loop {
         while let Some((unit_id, output, reused, staged)) = ready.remove(&next_ingest) {
             progress.units[next_ingest].protocol_events = output.events.len() as u64;
-            progress.units[next_ingest].loader = loader_observations(&output.events);
+            progress.units[next_ingest].loader =
+                loader_observations(&output.events.named("profile_declared").collect::<Vec<_>>());
             if let Some(bytes) = output.peak_memory_bytes {
                 progress.units[next_ingest]
                     .loader
@@ -723,7 +724,7 @@ where
                         replay_analysis_checkpoint(events, &item.spec, root, scan_id, &config.scan)
                             .ok()?;
                     validate_unit_output(&item, &output).ok()?;
-                    semantic_checkpoint_complete(item.request.as_ref(), &output.events)
+                    output_semantic_checkpoint_complete(item.request.as_ref(), &output)
                         .then_some(output)
                 });
                 if let Some(output) = cached {
@@ -811,7 +812,7 @@ where
                     }
                     Err(error) => WorkerOutput {
                         adapter: spec.adapter,
-                        events: Vec::new(),
+                        events: WorkerEvents::default(),
                         stderr: String::new(),
                         stderr_truncated: false,
                         error: Some(error.to_string()),
@@ -847,7 +848,7 @@ where
                     .context("analysis task has no owning unit")?;
                 let output = WorkerOutput {
                     adapter,
-                    events: Vec::new(),
+                    events: WorkerEvents::default(),
                     stderr: String::new(),
                     stderr_truncated: false,
                     error: Some(format!("analysis unit task failed: {error}")),
@@ -866,13 +867,13 @@ where
         // Serialize without publishing. A protocol-valid stream can still be
         // rejected by the Store's cross-unit integrity and coverage checks.
         let staged = if output.error.is_none()
-            && semantic_checkpoint_complete(item.request.as_ref(), &output.events)
+            && output_semantic_checkpoint_complete(item.request.as_ref(), &output)
             && !cancellation.is_cancelled()
             && package_semantic_checkpoint_bound(&item)
             && validate_inputs(&item, AnalysisInputValidation::CheckpointWrite)
             && let (Some(checkpoints), Some(key)) = (&checkpoints, &item.checkpoint_key)
         {
-            match checkpoints.stage(key, &output.events) {
+            match checkpoints.stage(key, &output.events.to_values()) {
                 Ok(staged) => staged,
                 Err(error) => {
                     tracing::warn!(unit_id = item.unit_id, %error, "analysis unit checkpoint could not be staged");
@@ -938,6 +939,21 @@ fn stage_prerequisites(work: &[AnalysisWorkItem]) -> Result<Vec<Option<usize>>> 
             Ok(previous)
         })
         .collect()
+}
+
+/// [`semantic_checkpoint_complete`] of a worker output. It reads only the
+/// profile declarations and completions, so only those events are parsed.
+fn output_semantic_checkpoint_complete(request: Option<&Value>, output: &WorkerOutput) -> bool {
+    let events = output
+        .events
+        .select(|name| {
+            matches!(
+                name,
+                "profile_declared" | "profile_completed" | "scan_completed"
+            )
+        })
+        .collect::<Vec<_>>();
+    semantic_checkpoint_complete(request, &events)
 }
 
 /// A successful protocol stream can still contain a typed graph after SSA or
@@ -1057,7 +1073,14 @@ fn validate_unit_output(item: &AnalysisWorkItem, output: &WorkerOutput) -> Resul
                     || ((path.ends_with(".s") || path.ends_with(".S"))
                         && (unit_root == "." || path.starts_with(&prefix)))))
     };
-    for event in &output.events {
+    // Only these events are checked; the rest of a large stream stays compact.
+    let checked = output.events.select(|name| {
+        matches!(
+            name,
+            "profile_declared" | "file_completed" | "dependency_site"
+        )
+    });
+    for event in checked {
         match event["event"].as_str() {
             Some("profile_declared") => {
                 let properties = &event["profile"]["properties"];
@@ -1542,14 +1565,15 @@ for (const event of [
                 attested_rust_sysroot: None,
             },
         };
+        let mut events = vec![
+            json!({"event":"profile_declared", "profile":{"properties": {
+            "analysis_unit_contract":"depgraph-analysis-unit-v1", "analysis_unit_id":"unit",
+            "analysis_unit_root":"app", "analysis_stage":"syntax"}}}),
+            json!({"event":"file_completed", "path":"app/main.go"}),
+        ];
         let mut output = WorkerOutput {
             adapter: AdapterKind::Go,
-            events: vec![
-                json!({"event":"profile_declared", "profile":{"properties": {
-                "analysis_unit_contract":"depgraph-analysis-unit-v1", "analysis_unit_id":"unit",
-                "analysis_unit_root":"app", "analysis_stage":"syntax"}}}),
-                json!({"event":"file_completed", "path":"app/main.go"}),
-            ],
+            events: events.clone().into(),
             stderr: String::new(),
             stderr_truncated: false,
             error: None,
@@ -1558,10 +1582,12 @@ for (const event of [
             peak_memory_bytes: None,
         };
         validate_unit_output(&item, &output)?;
-        output.events[1]["path"] = json!("other/main.go");
+        events[1]["path"] = json!("other/main.go");
+        output.events = events.clone().into();
         assert!(validate_unit_output(&item, &output).is_err());
-        output.events[1]["path"] = json!("app/main.go");
-        output.events[0]["profile"]["properties"]["analysis_unit_id"] = json!("other");
+        events[1]["path"] = json!("app/main.go");
+        events[0]["profile"]["properties"]["analysis_unit_id"] = json!("other");
+        output.events = events.into();
         assert!(validate_unit_output(&item, &output).is_err());
         let directory = tempfile::tempdir()?;
         let inventory = directory.path().join("inventory.json");

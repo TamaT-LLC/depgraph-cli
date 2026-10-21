@@ -25,6 +25,10 @@ use tokio::{
 };
 use walkdir::WalkDir;
 
+mod events;
+pub(crate) use events::EncodedEvent;
+pub use events::WorkerEvents;
+
 use crate::{
     BOUNDED_QUERY_RELEASE_SMOKE_FIXTURE_PATH, BOUNDED_QUERY_RELEASE_SMOKE_QUERY,
     RUST_SYSROOT_COMPONENT_NAME, RUST_SYSROOT_COMPONENT_ROOT, RUST_SYSROOT_COMPONENT_VERSION,
@@ -207,7 +211,7 @@ pub struct WorkerSpec {
 #[derive(Debug)]
 pub struct WorkerOutput {
     pub adapter: AdapterKind,
-    pub events: Vec<Value>,
+    pub events: WorkerEvents,
     pub stderr: String,
     pub stderr_truncated: bool,
     pub error: Option<String>,
@@ -233,7 +237,7 @@ pub(crate) struct WorkerDeltaOutput {
 
 #[derive(Debug)]
 struct WorkerExecution {
-    events: Vec<Value>,
+    events: WorkerEvents,
     delta: Option<ValidatedDelta>,
     stderr: String,
     stderr_truncated: bool,
@@ -1634,7 +1638,7 @@ pub async fn execute_worker(
             let error = format!("{error:#}");
             WorkerOutput {
                 adapter,
-                events: Vec::new(),
+                events: WorkerEvents::default(),
                 stderr: error.clone(),
                 stderr_truncated: false,
                 failure_kind: Some(WorkerFailureKind::Launch),
@@ -1692,7 +1696,7 @@ pub(crate) async fn execute_worker_unit(spec: WorkerSpec, input: WorkerUnitInput
             let error = format!("{error:#}");
             WorkerOutput {
                 adapter,
-                events: Vec::new(),
+                events: WorkerEvents::default(),
                 stderr: error.clone(),
                 stderr_truncated: false,
                 failure_kind: Some(WorkerFailureKind::Launch),
@@ -2104,7 +2108,7 @@ where
                     expected_version.as_deref(),
                 );
                 (
-                    Vec::new(),
+                    WorkerEvents::default(),
                     parsed.delta,
                     parsed.error,
                     parsed.failure_kind,
@@ -2756,7 +2760,7 @@ pub fn parse_and_validate_events(
     if let Some(error) = parsed.error {
         bail!(error);
     }
-    Ok(parsed.events)
+    Ok(parsed.events.to_values())
 }
 
 /// Rebind a disposable checkpoint to this attempt, then repeat the same
@@ -2806,7 +2810,7 @@ pub(crate) fn replay_analysis_checkpoint(
 
 #[derive(Debug)]
 struct ParsedProtocol {
-    events: Vec<Value>,
+    events: WorkerEvents,
     error: Option<String>,
     failure_kind: Option<WorkerFailureKind>,
     security_violation: bool,
@@ -2946,7 +2950,6 @@ fn parse_events_with_expansion_limit(
     release_attested: Option<bool>,
     expansion_limit: usize,
 ) -> ParsedProtocol {
-    let mut validator = ProtocolValidator::for_safe_scan();
     let mut compact_evidence = requests_compact_evidence(expected_adapter)
         .then(|| CompactEvidenceDecoder::with_expansion_limit(expansion_limit));
     let line_limit = configured_line_limit.min(MAX_EVENT_LINE_BYTES);
@@ -2954,6 +2957,17 @@ fn parse_events_with_expansion_limit(
     let mut failure_kind = None;
     let mut security_violation = false;
     let enforce_web_definition_graph = release_attested.is_some() && expected_adapter == "web";
+    // Retain each accepted event once, as compact JSON, instead of as a typed
+    // event beside the validator's upsert maps and then as a JSON value
+    // (#598). The Web semantic checks below rewrite the typed prefix after a
+    // rejection, so a Web stream keeps its typed prefix until the end.
+    let retain_typed_prefix = enforce_web_definition_graph;
+    let mut validator = if retain_typed_prefix {
+        ProtocolValidator::for_safe_scan()
+    } else {
+        ProtocolValidator::for_safe_scan().without_graph_event_retention()
+    };
+    let mut accepted = WorkerEvents::default();
     let mut web_profiles = BTreeSet::new();
     let mut web_definition_profiles = BTreeSet::new();
     let mut web_import_type_profiles = BTreeSet::new();
@@ -3588,7 +3602,11 @@ fn parse_events_with_expansion_limit(
         let current_web_framework_semantic_delta =
             enforce_web_definition_graph && is_web_framework_semantic_delta_event(&event);
         saw_web_framework_semantic_delta |= current_web_framework_semantic_delta;
-        if let Err(error) = validator.push(event) {
+        if let Err(error) = validator.push_observed(event, |event| {
+            if !retain_typed_prefix {
+                accepted.push_protocol(event);
+            }
+        }) {
             if let Some(site_id) = current_site_closure {
                 web_discarded_site_ids.insert(site_id);
             }
@@ -3692,11 +3710,15 @@ fn parse_events_with_expansion_limit(
             );
         }
     }
-    let events = prefix
-        .into_iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .expect("typed protocol events always serialize");
+    let events = if retain_typed_prefix {
+        let mut events = WorkerEvents::default();
+        for event in prefix {
+            events.push_protocol(&event);
+        }
+        events
+    } else {
+        accepted
+    };
     ParsedProtocol {
         events,
         error: parse_error,
