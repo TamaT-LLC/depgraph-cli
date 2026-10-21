@@ -1105,6 +1105,10 @@ impl<'a> EvidenceByOwner<'a> {
         owners: &HashSet<&str>,
     ) -> Self {
         let mut by_owner = HashMap::<_, Vec<_>>::with_capacity(owners.len());
+        if owners.is_empty() {
+            // An empty page (e.g. offset past the end) needs no evidence scan.
+            return Self { by_owner };
+        }
         for record in records {
             if record.owner_type == owner_type && owners.contains(record.owner_id.as_str()) {
                 by_owner
@@ -1512,6 +1516,14 @@ mod tests {
             assert_eq!(total_items, u64::try_from(site_count).expect("count"));
             assert_eq!(builds, 100, "site_count={site_count}");
         }
+        let fixture = fixture(1_000);
+        let ((items, total_items), builds) = owner_evidence_builds(|| {
+            sites_page_items(fixture.sites, &fixture.evidence, None, None, 5_000, 100)
+                .expect("sites page past the end")
+        });
+        assert!(items.is_empty());
+        assert_eq!(total_items, 1_000);
+        assert_eq!(builds, 0);
     }
 
     #[test]
