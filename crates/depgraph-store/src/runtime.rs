@@ -1822,6 +1822,18 @@ mod tests {
         )?;
         assert_eq!(page.total_items, expected.len() as u64);
         assert_eq!(page.items, expected);
+        for node in &snapshot.nodes {
+            assert_eq!(
+                store.find_completed_snapshot_node(snapshot_id, &node.id, || false)?,
+                Some(node.clone()),
+                "{}",
+                node.id
+            );
+        }
+        assert_eq!(
+            store.find_completed_snapshot_node(snapshot_id, "node:missing", || false)?,
+            None
+        );
         Ok(())
     }
 

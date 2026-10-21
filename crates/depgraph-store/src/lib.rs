@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashSet},
     path::Path,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,6 +23,7 @@ mod incremental;
 mod profile_matrix;
 mod profiling;
 mod read;
+mod read_cache;
 mod records;
 mod runtime;
 mod schema;
@@ -69,6 +71,7 @@ use read::{
     load_profiles, load_scan_attempt_summary, load_scan_topology, load_sites, merge_coverage,
     observed_coverage, topology_from_snapshot,
 };
+pub use read_cache::enable_read_cache;
 pub use records::*;
 pub use runtime::{
     PreparedRuntimeImport, RuntimeEdgeContext, RuntimeImportRecoveryIdentity, RuntimeImportResult,
@@ -180,6 +183,101 @@ effective_diagnostics(
       FROM diagnostic_candidates
      GROUP BY id
 )";
+
+/// Recursive CTEs that resolve the layers of one completed snapshot (`?1`):
+/// the snapshot itself, its build and runtime overlays, and the semantic
+/// no-op scans it inherits from. Paged node reads share them so that every
+/// projection walks the layers exactly as the canonical loader does.
+macro_rules! completed_snapshot_layers_sql {
+    () => {
+        r#"
+WITH RECURSIVE
+snapshot_records(
+    id, parent_snapshot_id, scan_parent_snapshot_id, scan_id, source_kind,
+    build_attempt_id, runtime_session_set_json, scan_exists,
+    semantic_noop, follow_parent
+) AS (
+    SELECT snapshot.id, snapshot.parent_snapshot_id, scan.parent_snapshot_id,
+           snapshot.scan_id, snapshot.source_kind, snapshot.build_attempt_id,
+           snapshot.runtime_session_set_json, scan.id IS NOT NULL,
+           CASE
+               WHEN snapshot.build_attempt_id IS NULL
+                AND snapshot.runtime_session_set_json='[]'
+                AND scan.parent_snapshot_id IS NOT NULL
+                AND (SELECT COUNT(*) FROM profiles WHERE scan_id=snapshot.scan_id)=0
+                AND (SELECT COUNT(*) FROM incremental_deltas
+                      WHERE scan_id=snapshot.scan_id AND status='applied')=1
+               THEN 1
+               ELSE 0
+           END,
+           CASE
+               WHEN snapshot.source_kind IN ('build', 'runtime') THEN 1
+               WHEN snapshot.build_attempt_id IS NULL
+                AND snapshot.runtime_session_set_json='[]'
+                AND scan.parent_snapshot_id IS NOT NULL
+                AND (SELECT COUNT(*) FROM profiles WHERE scan_id=snapshot.scan_id)=0
+                AND (SELECT COUNT(*) FROM incremental_deltas
+                      WHERE scan_id=snapshot.scan_id AND status='applied')=1
+               THEN 1
+               ELSE 0
+           END
+      FROM completed_snapshots AS snapshot
+      LEFT JOIN scans AS scan ON scan.id=snapshot.scan_id
+     WHERE snapshot.status='completed'
+),
+snapshot_layers(
+    id, parent_snapshot_id, scan_parent_snapshot_id, scan_id, source_kind,
+    build_attempt_id, runtime_session_set_json, scan_exists,
+    semantic_noop, follow_parent, depth, visited_path, cycle
+) AS (
+    SELECT record.id, record.parent_snapshot_id, record.scan_parent_snapshot_id,
+           record.scan_id, record.source_kind, record.build_attempt_id,
+           record.runtime_session_set_json, record.scan_exists,
+           record.semantic_noop, record.follow_parent, 0,
+           char(31) || record.id || char(31), 0
+      FROM snapshot_records AS record
+     WHERE record.id=?1
+    UNION ALL
+    SELECT parent.id, parent.parent_snapshot_id, parent.scan_parent_snapshot_id,
+           parent.scan_id, parent.source_kind, parent.build_attempt_id,
+           parent.runtime_session_set_json, parent.scan_exists,
+           parent.semantic_noop, parent.follow_parent, child.depth + 1,
+           child.visited_path || parent.id || char(31),
+           instr(
+               child.visited_path,
+               char(31) || parent.id || char(31)
+           ) > 0
+      FROM snapshot_layers AS child
+      JOIN snapshot_records AS parent ON parent.id=child.parent_snapshot_id
+     WHERE child.follow_parent=1 AND child.cycle=0
+),
+applicable_build_layers AS (
+    SELECT layer.*
+      FROM snapshot_layers AS layer
+     WHERE layer.build_attempt_id IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+             FROM snapshot_layers AS parent
+            WHERE parent.depth=layer.depth + 1
+              AND parent.build_attempt_id=layer.build_attempt_id
+       )
+),
+runtime_layer_sessions(layer_depth, session_id, session_ordinal) AS (
+    SELECT layer.depth, CAST(session.value AS TEXT), CAST(session.key AS INTEGER)
+      FROM snapshot_layers AS layer
+      JOIN json_each(layer.runtime_session_set_json) AS session
+     WHERE NOT EXISTS (
+           SELECT 1
+             FROM snapshot_layers AS parent
+             JOIN json_each(parent.runtime_session_set_json) AS inherited
+            WHERE parent.depth=layer.depth + 1
+              AND inherited.type='text'
+              AND inherited.value=session.value
+       )
+),
+"#
+    };
+}
 
 pub struct Store {
     connection: Connection,
@@ -320,10 +418,12 @@ impl Store {
             bail!("store read cancelled before traversal");
         }
         self.connection.progress_handler(100, Some(cancelled));
+        let before = read_cache::observe_before_read(&self.connection);
         let begin = self.connection.execute_batch("BEGIN DEFERRED TRANSACTION");
         let began = begin.is_ok();
         let result = match begin {
             Ok(()) => {
+                let _pinned = read_cache::pin_read(&self.connection, before);
                 operation(self).context("store read failed or was cancelled during traversal")
             }
             Err(error) => Err(error.into()),
@@ -545,342 +645,69 @@ impl Store {
         let kinds = serde_json::to_string(kinds)?;
         self.interruptible_read(cancelled, |store| {
             verify_completed_snapshot_seal(&store.connection, snapshot_id)?;
-            let sql = r#"
-WITH RECURSIVE
-snapshot_records(
-    id, parent_snapshot_id, scan_parent_snapshot_id, scan_id, source_kind,
-    build_attempt_id, runtime_session_set_json, scan_exists,
-    semantic_noop, follow_parent
-) AS (
-    SELECT snapshot.id, snapshot.parent_snapshot_id, scan.parent_snapshot_id,
-           snapshot.scan_id, snapshot.source_kind, snapshot.build_attempt_id,
-           snapshot.runtime_session_set_json, scan.id IS NOT NULL,
-           CASE
-               WHEN snapshot.build_attempt_id IS NULL
-                AND snapshot.runtime_session_set_json='[]'
-                AND scan.parent_snapshot_id IS NOT NULL
-                AND (SELECT COUNT(*) FROM profiles WHERE scan_id=snapshot.scan_id)=0
-                AND (SELECT COUNT(*) FROM incremental_deltas
-                      WHERE scan_id=snapshot.scan_id AND status='applied')=1
-               THEN 1
-               ELSE 0
-           END,
-           CASE
-               WHEN snapshot.source_kind IN ('build', 'runtime') THEN 1
-               WHEN snapshot.build_attempt_id IS NULL
-                AND snapshot.runtime_session_set_json='[]'
-                AND scan.parent_snapshot_id IS NOT NULL
-                AND (SELECT COUNT(*) FROM profiles WHERE scan_id=snapshot.scan_id)=0
-                AND (SELECT COUNT(*) FROM incremental_deltas
-                      WHERE scan_id=snapshot.scan_id AND status='applied')=1
-               THEN 1
-               ELSE 0
-           END
-      FROM completed_snapshots AS snapshot
-      LEFT JOIN scans AS scan ON scan.id=snapshot.scan_id
-     WHERE snapshot.status='completed'
-),
-snapshot_layers(
-    id, parent_snapshot_id, scan_parent_snapshot_id, scan_id, source_kind,
-    build_attempt_id, runtime_session_set_json, scan_exists,
-    semantic_noop, follow_parent, depth, visited_path, cycle
-) AS (
-    SELECT record.id, record.parent_snapshot_id, record.scan_parent_snapshot_id,
-           record.scan_id, record.source_kind, record.build_attempt_id,
-           record.runtime_session_set_json, record.scan_exists,
-           record.semantic_noop, record.follow_parent, 0,
-           char(31) || record.id || char(31), 0
-      FROM snapshot_records AS record
-     WHERE record.id=?1
-    UNION ALL
-    SELECT parent.id, parent.parent_snapshot_id, parent.scan_parent_snapshot_id,
-           parent.scan_id, parent.source_kind, parent.build_attempt_id,
-           parent.runtime_session_set_json, parent.scan_exists,
-           parent.semantic_noop, parent.follow_parent, child.depth + 1,
-           child.visited_path || parent.id || char(31),
-           instr(
-               child.visited_path,
-               char(31) || parent.id || char(31)
-           ) > 0
-      FROM snapshot_layers AS child
-      JOIN snapshot_records AS parent ON parent.id=child.parent_snapshot_id
-     WHERE child.follow_parent=1 AND child.cycle=0
-),
-applicable_build_layers AS (
-    SELECT layer.*
-      FROM snapshot_layers AS layer
-     WHERE layer.build_attempt_id IS NOT NULL
-       AND NOT EXISTS (
-           SELECT 1
-             FROM snapshot_layers AS parent
-            WHERE parent.depth=layer.depth + 1
-              AND parent.build_attempt_id=layer.build_attempt_id
-       )
-),
-runtime_layer_sessions(layer_depth, session_id, session_ordinal) AS (
-    SELECT layer.depth, CAST(session.value AS TEXT), CAST(session.key AS INTEGER)
-      FROM snapshot_layers AS layer
-      JOIN json_each(layer.runtime_session_set_json) AS session
-     WHERE NOT EXISTS (
-           SELECT 1
-             FROM snapshot_layers AS parent
-             JOIN json_each(parent.runtime_session_set_json) AS inherited
-            WHERE parent.depth=layer.depth + 1
-              AND inherited.type='text'
-              AND inherited.value=session.value
-       )
-),
-node_candidates(
-    id, kind, locator, display_name,
-    layer_depth, source_order, collection_order, item_order
-) AS (
-    SELECT node.id, node.kind, node.locator, node.display_name,
-           layer.depth, 0, 0, node.rowid
-      FROM snapshot_layers AS layer
-      JOIN nodes AS node ON node.scan_id=layer.scan_id
-     WHERE layer.follow_parent=0 AND layer.cycle=0
-    UNION ALL
-    SELECT json_extract(item.value, '$.id'),
-           json_extract(item.value, '$.kind'),
-           json_extract(item.value, '$.locator'),
-           json_extract(item.value, '$.display_name'),
-           layer.depth, 1, 0, CAST(item.key AS INTEGER)
-      FROM applicable_build_layers AS layer
-      JOIN build_attempts AS attempt ON attempt.id=layer.build_attempt_id
-      JOIN json_each(attempt.delta_json, '$.nodes') AS item
-     WHERE attempt.base_scan_id=layer.scan_id
-       AND attempt.status='completed'
-       AND attempt.delta_json IS NOT NULL
-    UNION ALL
-    SELECT json_extract(node.raw_json, '$.id'),
-           json_extract(node.raw_json, '$.kind'),
-           json_extract(node.raw_json, '$.locator'),
-           json_extract(node.raw_json, '$.display_name'),
-           session.layer_depth, 2, session.session_ordinal, node.rowid
-      FROM runtime_layer_sessions AS session
-      JOIN runtime_nodes AS node ON node.session_id=session.session_id
-),
-ranked_nodes AS (
-    SELECT id, kind, locator, display_name,
-           ROW_NUMBER() OVER (
-               PARTITION BY id
-               ORDER BY layer_depth DESC, source_order,
-                        collection_order, item_order
-           ) AS precedence
-      FROM node_candidates
-),
-semantic_parent_candidates AS (
-    SELECT layer.depth AS overlay_depth,
-           overlay.id AS overlay_id,
-           overlay.kind AS overlay_kind,
-           overlay.locator AS overlay_locator,
-           overlay.display_name AS overlay_display_name,
-           candidate.kind AS parent_kind,
-           candidate.locator AS parent_locator,
-           candidate.display_name AS parent_display_name,
-           ROW_NUMBER() OVER (
-               PARTITION BY layer.depth, overlay.id
-               ORDER BY candidate.layer_depth DESC, candidate.source_order,
-                        candidate.collection_order, candidate.item_order
-           ) AS precedence
-      FROM snapshot_layers AS layer
-      JOIN nodes AS overlay ON overlay.scan_id=layer.scan_id
-      JOIN node_candidates AS candidate
-        ON candidate.id=overlay.id AND candidate.layer_depth>layer.depth
-     WHERE layer.semantic_noop=1
-),
-projection_state(target_exists, integrity_valid) AS (
-    SELECT EXISTS(SELECT 1 FROM snapshot_layers WHERE depth=0),
-           CASE
-               WHEN NOT EXISTS(SELECT 1 FROM snapshot_layers WHERE depth=0) THEN 0
-               WHEN EXISTS(
-                   SELECT 1 FROM snapshot_layers
-                    WHERE cycle=1 OR scan_exists=0
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM snapshot_layers AS layer
-                    WHERE layer.follow_parent=1
-                      AND (
-                          layer.parent_snapshot_id IS NULL
-                          OR NOT EXISTS (
-                              SELECT 1 FROM snapshot_layers AS parent
-                               WHERE parent.depth=layer.depth + 1
-                          )
-                      )
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM snapshot_layers AS layer
-                    WHERE layer.semantic_noop=1
-                      AND (
-                          layer.parent_snapshot_id IS NOT layer.scan_parent_snapshot_id
-                          OR (SELECT COUNT(*) FROM nodes
-                               WHERE scan_id=layer.scan_id) != 1
-                          OR EXISTS (
-                              SELECT 1 FROM nodes
-                               WHERE scan_id=layer.scan_id
-                                 AND json_valid(properties_json)=0
-                          )
-                          OR NOT EXISTS (
-                              SELECT 1
-                                FROM semantic_parent_candidates AS parent
-                               WHERE parent.overlay_depth=layer.depth
-                                 AND parent.precedence=1
-                                 AND parent.overlay_kind=parent.parent_kind
-                                 AND parent.overlay_locator=parent.parent_locator
-                                 AND parent.overlay_display_name=parent.parent_display_name
-                          )
-                      )
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM applicable_build_layers AS layer
-                     LEFT JOIN build_attempts AS attempt
-                       ON attempt.id=layer.build_attempt_id
-                      AND attempt.base_scan_id=layer.scan_id
-                      AND attempt.status='completed'
-                    WHERE attempt.id IS NULL
-                       OR attempt.delta_json IS NULL
-                       OR json_valid(attempt.delta_json)=0
-                       OR json_type(attempt.delta_json, '$.profiles')!='array'
-                       OR json_type(attempt.delta_json, '$.nodes')!='array'
-                       OR json_type(attempt.delta_json, '$.sites')!='array'
-                       OR json_type(attempt.delta_json, '$.edges')!='array'
-                       OR json_type(attempt.delta_json, '$.evidence')!='array'
-                       OR json_type(attempt.delta_json, '$.diagnostics')!='array'
-                       OR json_type(attempt.delta_json, '$.coverage')!='object'
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM applicable_build_layers AS layer
-                     JOIN build_attempts AS attempt ON attempt.id=layer.build_attempt_id
-                     JOIN json_each(attempt.delta_json, '$.nodes') AS node
-                    WHERE json_type(node.value, '$.id')!='text'
-                       OR json_type(node.value, '$.kind')!='text'
-                       OR json_type(node.value, '$.locator')!='text'
-                       OR json_type(node.value, '$.display_name')!='text'
-                       OR json_type(node.value, '$.properties') IS NULL
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1 FROM snapshot_layers AS layer
-                    WHERE json_valid(layer.runtime_session_set_json)=0
-                       OR json_type(layer.runtime_session_set_json)!='array'
-                       OR EXISTS (
-                           SELECT 1 FROM json_each(layer.runtime_session_set_json)
-                            WHERE type!='text'
-                       )
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM runtime_layer_sessions AS earlier
-                     JOIN runtime_layer_sessions AS later
-                       ON later.layer_depth=earlier.layer_depth
-                      AND later.session_ordinal>earlier.session_ordinal
-                    WHERE earlier.session_id>=later.session_id
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM runtime_layer_sessions AS layer
-                     LEFT JOIN runtime_sessions AS session
-                       ON session.id=layer.session_id
-                    WHERE session.id IS NULL
-               ) THEN 0
-               WHEN EXISTS(
-                   SELECT 1
-                     FROM runtime_layer_sessions AS layer
-                     JOIN runtime_nodes AS node ON node.session_id=layer.session_id
-                    WHERE json_valid(node.raw_json)=0
-                       OR json_type(node.raw_json, '$.id')!='text'
-                       OR json_type(node.raw_json, '$.kind')!='text'
-                       OR json_type(node.raw_json, '$.locator')!='text'
-                       OR json_type(node.raw_json, '$.display_name')!='text'
-                       OR json_type(node.raw_json, '$.properties') IS NULL
-               ) THEN 0
-               ELSE 1
-           END
-),
-filtered_nodes AS (
-    SELECT id, kind, locator, display_name
-      FROM ranked_nodes
-     WHERE precedence=1
-       AND (
-           json_array_length(?4)=0
-           OR kind IN (SELECT CAST(value AS TEXT) FROM json_each(?4))
-       )
-       AND CASE ?3
-           WHEN 'exact' THEN
-               id=?2 OR kind=?2 OR locator=?2 OR display_name=?2
-           WHEN 'prefix' THEN
-               substr(id, 1, length(?2))=?2
-               OR substr(kind, 1, length(?2))=?2
-               OR substr(locator, 1, length(?2))=?2
-               OR substr(display_name, 1, length(?2))=?2
-           WHEN 'contains' THEN
-               instr(id, ?2)>0 OR instr(kind, ?2)>0
-               OR instr(locator, ?2)>0 OR instr(display_name, ?2)>0
-           ELSE 0
-       END
-),
-total AS (
-    SELECT COUNT(*) AS item_count FROM filtered_nodes
-),
-paged AS (
-    SELECT id, kind, locator, display_name
-      FROM filtered_nodes
-     ORDER BY id COLLATE BINARY
-     LIMIT ?5 OFFSET ?6
-)
-SELECT page.id, page.kind, page.locator, page.display_name, total.item_count,
-       state.target_exists, state.integrity_valid
-  FROM paged AS page CROSS JOIN total CROSS JOIN projection_state AS state
- WHERE state.integrity_valid=1
-UNION ALL
-SELECT NULL, NULL, NULL, NULL,
-       CASE WHEN state.integrity_valid=1 THEN total.item_count ELSE 0 END,
-       state.target_exists, state.integrity_valid
-  FROM total CROSS JOIN projection_state AS state
- WHERE state.integrity_valid=0 OR NOT EXISTS (SELECT 1 FROM paged)
-ORDER BY id COLLATE BINARY
-"#;
-            let mut statement = store.connection.prepare(sql)?;
-            let mut rows = statement.query(params![
+            completed_snapshot_nodes_page(
+                &store.connection,
                 snapshot_id,
                 query,
-                match_mode.as_str(),
-                kinds,
+                match_mode,
+                &kinds,
+                offset,
                 limit,
-                offset
-            ])?;
-            let mut items = Vec::new();
-            let mut total_items = None;
-            let mut target_exists = None;
-            let mut integrity_valid = None;
-            while let Some(row) = rows.next()? {
-                total_items = Some(row.get::<_, u64>(4)?);
-                target_exists = Some(row.get::<_, bool>(5)?);
-                integrity_valid = Some(row.get::<_, bool>(6)?);
-                let Some(id) = row.get::<_, Option<String>>(0)? else {
-                    continue;
-                };
-                items.push(NodeSummaryRecord {
-                    id,
-                    kind: row.get(1)?,
-                    locator: row.get(2)?,
-                    display_name: row.get(3)?,
-                });
+            )
+        })
+    }
+
+    /// Find one node by exact id in a completed snapshot, with its properties.
+    ///
+    /// `find_completed_snapshot_nodes_page` projects only the public identity
+    /// fields so that node pages stay cheap. A single-node read (MCP
+    /// `agent_node_get`) also needs the properties, for example the `path` of
+    /// a Web file node whose locator is `file://…` (Issue #601). This matches
+    /// the node with the node page query, so the snapshot projection is
+    /// validated exactly as for a page, and then reads the properties of that
+    /// one node in the same read transaction and under the same storage seal
+    /// check.
+    ///
+    /// Returns `None` when the snapshot does not contain the node.
+    pub fn find_completed_snapshot_node<C>(
+        &mut self,
+        snapshot_id: &str,
+        node_id: &str,
+        cancelled: C,
+    ) -> Result<Option<NodeRecord>>
+    where
+        C: FnMut() -> bool + Send + 'static,
+    {
+        self.interruptible_read(cancelled, |store| {
+            verify_completed_snapshot_seal(&store.connection, snapshot_id)?;
+            let page = completed_snapshot_nodes_page(
+                &store.connection,
+                snapshot_id,
+                node_id,
+                NodeTextMatch::Exact,
+                "[]",
+                0,
+                i64::MAX,
+            )?;
+            let mut matches = page.items.into_iter().filter(|node| node.id == node_id);
+            let Some(node) = matches.next() else {
+                return Ok(None);
+            };
+            if matches.next().is_some() {
+                bail!("completed snapshot {snapshot_id} projects node {node_id} more than once");
             }
-            if !target_exists.unwrap_or(false) {
-                bail!("completed snapshot {snapshot_id} was not found");
-            }
-            if !integrity_valid.unwrap_or(false) {
-                bail!(
-                    "completed snapshot {snapshot_id} node projection failed integrity validation"
-                );
-            }
-            let total_items =
-                total_items.context("completed snapshot node projection was empty")?;
-            Ok(StorePage { items, total_items })
+            let properties =
+                completed_snapshot_node_properties(&store.connection, snapshot_id, node_id)?
+                    .with_context(|| {
+                        format!("completed snapshot {snapshot_id} node {node_id} has no properties")
+                    })?;
+            Ok(Some(NodeRecord {
+                id: node.id,
+                kind: node.kind,
+                locator: node.locator,
+                display_name: node.display_name,
+                properties,
+            }))
         })
     }
 
@@ -940,7 +767,20 @@ ORDER BY id COLLATE BINARY
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         names.sort();
-        let mut coverage = self.load_completed_snapshot(snapshot_id)?.coverage;
+        // Only the current snapshot may take the one reconstruction the read
+        // cache keeps. Listing other snapshots reuses it when it matches but
+        // never evicts it just to read their coverage (Issue #599).
+        let mut coverage = if self.current_snapshot_id()?.as_deref() == Some(snapshot_id) {
+            self.load_completed_snapshot_shared(snapshot_id)?
+                .coverage
+                .clone()
+        } else if let Some(kept) =
+            read_cache::peek_completed_snapshot(&self.connection, snapshot_id)
+        {
+            kept.coverage.clone()
+        } else {
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)?.coverage
+        };
         coverage.completeness.sort();
         coverage.completeness.dedup();
         coverage.reasons.sort();
@@ -2369,8 +2209,27 @@ ORDER BY id COLLATE BINARY
         Ok(snapshot_id)
     }
 
+    /// Loads a completed snapshot.
+    ///
+    /// When the process has called [`enable_read_cache`] and this is a
+    /// read-only handle, the result is copied from the reconstruction kept by
+    /// [`Self::load_completed_snapshot_shared`], which is several times faster
+    /// than reconstructing it from SQLite on a large store.
     pub fn load_completed_snapshot(&self, snapshot_id: &str) -> Result<GraphSnapshot> {
-        load_completed_snapshot_from_connection(&self.connection, snapshot_id)
+        self.load_completed_snapshot_shared(snapshot_id)
+            .map(Arc::unwrap_or_clone)
+    }
+
+    /// Loads a completed snapshot as a shared value.
+    ///
+    /// The result equals the one reconstructed from SQLite. When the process
+    /// has called [`enable_read_cache`] and this is a read-only handle, the
+    /// reconstructed snapshot is reused by later read-only handles on the same
+    /// store until any of the store files change (Issue #599).
+    pub fn load_completed_snapshot_shared(&self, snapshot_id: &str) -> Result<Arc<GraphSnapshot>> {
+        read_cache::load_completed_snapshot_with(&self.connection, snapshot_id, || {
+            load_completed_snapshot_from_connection(&self.connection, snapshot_id)
+        })
     }
 
     /// Load only node identities/kinds and edge endpoints for graph-topology
@@ -3891,6 +3750,334 @@ fn insert_file_coverage(
     Ok(())
 }
 
+/// Run the node page query for one completed snapshot. The caller verifies
+/// the snapshot's storage seal in the same read transaction.
+fn completed_snapshot_nodes_page(
+    connection: &Connection,
+    snapshot_id: &str,
+    query: &str,
+    match_mode: NodeTextMatch,
+    kinds: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<StorePage<NodeSummaryRecord>> {
+    let sql = concat!(
+        completed_snapshot_layers_sql!(),
+        r#"
+node_candidates(
+    id, kind, locator, display_name,
+    layer_depth, source_order, collection_order, item_order
+) AS (
+    SELECT node.id, node.kind, node.locator, node.display_name,
+           layer.depth, 0, 0, node.rowid
+      FROM snapshot_layers AS layer
+      JOIN nodes AS node ON node.scan_id=layer.scan_id
+     WHERE layer.follow_parent=0 AND layer.cycle=0
+    UNION ALL
+    SELECT json_extract(item.value, '$.id'),
+           json_extract(item.value, '$.kind'),
+           json_extract(item.value, '$.locator'),
+           json_extract(item.value, '$.display_name'),
+           layer.depth, 1, 0, CAST(item.key AS INTEGER)
+      FROM applicable_build_layers AS layer
+      JOIN build_attempts AS attempt ON attempt.id=layer.build_attempt_id
+      JOIN json_each(attempt.delta_json, '$.nodes') AS item
+     WHERE attempt.base_scan_id=layer.scan_id
+       AND attempt.status='completed'
+       AND attempt.delta_json IS NOT NULL
+    UNION ALL
+    SELECT json_extract(node.raw_json, '$.id'),
+           json_extract(node.raw_json, '$.kind'),
+           json_extract(node.raw_json, '$.locator'),
+           json_extract(node.raw_json, '$.display_name'),
+           session.layer_depth, 2, session.session_ordinal, node.rowid
+      FROM runtime_layer_sessions AS session
+      JOIN runtime_nodes AS node ON node.session_id=session.session_id
+),
+ranked_nodes AS (
+    SELECT id, kind, locator, display_name,
+           ROW_NUMBER() OVER (
+       PARTITION BY id
+       ORDER BY layer_depth DESC, source_order,
+                collection_order, item_order
+           ) AS precedence
+      FROM node_candidates
+),
+semantic_parent_candidates AS (
+    SELECT layer.depth AS overlay_depth,
+           overlay.id AS overlay_id,
+           overlay.kind AS overlay_kind,
+           overlay.locator AS overlay_locator,
+           overlay.display_name AS overlay_display_name,
+           candidate.kind AS parent_kind,
+           candidate.locator AS parent_locator,
+           candidate.display_name AS parent_display_name,
+           ROW_NUMBER() OVER (
+       PARTITION BY layer.depth, overlay.id
+       ORDER BY candidate.layer_depth DESC, candidate.source_order,
+                candidate.collection_order, candidate.item_order
+           ) AS precedence
+      FROM snapshot_layers AS layer
+      JOIN nodes AS overlay ON overlay.scan_id=layer.scan_id
+      JOIN node_candidates AS candidate
+        ON candidate.id=overlay.id AND candidate.layer_depth>layer.depth
+     WHERE layer.semantic_noop=1
+),
+projection_state(target_exists, integrity_valid) AS (
+    SELECT EXISTS(SELECT 1 FROM snapshot_layers WHERE depth=0),
+           CASE
+       WHEN NOT EXISTS(SELECT 1 FROM snapshot_layers WHERE depth=0) THEN 0
+       WHEN EXISTS(
+           SELECT 1 FROM snapshot_layers
+            WHERE cycle=1 OR scan_exists=0
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM snapshot_layers AS layer
+            WHERE layer.follow_parent=1
+              AND (
+                  layer.parent_snapshot_id IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1 FROM snapshot_layers AS parent
+                       WHERE parent.depth=layer.depth + 1
+                  )
+              )
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM snapshot_layers AS layer
+            WHERE layer.semantic_noop=1
+              AND (
+                  layer.parent_snapshot_id IS NOT layer.scan_parent_snapshot_id
+                  OR (SELECT COUNT(*) FROM nodes
+                       WHERE scan_id=layer.scan_id) != 1
+                  OR EXISTS (
+                      SELECT 1 FROM nodes
+                       WHERE scan_id=layer.scan_id
+                         AND json_valid(properties_json)=0
+                  )
+                  OR NOT EXISTS (
+                      SELECT 1
+                        FROM semantic_parent_candidates AS parent
+                       WHERE parent.overlay_depth=layer.depth
+                         AND parent.precedence=1
+                         AND parent.overlay_kind=parent.parent_kind
+                         AND parent.overlay_locator=parent.parent_locator
+                         AND parent.overlay_display_name=parent.parent_display_name
+                  )
+              )
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM applicable_build_layers AS layer
+             LEFT JOIN build_attempts AS attempt
+               ON attempt.id=layer.build_attempt_id
+              AND attempt.base_scan_id=layer.scan_id
+              AND attempt.status='completed'
+            WHERE attempt.id IS NULL
+               OR attempt.delta_json IS NULL
+               OR json_valid(attempt.delta_json)=0
+               OR json_type(attempt.delta_json, '$.profiles')!='array'
+               OR json_type(attempt.delta_json, '$.nodes')!='array'
+               OR json_type(attempt.delta_json, '$.sites')!='array'
+               OR json_type(attempt.delta_json, '$.edges')!='array'
+               OR json_type(attempt.delta_json, '$.evidence')!='array'
+               OR json_type(attempt.delta_json, '$.diagnostics')!='array'
+               OR json_type(attempt.delta_json, '$.coverage')!='object'
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM applicable_build_layers AS layer
+             JOIN build_attempts AS attempt ON attempt.id=layer.build_attempt_id
+             JOIN json_each(attempt.delta_json, '$.nodes') AS node
+            WHERE json_type(node.value, '$.id')!='text'
+               OR json_type(node.value, '$.kind')!='text'
+               OR json_type(node.value, '$.locator')!='text'
+               OR json_type(node.value, '$.display_name')!='text'
+               OR json_type(node.value, '$.properties') IS NULL
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1 FROM snapshot_layers AS layer
+            WHERE json_valid(layer.runtime_session_set_json)=0
+               OR json_type(layer.runtime_session_set_json)!='array'
+               OR EXISTS (
+                   SELECT 1 FROM json_each(layer.runtime_session_set_json)
+                    WHERE type!='text'
+               )
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM runtime_layer_sessions AS earlier
+             JOIN runtime_layer_sessions AS later
+               ON later.layer_depth=earlier.layer_depth
+              AND later.session_ordinal>earlier.session_ordinal
+            WHERE earlier.session_id>=later.session_id
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM runtime_layer_sessions AS layer
+             LEFT JOIN runtime_sessions AS session
+               ON session.id=layer.session_id
+            WHERE session.id IS NULL
+       ) THEN 0
+       WHEN EXISTS(
+           SELECT 1
+             FROM runtime_layer_sessions AS layer
+             JOIN runtime_nodes AS node ON node.session_id=layer.session_id
+            WHERE json_valid(node.raw_json)=0
+               OR json_type(node.raw_json, '$.id')!='text'
+               OR json_type(node.raw_json, '$.kind')!='text'
+               OR json_type(node.raw_json, '$.locator')!='text'
+               OR json_type(node.raw_json, '$.display_name')!='text'
+               OR json_type(node.raw_json, '$.properties') IS NULL
+       ) THEN 0
+       ELSE 1
+           END
+),
+filtered_nodes AS (
+    SELECT id, kind, locator, display_name
+      FROM ranked_nodes
+     WHERE precedence=1
+       AND (
+           json_array_length(?4)=0
+           OR kind IN (SELECT CAST(value AS TEXT) FROM json_each(?4))
+       )
+       AND CASE ?3
+           WHEN 'exact' THEN
+       id=?2 OR kind=?2 OR locator=?2 OR display_name=?2
+           WHEN 'prefix' THEN
+       substr(id, 1, length(?2))=?2
+       OR substr(kind, 1, length(?2))=?2
+       OR substr(locator, 1, length(?2))=?2
+       OR substr(display_name, 1, length(?2))=?2
+           WHEN 'contains' THEN
+       instr(id, ?2)>0 OR instr(kind, ?2)>0
+       OR instr(locator, ?2)>0 OR instr(display_name, ?2)>0
+           ELSE 0
+       END
+),
+total AS (
+    SELECT COUNT(*) AS item_count FROM filtered_nodes
+),
+paged AS (
+    SELECT id, kind, locator, display_name
+      FROM filtered_nodes
+     ORDER BY id COLLATE BINARY
+     LIMIT ?5 OFFSET ?6
+)
+SELECT page.id, page.kind, page.locator, page.display_name, total.item_count,
+       state.target_exists, state.integrity_valid
+  FROM paged AS page CROSS JOIN total CROSS JOIN projection_state AS state
+ WHERE state.integrity_valid=1
+UNION ALL
+SELECT NULL, NULL, NULL, NULL,
+       CASE WHEN state.integrity_valid=1 THEN total.item_count ELSE 0 END,
+       state.target_exists, state.integrity_valid
+  FROM total CROSS JOIN projection_state AS state
+ WHERE state.integrity_valid=0 OR NOT EXISTS (SELECT 1 FROM paged)
+ORDER BY id COLLATE BINARY
+"#
+    );
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query(params![
+        snapshot_id,
+        query,
+        match_mode.as_str(),
+        kinds,
+        limit,
+        offset
+    ])?;
+    let mut items = Vec::new();
+    let mut total_items = None;
+    let mut target_exists = None;
+    let mut integrity_valid = None;
+    while let Some(row) = rows.next()? {
+        total_items = Some(row.get::<_, u64>(4)?);
+        target_exists = Some(row.get::<_, bool>(5)?);
+        integrity_valid = Some(row.get::<_, bool>(6)?);
+        let Some(id) = row.get::<_, Option<String>>(0)? else {
+            continue;
+        };
+        items.push(NodeSummaryRecord {
+            id,
+            kind: row.get(1)?,
+            locator: row.get(2)?,
+            display_name: row.get(3)?,
+        });
+    }
+    if !target_exists.unwrap_or(false) {
+        bail!("completed snapshot {snapshot_id} was not found");
+    }
+    if !integrity_valid.unwrap_or(false) {
+        bail!("completed snapshot {snapshot_id} node projection failed integrity validation");
+    }
+    let total_items = total_items.context("completed snapshot node projection was empty")?;
+    Ok(StorePage { items, total_items })
+}
+
+/// Read the effective properties of one node in a completed snapshot, with
+/// the same layer precedence as the canonical loader: a semantic no-op
+/// overlay replaces the inherited node (the shallowest overlay wins), and
+/// otherwise the first layer that recorded the node wins over later build and
+/// runtime overlays. The caller verifies the storage seal and the projection
+/// integrity in the same read transaction.
+fn completed_snapshot_node_properties(
+    connection: &Connection,
+    snapshot_id: &str,
+    node_id: &str,
+) -> Result<Option<Value>> {
+    let sql = concat!(
+        completed_snapshot_layers_sql!(),
+        r#"
+property_candidates(
+    properties_json, overlay_rank, layer_rank,
+    source_order, collection_order, item_order
+) AS (
+    SELECT node.properties_json, 0, layer.depth, 0, 0, 0
+      FROM snapshot_layers AS layer
+      JOIN nodes AS node ON node.scan_id=layer.scan_id AND node.id=?2
+     WHERE layer.semantic_noop=1 AND layer.cycle=0
+    UNION ALL
+    SELECT node.properties_json, 1, -layer.depth, 0, 0, node.rowid
+      FROM snapshot_layers AS layer
+      JOIN nodes AS node ON node.scan_id=layer.scan_id AND node.id=?2
+     WHERE layer.follow_parent=0 AND layer.cycle=0
+    UNION ALL
+    SELECT item.value -> '$.properties', 1, -layer.depth, 1, 0,
+           CAST(item.key AS INTEGER)
+      FROM applicable_build_layers AS layer
+      JOIN build_attempts AS attempt ON attempt.id=layer.build_attempt_id
+      JOIN json_each(attempt.delta_json, '$.nodes') AS item
+     WHERE attempt.base_scan_id=layer.scan_id
+       AND attempt.status='completed'
+       AND attempt.delta_json IS NOT NULL
+       AND json_extract(item.value, '$.id')=?2
+    UNION ALL
+    SELECT node.raw_json -> '$.properties', 1, -session.layer_depth, 2,
+           session.session_ordinal, node.rowid
+      FROM runtime_layer_sessions AS session
+      JOIN runtime_nodes AS node ON node.session_id=session.session_id
+     WHERE json_extract(node.raw_json, '$.id')=?2
+)
+SELECT properties_json
+  FROM property_candidates
+ ORDER BY overlay_rank, layer_rank, source_order, collection_order, item_order
+ LIMIT 1
+"#
+    );
+    let raw = connection
+        .query_row(sql, params![snapshot_id, node_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten();
+    raw.map(|raw| {
+        serde_json::from_str(&raw)
+            .with_context(|| format!("completed snapshot node {node_id} has invalid properties"))
+    })
+    .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4061,6 +4248,18 @@ mod tests {
         )?;
         assert_eq!(page.total_items, expected.len() as u64);
         assert_eq!(page.items, expected);
+        for node in &snapshot.nodes {
+            assert_eq!(
+                store.find_completed_snapshot_node(snapshot_id, &node.id, || false)?,
+                Some(node.clone()),
+                "{}",
+                node.id
+            );
+        }
+        assert_eq!(
+            store.find_completed_snapshot_node(snapshot_id, "node:missing", || false)?,
+            None
+        );
         Ok(())
     }
 
@@ -4162,6 +4361,228 @@ mod tests {
             .completed_snapshot_details(&snapshot_id)
             .expect_err("provenance tampering must invalidate the storage seal");
         assert!(error.to_string().contains("storage seal mismatch"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn issue_599_completed_store(path: &Path) -> Result<String> {
+        let mut store = Store::open(path)?;
+        let scan_id = stage_protocol_fixture(
+            &mut store,
+            include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+            Some("fixture-revision"),
+        )?;
+        store.finish_scan(&scan_id, "completed", None, true)?;
+        store.current_snapshot_id()?.context("snapshot")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_read_cache_reuses_unchanged_store_reads_and_rechecks_after_a_change() -> Result<()>
+    {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let snapshot_id = issue_599_completed_store(&path)?;
+        let writer = Store::open(&path)?;
+
+        read_cache::set_read_cache_enabled_for_test(false);
+        let uncached = Store::open_read_only(&path)?;
+        let expected_details = uncached.completed_snapshot_details(&snapshot_id)?;
+        let expected_snapshot = uncached.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default(),
+            "the cache stays off unless the process enables it"
+        );
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        // Every request opens its own read-only handle, as the MCP server does.
+        for _ in 0..3 {
+            let reader = Store::open_read_only(&path)?;
+            assert_eq!(
+                reader.completed_snapshot_details(&snapshot_id)?,
+                expected_details
+            );
+            assert_eq!(
+                reader.load_completed_snapshot(&snapshot_id)?,
+                expected_snapshot
+            );
+            assert_eq!(
+                *reader.load_completed_snapshot_shared(&snapshot_id)?,
+                expected_snapshot
+            );
+        }
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 2,
+                snapshot_hits: 8,
+                snapshot_loads: 1,
+            },
+            "three requests hash the seal once and reconstruct the snapshot once"
+        );
+
+        // A read transaction pinned by `interruptible_read` reuses them too.
+        let mut reader = Store::open_read_only(&path)?;
+        let details = reader.interruptible_read(
+            || false,
+            |store| store.completed_snapshot_details(&snapshot_id),
+        )?;
+        assert_eq!(details, expected_details);
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 1,
+                snapshot_hits: 1,
+                snapshot_loads: 0,
+            }
+        );
+        // Any other open transaction may read a state older than the files
+        // show now, so it never relies on the cache.
+        reader.connection.execute_batch("BEGIN DEFERRED")?;
+        assert_eq!(
+            reader.completed_snapshot_details(&snapshot_id)?,
+            expected_details
+        );
+        reader.connection.execute_batch("COMMIT")?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+
+        // A writable handle never reuses a verified seal: it may hold
+        // uncommitted changes that the store files do not show yet.
+        writer.completed_snapshot_details(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+
+        // Any committed change to the store invalidates both kinds of reuse,
+        // so tampering with a sealed row is still detected on the next read.
+        writer.connection.execute(
+            "UPDATE nodes SET display_name=display_name || '-tampered'
+              WHERE rowid=(SELECT MIN(rowid) FROM nodes)",
+            [],
+        )?;
+        let reader = Store::open_read_only(&path)?;
+        let error = reader
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("a tampered row must fail the storage seal after a cached verification");
+        assert!(
+            error.to_string().contains("storage seal mismatch"),
+            "{error:#}"
+        );
+        let reloaded = reader.load_completed_snapshot(&snapshot_id)?;
+        assert_ne!(
+            reloaded, expected_snapshot,
+            "the change is visible, not the cached copy"
+        );
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 0,
+                snapshot_hits: 0,
+                snapshot_loads: 1,
+            }
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_listing_another_snapshot_keeps_the_current_reconstruction() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let older_id = {
+            let mut store = Store::open(&path)?;
+            stage_protocol_fixture_with_scan_id(
+                &mut store,
+                include_str!("../../depgraph-protocol/tests/fixtures/protocol-v1.golden.ndjson"),
+                "scan-older",
+                Some("older-revision"),
+            )?;
+            store.finish_scan("scan-older", "completed", None, true)?;
+            store.current_snapshot_id()?.context("older snapshot")?
+        };
+        let current_id = issue_599_completed_store(&path)?;
+        assert_ne!(older_id, current_id);
+        read_cache::set_read_cache_enabled_for_test(false);
+        let expected_older = Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?;
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        Store::open_read_only(&path)?.completed_snapshot_details(&current_id)?;
+        assert_eq!(
+            Store::open_read_only(&path)?.completed_snapshot_details(&older_id)?,
+            expected_older
+        );
+        Store::open_read_only(&path)?.load_completed_snapshot_shared(&current_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts {
+                seal_hits: 0,
+                snapshot_hits: 1,
+                snapshot_loads: 1,
+            },
+            "reading the older snapshot's coverage neither evicts nor replaces the current one"
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_599_read_cache_never_records_a_read_of_a_file_renamed_away() -> Result<()> {
+        let _serial = read_cache::TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("graph.db");
+        let replacement = temporary.path().join("replacement.db");
+        let snapshot_id = issue_599_completed_store(&path)?;
+        assert_eq!(issue_599_completed_store(&replacement)?, snapshot_id);
+        // The replacement carries the same snapshot and stored seal, but one of
+        // its sealed rows was changed afterwards.
+        {
+            let writer = Store::open(&replacement)?;
+            writer.connection.execute(
+                "UPDATE nodes SET display_name=display_name || '-tampered'
+                  WHERE rowid=(SELECT MIN(rowid) FROM nodes)",
+                [],
+            )?;
+        }
+        for sidecar in ["-wal", "-shm", "-journal"] {
+            let mut name = replacement.as_os_str().to_owned();
+            name.push(sidecar);
+            assert!(!Path::new(&name).exists(), "{sidecar} left behind");
+        }
+
+        read_cache::set_read_cache_enabled_for_test(true);
+        let renamed_away = Store::open_read_only(&path)?;
+        std::fs::rename(&replacement, &path)?;
+        // This handle still reads the original, intact file, but the path now
+        // names the replacement, so it bypasses the cache entirely.
+        renamed_away.completed_snapshot_details(&snapshot_id)?;
+        renamed_away.load_completed_snapshot(&snapshot_id)?;
+        assert_eq!(
+            read_cache::take_read_cache_counts_for_test(),
+            read_cache::ReadCacheCounts::default()
+        );
+        let error = Store::open_read_only(&path)?
+            .completed_snapshot_details(&snapshot_id)
+            .expect_err("the replacement must fail its storage seal");
+        assert!(
+            error.to_string().contains("storage seal mismatch"),
+            "{error:#}"
+        );
+        read_cache::set_read_cache_enabled_for_test(false);
         Ok(())
     }
 
@@ -4931,6 +5352,10 @@ mod tests {
                 || false,
             )
             .expect_err("paged projection must reject the same build delta corruption");
+        let node_id = base.nodes[0].id.clone();
+        store
+            .find_completed_snapshot_node(&snapshot_id, &node_id, || false)
+            .expect_err("single-node projection must reject the same build delta corruption");
         Ok(())
     }
 
@@ -4964,6 +5389,10 @@ mod tests {
                 || false,
             )
             .expect_err("paged projection must reject non-node snapshot tampering");
+        let node_id = store.load_snapshot("scan-golden")?.nodes[0].id.clone();
+        store
+            .find_completed_snapshot_node(&snapshot_id, &node_id, || false)
+            .expect_err("single-node projection must reject non-node snapshot tampering");
         Ok(())
     }
 

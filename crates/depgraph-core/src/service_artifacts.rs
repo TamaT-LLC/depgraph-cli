@@ -628,8 +628,15 @@ impl DepgraphService {
             self.load_snapshot_pair(request.from(), request.to(), cancellation)?;
         preflight_graph_work(&from, &to, 1, cancellation)?;
         check_cancelled(cancellation)?;
-        let raw = diff_graph_snapshots(&from_id, &to_id, from, to)
-            .map_err(|source| cancelled_or_store(source, cancellation))?;
+        // The diff consumes its inputs; only a snapshot the read cache still
+        // holds is copied here.
+        let raw = diff_graph_snapshots(
+            &from_id,
+            &to_id,
+            std::sync::Arc::unwrap_or_clone(from),
+            std::sync::Arc::unwrap_or_clone(to),
+        )
+        .map_err(|source| cancelled_or_store(source, cancellation))?;
         let filtered = request.filters().apply(raw);
         let items = graph_snapshot_diff_item_count(&filtered);
         if items > MAX_SHARED_ARTIFACT_ITEMS {
@@ -891,7 +898,12 @@ impl DepgraphService {
         from: &SnapshotLocator,
         to: &SnapshotLocator,
         cancellation: &CancellationToken,
-    ) -> DepgraphServiceResult<(String, GraphSnapshot, String, GraphSnapshot)> {
+    ) -> DepgraphServiceResult<(
+        String,
+        std::sync::Arc<GraphSnapshot>,
+        String,
+        std::sync::Arc<GraphSnapshot>,
+    )> {
         check_cancelled(cancellation)?;
         let mut read_store = self.read_store_factory().open()?;
         let from = from.clone();
@@ -906,11 +918,13 @@ impl DepgraphService {
                 let Some(to_id) = resolve_locator(store, &to)? else {
                     return Ok(None);
                 };
-                let from_snapshot = store.load_completed_snapshot(&from_id)?;
+                // Shared with the read cache of a long-lived reader instead of
+                // being copied (Issue #599).
+                let from_snapshot = store.load_completed_snapshot_shared(&from_id)?;
                 let to_snapshot = if from_id == to_id {
-                    from_snapshot.clone()
+                    std::sync::Arc::clone(&from_snapshot)
                 } else {
-                    store.load_completed_snapshot(&to_id)?
+                    store.load_completed_snapshot_shared(&to_id)?
                 };
                 Ok(Some((from_id, from_snapshot, to_id, to_snapshot)))
             },

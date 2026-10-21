@@ -371,7 +371,7 @@ impl HealthAuditRequest {
 #[derive(Clone, Debug)]
 pub struct PinnedHealthSnapshot {
     id: ResolvedSnapshotId,
-    snapshot: GraphSnapshot,
+    snapshot: std::sync::Arc<GraphSnapshot>,
 }
 
 impl PinnedHealthSnapshot {
@@ -381,7 +381,7 @@ impl PinnedHealthSnapshot {
     }
 
     #[must_use]
-    pub const fn snapshot(&self) -> &GraphSnapshot {
+    pub fn snapshot(&self) -> &GraphSnapshot {
         &self.snapshot
     }
 
@@ -1054,7 +1054,7 @@ impl DepgraphService {
             .collect::<Vec<_>>();
         Ok(HealthHotspotsResult {
             snapshot_id: snapshot_id.clone(),
-            scan_id: snapshot.scan.id,
+            scan_id: snapshot.scan.id.clone(),
             collection_digest: collection_digest(
                 &CollectionIdentity {
                     snapshot_ids: vec![snapshot_id.as_str().to_owned()],
@@ -1728,7 +1728,7 @@ fn load_snapshot_by_id(
     request: &mut SnapshotReadRequest,
     snapshot_id: &str,
     cancellation: &CancellationToken,
-) -> DepgraphServiceResult<GraphSnapshot> {
+) -> DepgraphServiceResult<std::sync::Arc<GraphSnapshot>> {
     if cancellation.is_cancelled() {
         return Err(DepgraphServiceError::Cancelled);
     }
@@ -1738,7 +1738,7 @@ fn load_snapshot_by_id(
         .store()
         .interruptible_read(
             move || cancellation_check.is_cancelled(),
-            move |store| store.load_completed_snapshot(&id),
+            move |store| store.load_completed_snapshot_shared(&id),
         )
         .map_err(DepgraphServiceError::store_operation)
 }
@@ -1959,7 +1959,7 @@ mod tests {
         let stable_id = format!("snapshot:sha256:{}", digest.to_string().repeat(64));
         PinnedHealthSnapshot {
             id: ResolvedSnapshotId::from_completed(stable_id).expect("stable test snapshot ID"),
-            snapshot: empty_snapshot(),
+            snapshot: std::sync::Arc::new(empty_snapshot()),
         }
     }
 

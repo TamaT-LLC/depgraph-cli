@@ -15,7 +15,7 @@ import {
 } from "./imports";
 import { analysisContentHash } from "./source-fingerprint";
 import { NOOP_PROGRESS, type ProgressReporter } from "./progress";
-import { discoverRoutes, routeParentKeys, routeTreeKey, type RouteEntry } from "./routes";
+import { compareRouteSource, discoverRoutes, routeParentKeys, routeTreeKey, type RouteEntry } from "./routes";
 import { mergeTypeScriptDefinitionDelta, type TypeScriptDefinitionDelta } from "./semantic-delta";
 import {
   buildFrameworkCompleteness,
@@ -1207,9 +1207,8 @@ class GraphBuilder {
     });
   }
 
-  routeNode(entry: RouteEntry, owner: PackageRecord): GraphNode {
-    const environment = preferredWebEnvironment("server");
-    const id = stableId("route", {
+  routeNodeId(entry: RouteEntry, owner: PackageRecord): string {
+    return stableId("route", {
       repository: this.#workspace.repositoryIdentity,
       workspace: owner.relativePath,
       package: owner.locator,
@@ -1217,9 +1216,20 @@ class GraphBuilder {
       router_instance: owner.id,
       pattern: entry.pattern,
       ...(entry.routeId === undefined ? {} : { route_id: entry.routeId }),
-      environment,
+      environment: preferredWebEnvironment("server"),
       profile: LOGICAL_PROFILE_ID,
     });
+  }
+
+  /**
+   * `sourcePath` is the repository-relative file core health reads as the
+   * route's location (hotspot location and Git churn). Several entries can
+   * share one route node, so the caller passes the same preferred file for all
+   * of them; see `compareRouteSource`.
+   */
+  routeNode(entry: RouteEntry, owner: PackageRecord, sourcePath: string): GraphNode {
+    const environment = preferredWebEnvironment("server");
+    const id = this.routeNodeId(entry, owner);
     return this.addNode({
       id,
       kind: "route",
@@ -1232,6 +1242,7 @@ class GraphBuilder {
         router_instance: owner.id,
         package_id: owner.id,
         environment,
+        source_path: sourcePath,
       },
     });
   }
@@ -3588,12 +3599,21 @@ export async function scan(
   });
   progress.start("graph_finalize");
 
+  // Choose each route node's source_path from the repository-wide entries, not
+  // only this analysis unit's, so units that share a route emit identical nodes.
+  const routeSourceEntries = new Map<string, RouteEntry>();
+  for (const entry of routeDiscovery.entries) {
+    const id = graph.routeNodeId(entry, owningPackage(workspace, entry.absoluteFile));
+    const current = routeSourceEntries.get(id);
+    if (current === undefined || compareRouteSource(entry, current) < 0) routeSourceEntries.set(id, entry);
+  }
   const routeNodesByGroup = new Map<string, Map<string, { node: GraphNode; evidence: Evidence; entry: RouteEntry }>>();
   for (const entry of outputRouteEntries) {
     const fileNode = graph.fileNode(entry.absoluteFile, entry.generated);
     const coverage = graph.ensureCoverage(fileNode, entry.relativeFile);
     const owner = owningPackage(workspace, entry.absoluteFile);
-    const routeNode = graph.routeNode(entry, owner);
+    const sourceEntry = routeSourceEntries.get(graph.routeNodeId(entry, owner)) ?? entry;
+    const routeNode = graph.routeNode(entry, owner, sourceEntry.relativeFile);
     const resolution: Resolution = {
       status: "resolved",
       precision: entry.generated ? "exact" : entry.framework === "astro" ? "heuristic" : "exact",
