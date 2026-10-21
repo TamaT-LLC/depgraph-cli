@@ -62,6 +62,12 @@ count covers the compact UTF-8 JSON document (the terminal newline is transport
 framing). A traversal-limit result has no continuation after its admitted result set; raise
 `--max-traversal` or narrow filters. `--all` preserves the legacy complete
 query shape, while `export` remains the streaming full-graph interface.
+Collecting the evidence and profile correlation of the returned edges for
+`deps`, `dependents`, and `why` scans the whole snapshot once; that scan is
+bounded by the fixed 16,000,000 work items below, not by `--max-traversal`,
+and the work that grows with the returned edges by a fixed 1,000,000. Either
+bound exits with code 3 and
+`request exhausted a service resource limit: preprocessing_work_items=<maximum>`.
 
 For `cycles`, `--max-traversal` (default 50,000) bounds the dependency edges
 the cycle search visits. For `unresolved`, it bounds the unresolved sites that

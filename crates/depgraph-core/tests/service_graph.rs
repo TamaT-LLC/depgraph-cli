@@ -1979,3 +1979,94 @@ fn issue_617_out_of_range_max_traversal_names_the_argument_and_its_range() {
         }
     }
 }
+
+// Issue #620: dependency listing and path explanation on a large snapshot.
+
+/// Canonical digest of the dependency pages and explained paths of the
+/// Issue #617 fixture, recorded with origin/main `3d7c7fd` before the path
+/// steps stopped counting the snapshot-wide evidence and correlation scans
+/// against the request work budget.
+const ISSUE_620_MID_SIZED_QUERY_DIGEST: &str =
+    "f7d63d2dceeee9ef36ca19fbdaa782d6dde36a034140613bc8c1097b4cd3a409";
+
+fn issue_620_query_digest(
+    service: &DepgraphService,
+    snapshot: &mut depgraph_core::service::SnapshotReadRequest,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let default = depgraph_core::DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL;
+    let mut hasher = Sha256::new();
+    let mut correlated_steps = 0_usize;
+    for (selector, direction, transitive) in [
+        ("id:file:0000", DependencyDirection::Outgoing, false),
+        ("id:file:0000", DependencyDirection::Incoming, false),
+        ("id:file:0000", DependencyDirection::Outgoing, true),
+        ("id:file:0123", DependencyDirection::Incoming, true),
+        ("id:symbol:0001:050", DependencyDirection::Incoming, false),
+        ("id:unknown:missing", DependencyDirection::Incoming, false),
+    ] {
+        let found = service.dependencies(
+            snapshot,
+            &DependenciesRequest::try_new(
+                selector,
+                direction,
+                transitive,
+                GraphQueryFilter::default(),
+                default,
+            )?,
+            cancellation,
+        )?;
+        assert!(found.complete(), "{selector}");
+        assert!(!found.items().is_empty(), "{selector}");
+        // The digest covers the evidence and profile correlation each step
+        // carries, not only the edges.
+        assert!(
+            found
+                .items()
+                .iter()
+                .all(|item| !item.step.evidence.is_empty()),
+            "{selector}"
+        );
+        correlated_steps += found
+            .items()
+            .iter()
+            .filter(|item| item.step.effective_profile_id.is_some())
+            .count();
+        hasher.update(serde_json::to_vec(&found.traversal().root)?);
+        hasher.update(serde_json::to_vec(&found.traversal().nodes)?);
+        hasher.update(serde_json::to_vec(found.items())?);
+    }
+    assert!(correlated_steps > 0);
+    for (from, to) in [
+        ("id:file:0000", "id:file:0009"),
+        ("id:file:0005", "id:symbol:0051:050"),
+    ] {
+        let explained = service.explain_path(
+            snapshot,
+            &ExplainPathRequest::try_new(from, to, GraphQueryFilter::default(), default)?,
+            cancellation,
+        )?;
+        assert!(explained.path().path_found, "{from} -> {to}");
+        hasher.update(serde_json::to_vec(explained.path())?);
+        hasher.update(serde_json::to_vec(explained.items())?);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[test]
+fn issue_620_mid_sized_dependency_pages_and_paths_are_unchanged() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("repository");
+    let store_path = temporary.path().join("cache/graph.db");
+    std::fs::create_dir_all(&root)?;
+    let mut writer = Store::open(&store_path)?;
+    seed_issue_617_graph(&mut writer, &root, Issue617Shape::MID_SIZED)?;
+    drop(writer);
+    let service = service(&root, &store_path)?;
+    let cancellation = CancellationToken::new();
+    let mut snapshot = service.start_snapshot_request("current")?;
+    let digest = issue_620_query_digest(&service, &mut snapshot, &cancellation)?;
+    assert_eq!(digest, ISSUE_620_MID_SIZED_QUERY_DIGEST);
+    Ok(())
+}

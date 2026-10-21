@@ -980,6 +980,17 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Health audit | health の cycle 検出は従来どおり自前の分析予算を cancellation callback で数え、cycle の上限超過（`ResourceLimitExceeded`を含む）を分析の`ResourceExhausted`へ写す |
 | Deterministic artifacts | shared schema（`argument`の`minimum` / `maximum`）、catalog JSON（`max_traversal`の説明）、各SHA-256 fixtureを再生成する |
 
+## Issue #620 path-step scan bounds
+
+`graph_dependencies_list` / `graph_dependents_list`（CLI `deps` / `dependents`）、`graph_path_get`（CLI `why`）、`graph_impact_get`は、返すedgeのevidenceとprofile correlationを集めるためにsnapshotの全evidence・全profile correlation・全profile entryを1回ずつ走査する。この走査を、返すedgeに比例する後処理と同じ前処理上限（1,000,000）で数えていたため、Rust HIRを通したdepgraph-cli自身のsnapshot（evidence 795,912、correlation 120,263、correlationのedge ID 209,051）では走査だけで1,245,578になり、selectorに関係なく失敗した。
+
+| Area | Evidence |
+| --- | --- |
+| Snapshot scan | 全evidence・全profile correlation（phaseとedge IDを含む）・全profile entryの走査は、固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000）で数える。cycle / unresolvedの索引と同じ上限 |
+| Request work | 選んだedgeの数え上げ、evidenceの集約・整列・複製、correlationとphase coverageの複製、path stepとedgeの出力は、従来どおり前処理上限（`MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS`、1,000,000）で数える。上のsnapshotで`crates/depgraph-core/src/config.rs`の`deps`は2,012、`dependents`は194 |
+| Errors | どちらの上限に当たっても`preprocessing_work_items`（`argument`なし、`narrow_query`）を返し、`maximum`で上限を区別する。従来は上限名のない`ResourceExhausted`だった。evidence数・reason数・phase coverage数などの構造上の上限は従来どおりdetailsなし |
+| Output | 返すnode・edge・path step・evidence・correlationの内容と順序は変わらない（Issue #617のフィクスチャでの依存一覧とpathのdigestを修正前のコードで記録して固定） |
+
 ## Issue #568 standard schema formats
 
 schemarsはRustの整数型から`format: "uint32"`などJSON Schema 2020-12にない値を出す。Ajvを使うMCP client（Claude Codeなど）は、tool一覧の取得時にこれを`unknown format "…" ignored`として1件ずつ警告していた（39 toolで1,134件）。

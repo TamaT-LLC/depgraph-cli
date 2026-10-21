@@ -98,6 +98,12 @@ pub(crate) fn resource_limit(error: &anyhow::Error) -> Option<(crate::DepgraphRe
     if let Some(error) = error.downcast_ref::<ImpactChangedPathAttributionExhausted>() {
         return bound(error.limit, error.maximum);
     }
+    if let Some(maximum) = crate::query::preprocessing_work_limit(error) {
+        return bound(
+            crate::DepgraphResourceLimit::PreprocessingWorkItems,
+            maximum,
+        );
+    }
     None
 }
 
