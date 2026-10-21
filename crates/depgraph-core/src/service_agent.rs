@@ -57,6 +57,29 @@ impl NodeProjection {
     }
 }
 
+/// One node with its effective properties.
+///
+/// Node pages (`NodeProjection`) carry only the public identity fields. A
+/// single-node read also needs the properties, for example the `path` of a
+/// Web file node whose locator is `file://…` (Issue #601).
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeDetailProjection {
+    node: NodeProjection,
+    properties: serde_json::Value,
+}
+
+impl NodeDetailProjection {
+    #[must_use]
+    pub const fn node(&self) -> &NodeProjection {
+        &self.node
+    }
+
+    #[must_use]
+    pub const fn properties(&self) -> &serde_json::Value {
+        &self.properties
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FindNodesResult {
     snapshot_id: ResolvedSnapshotId,
@@ -721,6 +744,66 @@ impl DepgraphService {
             snapshot_id: snapshot_id.clone(),
             nodes: page.items.into_iter().map(Into::into).collect(),
             total_items: page.total_items,
+        })
+    }
+
+    /// Read one node by exact id together with its effective properties.
+    ///
+    /// The node is matched with the node page query in the same read as its
+    /// properties, so the snapshot projection is validated exactly as for a
+    /// node page (Issue #601).
+    pub fn get_node(
+        &self,
+        snapshot_id: &ResolvedSnapshotId,
+        node_id: &str,
+        cancellation: &CancellationToken,
+    ) -> DepgraphServiceResult<NodeDetailProjection> {
+        validate_find_nodes_query(node_id)?;
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let mut read_store = self.read_store_factory().open()?;
+        let cancellation_check = cancellation.clone();
+        let node = if snapshot_id.is_attempt() {
+            read_store.store().interruptible_read(
+                move || cancellation_check.is_cancelled(),
+                |store| {
+                    let attempt_id = snapshot_id
+                        .attempt_id()
+                        .ok_or_else(|| anyhow::anyhow!("invalid partial attempt identity"))?;
+                    let mut matches = store
+                        .load_snapshot(attempt_id)?
+                        .nodes
+                        .into_iter()
+                        .filter(|node| node.id == node_id);
+                    let node = matches.next();
+                    if matches.next().is_some() {
+                        anyhow::bail!("partial snapshot projects node {node_id} more than once");
+                    }
+                    Ok(node)
+                },
+            )
+        } else {
+            read_store.store().find_completed_snapshot_node(
+                snapshot_id.as_str(),
+                node_id,
+                move || cancellation_check.is_cancelled(),
+            )
+        };
+        if cancellation.is_cancelled() {
+            return Err(DepgraphServiceError::Cancelled);
+        }
+        let node = node
+            .map_err(DepgraphServiceError::store_operation)?
+            .ok_or(DepgraphServiceError::NotFound)?;
+        Ok(NodeDetailProjection {
+            node: NodeProjection {
+                id: node.id,
+                kind: node.kind,
+                locator: node.locator,
+                display_name: node.display_name,
+            },
+            properties: node.properties,
         })
     }
 

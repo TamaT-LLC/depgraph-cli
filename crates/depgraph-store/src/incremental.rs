@@ -2607,6 +2607,58 @@ mod tests {
     }
 
     #[test]
+    fn single_node_properties_follow_the_shallowest_semantic_noop_overlay() {
+        let (mut store, first_id, _, _, ids) =
+            completed_semantic_noop_fixture("semantic-noop-properties");
+        let projection = store
+            .semantic_noop_delta_base(&first_id, "src/index.ts")
+            .unwrap()
+            .unwrap();
+        let second_scan_id = "semantic-noop-properties-second";
+        let delta = validated_node_delta(
+            second_scan_id,
+            &projection,
+            &ids.source,
+            &format!("sha256:{}", "3".repeat(64)),
+        );
+        let second_id = store
+            .commit_semantic_noop_delta(
+                second_scan_id,
+                Path::new("/fixture"),
+                false,
+                &first_id,
+                Some("revision-second"),
+                &health_provenance(),
+                &delta,
+                "",
+                false,
+            )
+            .unwrap();
+
+        for snapshot_id in [&first_id, &second_id] {
+            let snapshot = store.load_completed_snapshot(snapshot_id).unwrap();
+            for node in &snapshot.nodes {
+                assert_eq!(
+                    store
+                        .find_completed_snapshot_node(snapshot_id, &node.id, || false)
+                        .unwrap(),
+                    Some(node.clone()),
+                    "{snapshot_id} {}",
+                    node.id
+                );
+            }
+        }
+        let node = store
+            .find_completed_snapshot_node(&second_id, &ids.source, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.properties["content_hash"],
+            format!("sha256:{}", "3".repeat(64))
+        );
+    }
+
+    #[test]
     fn analysis_unit_gate_follows_preexisting_semantic_noop_overlay_ancestors() {
         let (store, snapshot, base_scan, _, _) =
             completed_semantic_noop_fixture("analysis-overlay");
