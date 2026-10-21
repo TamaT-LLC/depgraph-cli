@@ -32,6 +32,10 @@ use depgraph_core::{
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
+    AGENT_IMPORT_GROUPS_PAGE_BYTES, AgentContextDetail, AgentContextOutput,
+    AgentEdgesImportsResponse, AgentFanInItem, AgentImportGroup,
+};
+use depgraph_mcp_tools::{
     AgentArgumentReason, AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentEdgeDetail,
     AgentEdgesOutput, AgentEdgesSummaryResponse, AgentError, AgentErrorCode, AgentErrorDetails,
@@ -192,6 +196,17 @@ struct ContextArguments {
     contract_version: ContractVersion,
     #[serde(default)]
     repository_id: Option<LogicalRepositoryId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetContextArguments {
+    #[serde(default)]
+    contract_version: ContractVersion,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
+    #[serde(default)]
+    detail: AgentContextDetail,
 }
 
 #[derive(Deserialize)]
@@ -617,6 +632,27 @@ struct GraphUnresolvedArguments {
     kinds: Vec<String>,
     #[serde(default)]
     max_traversal: Option<usize>,
+    #[serde(default)]
+    cursor: Option<Cursor>,
+    #[serde(default)]
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphFanInArguments {
+    #[serde(default)]
+    contract_version: ContractVersion,
+    #[serde(default)]
+    repository_id: Option<LogicalRepositoryId>,
+    #[serde(default)]
+    snapshot: Option<String>,
+    #[serde(default)]
+    node_kinds: Vec<String>,
+    #[serde(default)]
+    edge_kinds: Vec<String>,
+    #[serde(default)]
+    path_prefixes: Vec<String>,
     #[serde(default)]
     cursor: Option<Cursor>,
     #[serde(default)]
@@ -1474,6 +1510,7 @@ impl ServerHandler for DepgraphMcpServer {
                 | "graph_impact_get"
                 | "graph_cycles_list"
                 | "graph_unresolved_list"
+                | "graph_fan_in_list"
                 | "snapshot_diff_get"
                 | "policy_evaluate"
                 | "graph_export"
@@ -3041,7 +3078,7 @@ fn execute_catalog_read_tool(
 ) -> Result<MappedToolResult, ToolExecutionFailure> {
     match tool {
         "get_context" => {
-            let arguments = decode_arguments::<ContextArguments>(arguments)?;
+            let arguments = decode_arguments::<GetContextArguments>(arguments)?;
             authorize_repository(
                 arguments.contract_version,
                 arguments.repository_id.as_ref(),
@@ -3055,6 +3092,8 @@ fn execute_catalog_read_tool(
                 .transpose()?;
             let result = AgentContext::try_from(&context)
                 .map_err(|_| ToolExecutionFailure::Service(DepgraphServiceError::Integrity))?;
+            // detail=full keeps the frozen AgentContext bytes (Issue #566).
+            let result = AgentContextOutput::project(result, arguments.detail);
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 snapshot_id,
@@ -3319,6 +3358,41 @@ fn execute_catalog_read_tool(
             let offset = pagination
                 .cursor_offset(&request)
                 .map_err(ToolExecutionFailure::Agent)?;
+            if matches!(arguments.detail, AgentEdgeDetail::Imports) {
+                // Groups instead of edges (Issue #566): the cursor is bound to
+                // detail=imports through the normalized request above, and the
+                // smaller byte budget ends a page of name-heavy groups early.
+                let request = PageRequest::new(
+                    request.max_items(),
+                    PageByteLimit::new(AGENT_IMPORT_GROUPS_PAGE_BYTES)
+                        .map_err(contract_mapping_error)?,
+                    request.cursor().cloned(),
+                );
+                let found = service.list_import_groups_page(
+                    &resolved_snapshot_id,
+                    &arguments.node_id,
+                    arguments.direction.into(),
+                    &edge_kinds,
+                    offset,
+                    usize::from(request.max_items().get()),
+                    cancellation,
+                )?;
+                let groups = found
+                    .items()
+                    .iter()
+                    .map(AgentImportGroup::try_from_core)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(contract_mapping_error)?;
+                let page = pagination
+                    .paginate_window(&groups, offset, found.total_items(), &request)
+                    .map_err(ToolExecutionFailure::Agent)?;
+                return CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                    repository_id.clone(),
+                    Some(snapshot_id),
+                    AgentEdgesOutput::Imports(AgentEdgesImportsResponse::new(page)),
+                ))
+                .map_err(Into::into);
+            }
             let found = service.list_edges_page(
                 &resolved_snapshot_id,
                 &arguments.node_id,
@@ -3865,6 +3939,101 @@ fn execute_catalog_read_tool(
                 cancellation,
             )
             .map_err(ToolExecutionFailure::Agent)?;
+            CanonicalResponseMapper::success(&SuccessEnvelope::new(
+                repository_id.clone(),
+                Some(snapshot_id),
+                page,
+            ))
+            .map_err(Into::into)
+        }
+        "graph_fan_in_list" => {
+            validate_array_argument_lengths(
+                &arguments,
+                &["node_kinds", "edge_kinds", "path_prefixes"],
+            )?;
+            let arguments = decode_arguments::<GraphFanInArguments>(arguments)?;
+            authorize_repository(
+                arguments.contract_version,
+                arguments.repository_id.as_ref(),
+                repository_id,
+            )?;
+            let mut node_kinds = arguments
+                .node_kinds
+                .iter()
+                .map(|kind| AgentToken::parse(kind).map(|_| kind.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    invalid_argument(Some("node_kinds"), AgentArgumentReason::InvalidValue)
+                })?;
+            if node_kinds.is_empty() {
+                node_kinds.push("file".to_owned());
+            }
+            node_kinds.sort();
+            node_kinds.dedup();
+            // An empty allowlist keeps the dependency edges graph_dependents_list
+            // follows by default: every kind except the structural ones.
+            let edge_kinds = EdgeKindFilter::try_new(arguments.edge_kinds, None)
+                .map_err(edge_kinds_argument_error)?;
+            let mut path_prefixes = arguments
+                .path_prefixes
+                .iter()
+                .map(RepositoryRelativePath::parse)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    invalid_argument(Some("path_prefixes"), AgentArgumentReason::InvalidValue)
+                })?;
+            path_prefixes.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            path_prefixes.dedup_by(|left, right| left.as_str() == right.as_str());
+            let snapshot = parse_snapshot_argument(
+                arguments.snapshot.as_deref().unwrap_or("current"),
+                "snapshot",
+            )?;
+            let resolved_snapshot_id =
+                service.resolve_snapshot_id_cancellable(&snapshot, cancellation)?;
+            let snapshot_id = parse_snapshot_id(resolved_snapshot_id.as_str())?;
+            let normalized = serde_json::json!({
+                "node_kinds": &node_kinds,
+                "edge_kinds": edge_kinds.edge_kinds(),
+                "path_prefixes": path_prefixes.iter().map(RepositoryRelativePath::as_str).collect::<Vec<_>>(),
+            });
+            let pagination = PaginationContext::new(
+                cursor_key,
+                tool,
+                repository_id.clone(),
+                snapshot_id.clone(),
+                &normalized,
+            )?;
+            let request = page_request(arguments.limit, arguments.cursor)?;
+            let offset = pagination
+                .cursor_offset(&request)
+                .map_err(ToolExecutionFailure::Agent)?;
+            let ranking = service.rank_fan_in(
+                &resolved_snapshot_id,
+                &node_kinds,
+                &edge_kinds,
+                cancellation,
+            )?;
+            let mut items = Vec::new();
+            for entry in ranking.entries() {
+                let item = AgentFanInItem::try_from_core(entry).map_err(contract_mapping_error)?;
+                if path_prefixes.is_empty()
+                    || path_prefixes
+                        .iter()
+                        .any(|prefix| item.path_has_prefix(prefix))
+                {
+                    items.push(item);
+                }
+            }
+            let total_items = u64::try_from(items.len()).map_err(|_| {
+                ToolExecutionFailure::Service(DepgraphServiceError::ResourceExhausted)
+            })?;
+            let end = offset
+                .saturating_add(usize::from(request.max_items().get()))
+                .min(items.len());
+            let window = items.get(offset..end).unwrap_or_default();
+            let page = pagination
+                .paginate_window(window, offset, total_items, &request)
+                .map_err(ToolExecutionFailure::Agent)?;
             CanonicalResponseMapper::success(&SuccessEnvelope::new(
                 repository_id.clone(),
                 Some(snapshot_id),

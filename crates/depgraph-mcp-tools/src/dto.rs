@@ -18,6 +18,15 @@ use crate::{
     RepositoryRelativePath, Sha256Digest, SnapshotDiffCollectionDigest, SnapshotId, SnapshotName,
 };
 
+// The `get_context` summary reads the private fields of the frozen context DTOs
+// (Issue #566), so it is a child module of this one.
+#[path = "context_detail.rs"]
+mod context_detail;
+pub use context_detail::{
+    AgentCompletedSnapshotSummary, AgentContextDetail, AgentContextOutput, AgentContextSummary,
+    AgentCurrentSnapshotSummary,
+};
+
 pub const MAX_AGENT_EVIDENCE_ITEMS: usize = depgraph_core::service::MAX_GRAPH_EVIDENCE_ITEMS;
 pub const MAX_AGENT_TARGET_ITEMS: usize = 256;
 pub const MAX_AGENT_SNAPSHOT_METADATA_ITEMS: usize = 1_024;

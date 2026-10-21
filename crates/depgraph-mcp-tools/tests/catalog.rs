@@ -44,6 +44,7 @@ const EXPECTED_TOOL_NAMES: &[&str] = &[
     "graph_dependencies_list",
     "graph_dependents_list",
     "graph_export",
+    "graph_fan_in_list",
     "graph_impact_get",
     "graph_path_get",
     "graph_query",
@@ -88,7 +89,7 @@ fn full_catalog_is_complete_unique_and_name_sorted() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, EXPECTED_TOOL_NAMES);
-    assert_eq!(catalog.tools().len(), 39);
+    assert_eq!(catalog.tools().len(), 40);
 }
 
 /// Tools handled by the operation-handle path, which keeps foreign repository IDs as
