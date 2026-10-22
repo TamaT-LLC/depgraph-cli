@@ -241,6 +241,18 @@ pub(crate) enum Occurrence {
         condition: Condition,
         span: SourceSpan,
     },
+    /// A name that an item binds at module scope (#622). Only the re-export
+    /// chain of `use` resolution reads it, to tell which names a module binds
+    /// itself and which of them a glob re-export of the module can see.
+    ItemDefinition {
+        name: String,
+        /// The item has a visibility other than private.
+        visible: bool,
+        inline_ancestors: Vec<String>,
+    },
+    /// A macro invocation in item position at module scope (#622), which may
+    /// define items that the syntax index does not see.
+    ItemMacroInvocation { inline_ancestors: Vec<String> },
     Include {
         macro_name: String,
         argument: Option<String>,
@@ -426,6 +438,18 @@ impl Collector {
             .last()
             .map(|frame| frame.condition.clone())
             .unwrap_or_else(|| self.inherited_condition())
+    }
+
+    fn record_item_definition(&mut self, name: &syn::Ident, visibility: &syn::Visibility) {
+        // Items inside a function body are not reachable by a module path.
+        if !self.type_use_frames.is_empty() {
+            return;
+        }
+        self.occurrences.push(Occurrence::ItemDefinition {
+            name: name.to_string().trim_start_matches("r#").to_owned(),
+            visible: !matches!(visibility, syn::Visibility::Inherited),
+            inline_ancestors: self.inline_modules.clone(),
+        });
     }
 
     fn record_call(&mut self, specifier: String, syntax_kind: CallSyntaxKind, span: SourceSpan) {
@@ -1040,6 +1064,12 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        match node {
+            syn::ForeignItem::Fn(item) => self.record_item_definition(&item.sig.ident, &item.vis),
+            syn::ForeignItem::Static(item) => self.record_item_definition(&item.ident, &item.vis),
+            syn::ForeignItem::Type(item) => self.record_item_definition(&item.ident, &item.vis),
+            _ => {}
+        }
         let attributes = foreign_item_attributes(node);
         let condition = self.condition(attributes);
         self.collect_attribute_boundaries(attributes, &condition);
@@ -1089,12 +1119,14 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.record_item_definition(&node.sig.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.collect_signature(&node.sig, &condition);
         self.visit_body_block(&node.block, &condition);
     }
 
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1108,6 +1140,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1127,6 +1160,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1143,6 +1177,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1156,6 +1191,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1169,6 +1205,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.occurrences.push(Occurrence::TypeDefinition {
             name: node.ident.to_string(),
@@ -1201,6 +1238,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.collect_generics(&node.generics, &condition);
         self.collect_type(&node.ty, TypeUseContext::ConstStatic, &condition);
@@ -1208,6 +1246,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         self.collect_type(&node.ty, TypeUseContext::ConstStatic, &condition);
         self.visit_body_expr(&node.expr, &condition);
@@ -1283,6 +1322,7 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        self.record_item_definition(&node.ident, &node.vis);
         let condition = self.condition(&node.attrs);
         let inline = node.content.is_some();
         let direct_path = path_override(&node.attrs);
@@ -1345,6 +1385,15 @@ impl<'ast> Visit<'ast> for Collector {
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        // `macro_rules! name` binds a macro name that a path never reaches
+        // through a glob, so it only counts as a local name.
+        if let Some(ident) = &node.ident {
+            self.record_item_definition(ident, &syn::Visibility::Inherited);
+        } else if self.type_use_frames.is_empty() {
+            self.occurrences.push(Occurrence::ItemMacroInvocation {
+                inline_ancestors: self.inline_modules.clone(),
+            });
+        }
         self.collect_macro(&node.mac, self.condition(&node.attrs));
     }
 

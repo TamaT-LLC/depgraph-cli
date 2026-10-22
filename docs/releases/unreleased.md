@@ -48,6 +48,32 @@ Rust HIR を通した depgraph-cli 自身の Store で、CLI の `depgraph deps`
 - 既定値と上限の値は変えない。`--max-traversal` / `max_traversal` の意味も変えない。
 - `deps` / `dependents` / `why` / `impact` の後処理の上限超過は、details のない `RESOURCE_EXHAUSTED` から `preprocessing_work_items` の details 付きに変わる。edge ごとの evidence 数などの構造上の上限は、従来どおり details なしで返す。
 
+## Rust の use を re-export の先の定義元 file に結び付ける
+
+Rust の syntax 解析で、`use crate::Config` のようにモジュールの中の名前を指す `use` を、そのモジュールにある `pub use` の re-export をたどって、名前を定義している file に結び付ける（[#622](https://github.com/TamaT-LLC/depgraph-cli/issues/622)）。
+これまでは、`crate::` / `self::` / `super::` のパスをモジュール本体の file に解決したところで止めていた（[#575](https://github.com/TamaT-LLC/depgraph-cli/pull/575)）。そのため、`crates/depgraph-core/src/lib.rs` の `pub use config::{Config, ...}` を経由して `Config` を使う `service_lifecycle.rs` などは、`config.rs` ではなく `lib.rs` の dependents に出ていた。file 単位の依存は HIR の有無に関係なくこの syntax の辺から作るので、HIR を通した Store でも同じだった。
+
+- たどる re-export は、モジュールの直下（関数の本体の外）にある `pub use` / `pub(crate) use` などの private でない `use`。`pub use path::{X, ...}`、`pub use path::X as Y`、glob の `pub use path::*` を対象にし、複数段の連鎖もたどる。`use` をしているモジュールが同じ file の中の inline module でも、re-export の先が別の file ならそこに結び付ける。
+- glob は、名前を定義または re-export していると分かるモジュールがちょうど 1 つあり、ほかに同じ名前を持ち得る binding がないときだけたどる。名前が複数の glob から来る場合（名前空間の違う item でも）、同名の item・private な `use` がモジュール自身にある場合（glob より優先される）、glob の先の item が private な場合、syntax の索引にない先（他の crate、enum など）の glob や private な glob が並ぶ場合、モジュールの直下にマクロの呼び出しがある場合（マクロが同名の item を作り得る）はたどらない。`use path as _` は名前を持たないので、たどる対象にも妨げにもしない。
+- 次の場合は、その段のモジュール（最初の段なら従来の解決先）に残す。同じ名前の re-export が `cfg` ごとに別の file を指す場合、同じ名前の item と re-export が別の名前空間に並ぶ場合、re-export の先が enum の variant など syntax の索引にないモジュールの下にある場合。
+- 循環する re-export、8 段を超える連鎖、1 つの `use` で 256 回を超えるモジュールの探索（glob が多段に重なる場合）は、たどらずに従来の解決先に残す。
+- crate をまたぐパス（`use depgraph_core::Config`、`pub use serde::Serialize` の先）は従来どおり package に結び付け、たどらない。
+- 辺の kind（`imports` / `reexports`）、site の ID、evidence の `target_specifier` / `glob` / `reexport` / `alias` は変えない。たどった re-export は evidence の property `reexport_chain`（各段の `path`、`line`、`target_specifier`）に記録する。MCP の `import` の射影はこの property を読まないので、`import` の内容は変わらない。
+
+depgraph-cli 自身（origin/main `70958ce`）の syntax-only と HIR の scan で、結果は同じだった。
+
+- 解決先の変わった `rust_use` / `rust_reexport` の site は 1,122 件。file から file への依存の組（構造辺を除く）は 700 組から 860 組になった（追加 219、削除 59）。
+- `crates/depgraph-core/src/config.rs` の file の dependents は 7 件から 12 件になり、`service_lifecycle.rs`、`daemon.rs`、`service_artifacts.rs`、`service_store_write.rs`、`profile_selection_preview.rs` が加わった。`crates/depgraph-core/src/lib.rs` は 30 件から 4 件、`crates/depgraph-mcp-tools/src/lib.rs` は 15 件から 0 件になった。
+- 新しい解決先 1,122 件は、すべて名前を定義している file だった（1,047 件は定義を直接確認し、75 件は `crates/depgraph-mcp-tools/src/scalar.rs` の `string_newtype!` が生成する型）。
+
+互換性:
+
+- 解決先が変わった site の `target_ids` と、その site の edge（edge ID は target を含む）が変わる。re-export で名前を集約している file（crate root の `lib.rs`、`mod.rs` など）の dependents・fan-in・reverse impact が減り、定義元の file のそれが増える。`deps` / `dependents` / `why` / `impact` の結果も同じように変わる。
+- hotspot は、fan-in と reverse impact の layer が rank 正規化なので、re-export を使うワークスペースの score と順位が変わり、fingerprint もあわせて変わる。finding ID は変わらない。上の syntax-only の Store では、9,440 件の finding のうち 9,437 件の fingerprint が変わり、上位 10 件の顔ぶれも変わった。
+- health の `unused-file` は、crate root を指していた依存がなくなることで、crate root の `lib.rs` に新しく出ることがある。上の Store では `crates/depgraph-mcp-tools/src/lib.rs` に 1 件増えた。crate root は `entry-point` の blocker で `indeterminate` になる。既存の finding の ID は変わらない。
+- 変化は Rust を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、再 scan 後に作り直す。
+- symbol（HIR の semantic 辺の先）への依存を file にまとめる表示は、この変更の対象外。
+
 ## Go の file node にリポジトリ相対パスを持たせる
 
 Go worker が出す file node（通常の Go ソース、アセンブリ、`//go:embed` の対象）に、リポジトリ相対パスの `path` property を記録する（[#591](https://github.com/TamaT-LLC/depgraph-cli/issues/591)）。

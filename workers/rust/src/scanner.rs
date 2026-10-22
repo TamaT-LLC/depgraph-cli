@@ -190,6 +190,85 @@ struct SyntaxImportBinding {
     span: SourceSpan,
 }
 
+/// The names a module binds at module scope, for following the `pub use`
+/// re-exports of a `use` path to the module that holds the item (#622).
+#[derive(Debug, Default)]
+struct ModuleBindings {
+    /// Every name the module binds itself: items of any visibility, private
+    /// `use` imports, and `extern crate` names. Such a name shadows a glob.
+    local: BTreeSet<String>,
+    /// Items with a visibility other than private, which a glob re-export of
+    /// the module can see.
+    visible: BTreeSet<String>,
+    /// `pub use` / `pub(crate) use` leaves at module scope that bind a name.
+    named_reexports: Vec<ModuleReexport>,
+    /// Glob `use` leaves at module scope, public or private.
+    globs: Vec<ModuleGlob>,
+    /// A macro invocation at module scope may define items that the index
+    /// does not see, and such an item would shadow a glob.
+    opaque_items: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleReexport {
+    /// The name the re-export binds.
+    name: String,
+    target_specifier: String,
+    path: String,
+    span: SourceSpan,
+}
+
+#[derive(Clone, Debug)]
+struct ModuleGlob {
+    /// `pub use path::*`; a private `use path::*` is only visible to the
+    /// module itself and its descendants.
+    public: bool,
+    target_specifier: String,
+    path: String,
+    span: SourceSpan,
+}
+
+/// One `use` leaf that a `use` path was followed through.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ReexportHop {
+    path: String,
+    line: u32,
+    target_specifier: String,
+}
+
+impl ReexportHop {
+    fn new(path: &str, span: SourceSpan, target_specifier: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            line: span.start_line,
+            target_specifier: target_specifier.to_owned(),
+        }
+    }
+}
+
+/// How a module binds a name, found by following its re-exports.
+#[derive(Debug)]
+enum ReexportLookup {
+    /// The module that holds the name, and the re-exports followed to reach
+    /// it from the module that was asked.
+    Found(ModuleKey, Vec<ReexportHop>),
+    /// The module is not proven to bind the name (only for glob probes).
+    NotFound,
+    /// The module binds the name, but where the item lives cannot be decided
+    /// without guessing: several bindings, an ambiguous glob, or a target the
+    /// syntax index does not know.
+    Undecided,
+    /// The chain is cyclic, deeper than `MAX_REEXPORT_CHAIN_DEPTH`, or took
+    /// more than `MAX_REEXPORT_LOOKUP_STEPS` lookups.
+    Abort,
+}
+
+/// The longest chain of `pub use` leaves followed from one `use` path.
+const MAX_REEXPORT_CHAIN_DEPTH: usize = 8;
+/// The most module lookups one `use` path may spend on glob probes and
+/// re-exports, so that modules with many globs stay linear in practice.
+const MAX_REEXPORT_LOOKUP_STEPS: usize = 256;
+
 #[derive(Debug)]
 struct AggregatedDiagnostic {
     severity: DiagnosticSeverity,
@@ -236,6 +315,8 @@ struct State {
     /// crate root file, the file an out-of-line `mod` declaration resolves
     /// to, or the file that contains an inline `mod` block.
     module_body_files: BTreeMap<ModuleKey, BTreeSet<String>>,
+    /// Module-scope bindings of each statically known module (#622).
+    module_bindings: BTreeMap<ModuleKey, ModuleBindings>,
     /// Source-phase edges of each syntax dependency site, so that a site's
     /// edges are found without scanning every edge of the graph.
     syntax_site_edges: BTreeMap<String, BTreeSet<String>>,
@@ -570,6 +651,7 @@ fn scan_with_shared_site_evidence(
     state.add_manifest_dependencies(&packages, lock.path.as_deref())?;
     state.add_unexecuted_build_capabilities(&packages)?;
     state.index_modules(&packages, &sources)?;
+    state.index_module_bindings(&sources);
     state.index_syntax_types(&packages, &sources)?;
     let source_bytes = sources
         .iter()
@@ -742,6 +824,7 @@ impl State {
             file_nodes: BTreeMap::new(),
             module_nodes: BTreeMap::new(),
             module_body_files: BTreeMap::new(),
+            module_bindings: BTreeMap::new(),
             syntax_site_edges: BTreeMap::new(),
             syntax_type_nodes: BTreeMap::new(),
             rust_prelude_policies: BTreeMap::new(),
@@ -2292,6 +2375,335 @@ impl State {
         Ok(())
     }
 
+    fn index_module_bindings(&mut self, sources: &[SourceUnit]) {
+        enum Binding {
+            Local { name: String, visible: bool },
+            Named(ModuleReexport),
+            Glob(ModuleGlob),
+            OpaqueItems,
+        }
+        for source in sources {
+            let (Some(package_index), true) = (source.package_index, source.parsed) else {
+                continue;
+            };
+            let Some(contexts) = self
+                .source_module_contexts
+                .get(&(package_index, source.rel_path.clone()))
+            else {
+                continue;
+            };
+            for occurrence in &source.occurrences {
+                let (inline_ancestors, binding) = match occurrence {
+                    Occurrence::ItemDefinition {
+                        name,
+                        visible,
+                        inline_ancestors,
+                    } => (
+                        inline_ancestors,
+                        Binding::Local {
+                            name: name.clone(),
+                            visible: *visible,
+                        },
+                    ),
+                    Occurrence::ItemMacroInvocation { inline_ancestors } => {
+                        (inline_ancestors, Binding::OpaqueItems)
+                    }
+                    Occurrence::Use {
+                        target_specifier,
+                        alias,
+                        glob,
+                        reexport,
+                        module_scope: true,
+                        inline_ancestors,
+                        span,
+                        ..
+                    } => {
+                        let binding = if *glob {
+                            Binding::Glob(ModuleGlob {
+                                public: *reexport,
+                                target_specifier: target_specifier.clone(),
+                                path: source.rel_path.clone(),
+                                span: *span,
+                            })
+                        } else {
+                            // `use path as _` binds no name.
+                            let Some(name) = use_binding_name(target_specifier, alias.as_deref())
+                            else {
+                                continue;
+                            };
+                            if *reexport {
+                                Binding::Named(ModuleReexport {
+                                    name,
+                                    target_specifier: target_specifier.clone(),
+                                    path: source.rel_path.clone(),
+                                    span: *span,
+                                })
+                            } else {
+                                Binding::Local {
+                                    name,
+                                    visible: false,
+                                }
+                            }
+                        };
+                        (inline_ancestors, binding)
+                    }
+                    Occurrence::ExternCrate {
+                        specifier,
+                        alias,
+                        inline_ancestors,
+                        ..
+                    } => {
+                        let Some(name) = use_binding_name(specifier, alias.as_deref()) else {
+                            continue;
+                        };
+                        (
+                            inline_ancestors,
+                            Binding::Local {
+                                name,
+                                visible: false,
+                            },
+                        )
+                    }
+                    _ => continue,
+                };
+                for context in contexts {
+                    let mut path = context.path.clone();
+                    path.extend(inline_ancestors.iter().cloned());
+                    let bindings = self
+                        .module_bindings
+                        .entry(ModuleKey {
+                            package_index,
+                            scope: context.scope.clone(),
+                            path,
+                        })
+                        .or_default();
+                    match &binding {
+                        Binding::Local { name, visible } => {
+                            if *visible {
+                                bindings.visible.insert(name.clone());
+                            }
+                            bindings.local.insert(name.clone());
+                        }
+                        Binding::Named(reexport) => bindings.named_reexports.push(reexport.clone()),
+                        Binding::Glob(glob) => bindings.globs.push(glob.clone()),
+                        Binding::OpaqueItems => bindings.opaque_items = true,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolves the target of a `pub use` leaf of module `from` to a module
+    /// with a known body file and the path segments below it. Paths that
+    /// leave the crate, or whose module the syntax index does not know, give
+    /// `None`.
+    fn reexport_target(
+        &self,
+        from: &ModuleKey,
+        specifier: &str,
+    ) -> Option<(ModuleKey, Vec<String>)> {
+        if specifier.starts_with("::") {
+            return None;
+        }
+        let parts: Vec<String> = specifier
+            .split("::")
+            .filter(|part| !part.is_empty() && *part != "*")
+            .map(|part| part.trim_start_matches("r#").to_owned())
+            .collect();
+        let first = parts.first()?;
+        let module_key = |path: Vec<String>| ModuleKey {
+            package_index: from.package_index,
+            scope: from.scope.clone(),
+            path,
+        };
+        let (mut path, cursor) = match first.as_str() {
+            "crate" => (Vec::new(), 1),
+            "self" => (from.path.clone(), 1),
+            "super" => {
+                let mut path = from.path.clone();
+                let mut cursor = 0;
+                while parts.get(cursor).is_some_and(|part| part == "super") {
+                    path.pop()?;
+                    cursor += 1;
+                }
+                (path, cursor)
+            }
+            _ => {
+                // Rust 2018 uniform paths: a bare path that names a child
+                // module of the re-exporting module is relative to it. Any
+                // other bare path names an external crate or a local item
+                // such as an enum, which the chain does not follow.
+                let mut child = from.path.clone();
+                child.push(first.clone());
+                let child = module_key(child);
+                if !self.module_body_files.contains_key(&child)
+                    && !self.module_nodes.contains_key(&child)
+                {
+                    return None;
+                }
+                (from.path.clone(), 0)
+            }
+        };
+        let base_len = path.len();
+        path.extend(parts[cursor..].iter().cloned());
+        for prefix_len in (base_len..=path.len()).rev() {
+            let key = module_key(path[..prefix_len].to_vec());
+            if self.module_body_files.contains_key(&key) {
+                let rest = path[prefix_len..].to_vec();
+                return Some((key, rest));
+            }
+            if self.module_nodes.contains_key(&key) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Finds the module that holds `name` as seen from `module`, following
+    /// `pub use` re-exports (#622). `named` says that the caller knows the
+    /// module binds the name (a `use` path or a named re-export points at
+    /// it); a glob probe passes `false`, and then only a binding the glob can
+    /// see counts. `steps` is the lookup budget left for the whole `use` path.
+    fn lookup_reexported_name(
+        &self,
+        module: &ModuleKey,
+        name: &str,
+        named: bool,
+        visiting: &mut Vec<(ModuleKey, String)>,
+        steps: &mut usize,
+    ) -> ReexportLookup {
+        if *steps == 0
+            || visiting.len() > MAX_REEXPORT_CHAIN_DEPTH
+            || visiting
+                .iter()
+                .any(|(key, visited)| key == module && visited == name)
+        {
+            return ReexportLookup::Abort;
+        }
+        *steps -= 1;
+        let empty = ModuleBindings::default();
+        let bindings = self.module_bindings.get(module).unwrap_or(&empty);
+        let mut named_reexports: Vec<&ModuleReexport> = Vec::new();
+        for reexport in &bindings.named_reexports {
+            if reexport.name == name
+                && !named_reexports
+                    .iter()
+                    .any(|seen| seen.target_specifier == reexport.target_specifier)
+            {
+                named_reexports.push(reexport);
+            }
+        }
+        if bindings.local.contains(name) {
+            return if !named_reexports.is_empty() {
+                // An item and a re-export of the same name can coexist only
+                // in different namespaces; either may be the one imported.
+                ReexportLookup::Undecided
+            } else if named || bindings.visible.contains(name) {
+                ReexportLookup::Found(module.clone(), Vec::new())
+            } else {
+                ReexportLookup::NotFound
+            };
+        }
+        match named_reexports.as_slice() {
+            [] => {}
+            [reexport] => {
+                let hop =
+                    ReexportHop::new(&reexport.path, reexport.span, &reexport.target_specifier);
+                let Some((target, rest)) = self.reexport_target(module, &reexport.target_specifier)
+                else {
+                    return ReexportLookup::Undecided;
+                };
+                return match rest.as_slice() {
+                    // `pub use self::child as name;` re-exports a module.
+                    [] => ReexportLookup::Found(target, vec![hop]),
+                    [item] => {
+                        visiting.push((module.clone(), name.to_owned()));
+                        let found =
+                            self.lookup_reexported_name(&target, item, true, visiting, steps);
+                        visiting.pop();
+                        match found {
+                            ReexportLookup::Found(holder, hops) => {
+                                let mut chain = vec![hop];
+                                chain.extend(hops);
+                                ReexportLookup::Found(holder, chain)
+                            }
+                            // The named re-export proves that the target
+                            // binds the item; stop there.
+                            ReexportLookup::NotFound | ReexportLookup::Undecided => {
+                                ReexportLookup::Found(target, vec![hop])
+                            }
+                            ReexportLookup::Abort => ReexportLookup::Abort,
+                        }
+                    }
+                    // An item below a non-module segment (an enum variant, an
+                    // associated item) or a module the index does not know.
+                    _ => ReexportLookup::Undecided,
+                };
+            }
+            _ => return ReexportLookup::Undecided,
+        }
+        // A private glob is visible to the module itself and its
+        // descendants, which a direct `use` path may be, but a glob of the
+        // module never re-exports it.
+        let mut globs: Vec<&ModuleGlob> = Vec::new();
+        for glob in bindings.globs.iter().filter(|glob| glob.public || named) {
+            if !globs
+                .iter()
+                .any(|seen| seen.target_specifier == glob.target_specifier)
+            {
+                globs.push(glob);
+            }
+        }
+        if bindings.opaque_items {
+            // A macro may define the name here: as a glob probe it may provide
+            // it, and as a direct path it would shadow every glob.
+            return if named && globs.is_empty() {
+                ReexportLookup::Found(module.clone(), Vec::new())
+            } else {
+                ReexportLookup::Undecided
+            };
+        }
+        let mut providers = Vec::new();
+        for glob in globs {
+            // A glob of something other than a known module (an enum, an
+            // external crate) may provide the name in another namespace, so
+            // the name is not decided.
+            let Some((target, rest)) = self.reexport_target(module, &glob.target_specifier) else {
+                return ReexportLookup::Undecided;
+            };
+            if !rest.is_empty() {
+                return ReexportLookup::Undecided;
+            }
+            visiting.push((module.clone(), name.to_owned()));
+            let found = self.lookup_reexported_name(&target, name, false, visiting, steps);
+            visiting.pop();
+            match found {
+                ReexportLookup::Found(holder, hops) => {
+                    let mut chain = vec![ReexportHop::new(
+                        &glob.path,
+                        glob.span,
+                        &glob.target_specifier,
+                    )];
+                    chain.extend(hops);
+                    providers.push((holder, chain));
+                }
+                ReexportLookup::NotFound => {}
+                ReexportLookup::Undecided => return ReexportLookup::Undecided,
+                ReexportLookup::Abort => return ReexportLookup::Abort,
+            }
+        }
+        if providers.len() > 1 {
+            // Two globs may provide the name in different namespaces.
+            return ReexportLookup::Undecided;
+        }
+        match providers.pop() {
+            Some((holder, chain)) => ReexportLookup::Found(holder, chain),
+            // The name comes from an item the index does not record.
+            None if named => ReexportLookup::Found(module.clone(), Vec::new()),
+            None => ReexportLookup::NotFound,
+        }
+    }
+
     fn index_syntax_types(&mut self, packages: &[Package], sources: &[SourceUnit]) -> Result<()> {
         for source in sources {
             let (Some(package_index), true) = (source.package_index, source.parsed) else {
@@ -2416,7 +2828,9 @@ impl State {
                 .filter_map(|occurrence| match occurrence {
                     Occurrence::Call { .. }
                     | Occurrence::Module { inline: true, .. }
-                    | Occurrence::TypeDefinition { .. } => None,
+                    | Occurrence::TypeDefinition { .. }
+                    | Occurrence::ItemDefinition { .. }
+                    | Occurrence::ItemMacroInvocation { .. } => None,
                     _ => Some(occurrence.clone()),
                 })
             {
@@ -2432,13 +2846,15 @@ impl State {
                         condition,
                         span,
                     } => {
-                        let resolution = self.resolve_rust_path(
+                        let mut reexport_chain = Vec::new();
+                        let resolution = self.resolve_rust_path_through_reexports(
                             packages,
                             source.package_index,
                             &target_specifier,
                             &source.rel_path,
                             &inline_ancestors,
                             span,
+                            Some(&mut reexport_chain),
                         )?;
                         let (site_kind, edge_kind) = if reexport {
                             ("rust_reexport", "reexports")
@@ -2457,6 +2873,23 @@ impl State {
                             .insert("reexport".into(), json!(reexport));
                         if let Some(alias) = alias {
                             evidence.properties.insert("alias".into(), json!(alias));
+                        }
+                        if !reexport_chain.is_empty() {
+                            evidence.properties.insert(
+                                "reexport_chain".into(),
+                                Value::Array(
+                                    reexport_chain
+                                        .iter()
+                                        .map(|hop| {
+                                            json!({
+                                                "path": hop.path,
+                                                "line": hop.line,
+                                                "target_specifier": hop.target_specifier,
+                                            })
+                                        })
+                                        .collect(),
+                                ),
+                            );
                         }
                         self.add_site(
                             &source_node,
@@ -2866,7 +3299,9 @@ impl State {
                     }
                     Occurrence::Call { .. } => {}
                     Occurrence::Module { inline: true, .. } => {}
-                    Occurrence::TypeDefinition { .. } => {}
+                    Occurrence::TypeDefinition { .. }
+                    | Occurrence::ItemDefinition { .. }
+                    | Occurrence::ItemMacroInvocation { .. } => {}
                 }
             }
         }
@@ -3176,6 +3611,32 @@ impl State {
         inline_ancestors: &[String],
         span: SourceSpan,
     ) -> Result<TargetResolution> {
+        self.resolve_rust_path_through_reexports(
+            packages,
+            package_index,
+            specifier,
+            path,
+            inline_ancestors,
+            span,
+            None,
+        )
+    }
+
+    /// Resolves a Rust path like `resolve_rust_path`. With `reexport_chain`,
+    /// a path that names an item of a module is also followed through the
+    /// module's `pub use` re-exports to the file of the module that holds
+    /// the item (#622), and the re-exports followed are appended to it.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_rust_path_through_reexports(
+        &mut self,
+        packages: &[Package],
+        package_index: Option<usize>,
+        specifier: &str,
+        path: &str,
+        inline_ancestors: &[String],
+        span: SourceSpan,
+        mut reexport_chain: Option<&mut Vec<ReexportHop>>,
+    ) -> Result<TargetResolution> {
         let parts: Vec<String> = specifier
             .split("::")
             .filter(|part| !part.is_empty() && *part != "*")
@@ -3267,6 +3728,22 @@ impl State {
                         .filter(|file| Some(*file) != own_file.as_ref())
                         .cloned()
                         .collect();
+                    // The module's re-exports may lead out of the importing
+                    // file even when the module body is that file.
+                    if body_files.is_some()
+                        && let (Some(chain), [item]) =
+                            (reexport_chain.as_deref_mut(), &module_path[prefix_len..])
+                        && let Some((files, hops)) =
+                            self.reexported_item_files(&key, item, own_file.as_ref())
+                    {
+                        targets.extend(files);
+                        for hop in hops {
+                            if !chain.contains(&hop) {
+                                chain.push(hop);
+                            }
+                        }
+                        break;
+                    }
                     if !other_files.is_empty() {
                         targets.extend(other_files);
                         break;
@@ -3307,6 +3784,35 @@ impl State {
             unknown,
             "path could not be resolved by static syntax analysis",
         ))
+    }
+
+    /// The body files of the module that holds `item` of `module` when the
+    /// item is reached through `pub use` re-exports, with the re-exports
+    /// followed. `None` keeps the module itself as the target: the item is
+    /// defined there, or where it lives cannot be decided.
+    fn reexported_item_files(
+        &self,
+        module: &ModuleKey,
+        item: &str,
+        own_file: Option<&String>,
+    ) -> Option<(Vec<String>, Vec<ReexportHop>)> {
+        let mut steps = MAX_REEXPORT_LOOKUP_STEPS;
+        let ReexportLookup::Found(holder, hops) =
+            self.lookup_reexported_name(module, item, true, &mut Vec::new(), &mut steps)
+        else {
+            return None;
+        };
+        if hops.is_empty() || &holder == module {
+            return None;
+        }
+        let files: Vec<_> = self
+            .module_body_files
+            .get(&holder)?
+            .iter()
+            .filter(|file| Some(*file) != own_file)
+            .cloned()
+            .collect();
+        (!files.is_empty()).then_some((files, hops))
     }
 
     fn resolve_module_file(
@@ -4596,6 +5102,16 @@ fn package_locator(package: &Package) -> String {
     )
 }
 
+/// The name a non-glob `use` leaf or `extern crate` binds, if any.
+fn use_binding_name(target_specifier: &str, alias: Option<&str>) -> Option<String> {
+    let name = match alias {
+        Some(alias) => alias,
+        None => target_specifier.rsplit("::").next()?,
+    }
+    .trim_start_matches("r#");
+    (!name.is_empty() && !matches!(name, "_" | "self" | "super" | "crate")).then(|| name.to_owned())
+}
+
 fn syntax_import_bindings(occurrences: &[Occurrence]) -> Vec<SyntaxImportBinding> {
     let mut bindings = occurrences
         .iter()
@@ -5382,6 +5898,483 @@ use Kind::A;
                 && node.kind == "module"
                 && node.display_name.as_deref() == Some("nested::deep")
         }));
+    }
+
+    #[test]
+    fn syntax_crate_paths_follow_reexport_chains_to_the_defining_file() {
+        // #622: `use crate::Config` must reach the file that defines `Config`
+        // through `pub use config::Config` in the crate root, and stay at the
+        // module when the chain cannot be decided.
+        let temp = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            temp.path(),
+            r#"pub mod ambiguous_a;
+pub mod ambiguous_b;
+pub mod config;
+pub mod consumer;
+pub mod cycle;
+pub mod globbed;
+pub mod layers;
+pub mod leaf;
+pub mod plat_unix;
+pub mod plat_windows;
+pub mod renamed;
+
+pub use config::{Config, load_config};
+pub use layers::Deep;
+pub use renamed::Original as Alias;
+pub use globbed::*;
+pub use ambiguous_a::*;
+pub use ambiguous_b::*;
+pub use cycle::Looped;
+#[cfg(unix)]
+pub use plat_unix::Plat;
+#[cfg(windows)]
+pub use plat_windows::Plat;
+pub use serde::Serialize;
+
+pub struct Local;
+"#,
+        );
+        let files = [
+            (
+                "src/config.rs",
+                "pub struct Config;\npub fn load_config() {}\n",
+            ),
+            ("src/leaf.rs", "pub struct Deep;\n"),
+            (
+                "src/layers/mod.rs",
+                "pub mod inner;\npub use self::inner::Deep;\n",
+            ),
+            (
+                "src/layers/inner.rs",
+                "pub(crate) use super::super::leaf::Deep;\n",
+            ),
+            ("src/renamed.rs", "pub struct Original;\n"),
+            (
+                "src/globbed.rs",
+                "pub struct FromGlob;\npub struct Local;\nfn hidden() {}\n",
+            ),
+            ("src/ambiguous_a.rs", "pub struct Twice;\n"),
+            ("src/ambiguous_b.rs", "pub struct Twice;\n"),
+            ("src/cycle.rs", "pub use crate::Looped;\n"),
+            ("src/plat_unix.rs", "pub struct Plat;\n"),
+            ("src/plat_windows.rs", "pub struct Plat;\n"),
+            (
+                "src/consumer.rs",
+                concat!(
+                    "use crate::Config;\n",
+                    "use crate::load_config;\n",
+                    "use crate::Deep;\n",
+                    "use crate::layers::Deep as LayerDeep;\n",
+                    "use crate::Alias;\n",
+                    "use crate::FromGlob;\n",
+                    "use crate::Twice;\n",
+                    "use crate::Local;\n",
+                    "use crate::hidden;\n",
+                    "use crate::Looped;\n",
+                    "use crate::Plat;\n",
+                    "use crate::Serialize;\n",
+                    "use crate::config::Config as Direct;\n",
+                ),
+            ),
+        ];
+        for (path, source) in files {
+            let path = temp.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let consumer = file_id("src/consumer.rs");
+        let use_site = |specifier: &str| {
+            result
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == "rust_use"
+                        && site.source == consumer
+                        && site.specifier == specifier
+                })
+                .unwrap_or_else(|| panic!("missing use site {specifier}"))
+        };
+        let chain_of = |site: &DependencySite| {
+            site.evidence[0]
+                .properties
+                .get("reexport_chain")
+                .map(|chain| {
+                    chain
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hop| {
+                            format!(
+                                "{}:{}:{}",
+                                hop["path"].as_str().unwrap(),
+                                hop["line"],
+                                hop["target_specifier"].as_str().unwrap()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        for (specifier, target, chain) in [
+            // One re-export, of a type and of a function.
+            (
+                "crate::Config",
+                "src/config.rs",
+                vec!["src/lib.rs:13:config::Config"],
+            ),
+            (
+                "crate::load_config",
+                "src/config.rs",
+                vec!["src/lib.rs:13:config::load_config"],
+            ),
+            // Several re-exports in a row, through `self::` and `super::`.
+            (
+                "crate::Deep",
+                "src/leaf.rs",
+                vec![
+                    "src/lib.rs:14:layers::Deep",
+                    "src/layers/mod.rs:2:self::inner::Deep",
+                    "src/layers/inner.rs:1:super::super::leaf::Deep",
+                ],
+            ),
+            (
+                "crate::layers::Deep as LayerDeep",
+                "src/leaf.rs",
+                vec![
+                    "src/layers/mod.rs:2:self::inner::Deep",
+                    "src/layers/inner.rs:1:super::super::leaf::Deep",
+                ],
+            ),
+            // `as` binds the alias, and the target module holds the original.
+            (
+                "crate::Alias",
+                "src/renamed.rs",
+                vec!["src/lib.rs:15:renamed::Original"],
+            ),
+            // Exactly one glob provides the name.
+            (
+                "crate::FromGlob",
+                "src/globbed.rs",
+                vec!["src/lib.rs:16:globbed::*"],
+            ),
+            // The module is already the definition: no chain.
+            ("crate::config::Config as Direct", "src/config.rs", vec![]),
+            // Two globs provide the name: stay at the module.
+            ("crate::Twice", "src/lib.rs", vec![]),
+            // A local item shadows the glob that also provides the name.
+            ("crate::Local", "src/lib.rs", vec![]),
+            // A glob does not see a private item.
+            ("crate::hidden", "src/lib.rs", vec![]),
+            // A cycle of re-exports is stopped and keeps the module.
+            ("crate::Looped", "src/lib.rs", vec![]),
+            // Two cfg alternatives re-export the name from different files.
+            ("crate::Plat", "src/lib.rs", vec![]),
+            // A re-export from another crate is not followed.
+            ("crate::Serialize", "src/lib.rs", vec![]),
+        ] {
+            let site = use_site(specifier);
+            assert_eq!(
+                site.resolution_status,
+                ResolutionStatus::Resolved,
+                "{specifier}"
+            );
+            assert_eq!(site.target_ids, vec![file_id(target)], "{specifier}");
+            assert_eq!(chain_of(site), chain, "{specifier}");
+            let edges: Vec<_> = result
+                .edges
+                .iter()
+                .filter(|edge| edge.site_id.as_deref() == Some(site.id.as_str()))
+                .collect();
+            assert_eq!(edges.len(), 1, "{specifier}");
+            assert_eq!(edges[0].kind, "imports", "{specifier}");
+            assert_eq!(edges[0].target, file_id(target), "{specifier}");
+            // The binding facts stay those of the `use` leaf itself.
+            let evidence = &site.evidence[0].properties;
+            assert_eq!(
+                evidence["target_specifier"],
+                json!(specifier.split(" as ").next().unwrap()),
+                "{specifier}"
+            );
+            assert_eq!(evidence["reexport"], json!(false), "{specifier}");
+        }
+
+        // The re-export sites of the crate root follow the rest of the chain.
+        let lib = file_id("src/lib.rs");
+        let reexport = result
+            .sites
+            .iter()
+            .find(|site| {
+                site.kind == "rust_reexport"
+                    && site.source == lib
+                    && site.specifier == "layers::Deep"
+            })
+            .expect("re-export site");
+        assert_eq!(reexport.target_ids, vec![file_id("src/leaf.rs")]);
+        assert!(result.edges.iter().any(|edge| {
+            edge.site_id.as_deref() == Some(reexport.id.as_str())
+                && edge.kind == "reexports"
+                && edge.target == file_id("src/leaf.rs")
+        }));
+    }
+
+    #[test]
+    fn syntax_reexport_chains_stop_at_the_depth_limit() {
+        // A chain of `MAX_REEXPORT_CHAIN_DEPTH` re-exports is followed; one
+        // more keeps the module instead of following an unbounded chain.
+        for (reexports, expected) in [
+            (
+                MAX_REEXPORT_CHAIN_DEPTH,
+                format!("src/m{}.rs", MAX_REEXPORT_CHAIN_DEPTH - 1),
+            ),
+            (MAX_REEXPORT_CHAIN_DEPTH + 1, "src/lib.rs".to_owned()),
+        ] {
+            // The crate root re-exports from m0, each m<i> from m<i+1>, and
+            // the last module defines the item.
+            let last = reexports - 1;
+            let temp = tempfile::tempdir().unwrap();
+            let mut lib = String::new();
+            for index in 0..=last {
+                lib.push_str(&format!("pub mod m{index};\n"));
+            }
+            lib.push_str("pub mod consumer;\npub use m0::Item;\n");
+            write_syntax_only_fixture(temp.path(), &lib);
+            for index in 0..last {
+                fs::write(
+                    temp.path().join(format!("src/m{index}.rs")),
+                    format!("pub use crate::m{}::Item;\n", index + 1),
+                )
+                .unwrap();
+            }
+            fs::write(
+                temp.path().join(format!("src/m{last}.rs")),
+                "pub struct Item;\n",
+            )
+            .unwrap();
+            fs::write(temp.path().join("src/consumer.rs"), "use crate::Item;\n").unwrap();
+            let result = scan_with_inventory_and_semantic_extractor(
+                temp.path(),
+                None,
+                semantic_extractor_must_not_run,
+                HirMode::SyntaxOnly,
+            )
+            .unwrap();
+            let file_id = |path: &str| {
+                result
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                    .unwrap_or_else(|| panic!("missing file node {path}"))
+                    .id
+                    .clone()
+            };
+            let consumer = file_id("src/consumer.rs");
+            let site = result
+                .sites
+                .iter()
+                .find(|site| site.kind == "rust_use" && site.source == consumer)
+                .expect("use site");
+            assert_eq!(
+                site.target_ids,
+                vec![file_id(&expected)],
+                "{reexports} re-exports"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_reexport_chains_keep_the_module_when_a_binding_may_be_hidden() {
+        // #622 review: a glob is followed only when no binding that the index
+        // cannot see (a macro-generated item, an external glob, a private
+        // glob) may provide the same name.
+        let temp = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            temp.path(),
+            r#"pub mod config;
+pub mod consumer;
+pub mod external;
+pub mod generated;
+pub mod mixed;
+pub mod unnamed;
+
+pub use config::Config;
+
+pub mod inline_consumer {
+    use crate::Config;
+}
+"#,
+        );
+        let files = [
+            ("src/config.rs", "pub struct Config;\n"),
+            (
+                "src/generated/mod.rs",
+                "pub mod inner;\npub use self::inner::*;\nmake_items!();\n",
+            ),
+            ("src/generated/inner.rs", "pub struct Shadowed;\n"),
+            (
+                "src/external/mod.rs",
+                "pub mod local;\npub use self::local::*;\npub use std::fmt::*;\n",
+            ),
+            ("src/external/local.rs", "pub struct Debug;\n"),
+            (
+                "src/mixed/mod.rs",
+                "mod functions;\nmod types;\nuse self::types::*;\npub use self::functions::*;\n",
+            ),
+            ("src/mixed/types.rs", "pub struct Both {}\n"),
+            ("src/mixed/functions.rs", "pub fn Both() {}\n"),
+            (
+                "src/unnamed/mod.rs",
+                "pub mod a;\npub mod b;\npub use self::a as _;\npub use self::b::*;\n",
+            ),
+            ("src/unnamed/a.rs", "pub struct Only;\n"),
+            ("src/unnamed/b.rs", "pub struct Only;\n"),
+            (
+                "src/consumer.rs",
+                concat!(
+                    "use crate::generated::Shadowed;\n",
+                    "use crate::external::Debug;\n",
+                    "use crate::mixed::Both;\n",
+                    "use crate::unnamed::Only;\n",
+                ),
+            ),
+        ];
+        for (path, source) in files {
+            let path = temp.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let target_of = |source: &str, specifier: &str| {
+            let source = file_id(source);
+            result
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == "rust_use" && site.source == source && site.specifier == specifier
+                })
+                .unwrap_or_else(|| panic!("missing use site {specifier}"))
+                .target_ids
+                .clone()
+        };
+        for (source, specifier, target) in [
+            // A macro invocation may define an item that shadows the glob.
+            (
+                "src/consumer.rs",
+                "crate::generated::Shadowed",
+                "src/generated/mod.rs",
+            ),
+            // An external glob may provide the name in another namespace.
+            (
+                "src/consumer.rs",
+                "crate::external::Debug",
+                "src/external/mod.rs",
+            ),
+            // A private glob may provide the name in another namespace.
+            ("src/consumer.rs", "crate::mixed::Both", "src/mixed/mod.rs"),
+            // `use path as _` binds no name and is not a glob.
+            (
+                "src/consumer.rs",
+                "crate::unnamed::Only",
+                "src/unnamed/b.rs",
+            ),
+            // A module inline in the importing file still follows the root's
+            // re-exports out of that file.
+            ("src/lib.rs", "crate::Config", "src/config.rs"),
+        ] {
+            assert_eq!(
+                target_of(source, specifier),
+                vec![file_id(target)],
+                "{specifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_reexport_glob_probes_stay_within_the_lookup_budget() {
+        // Every module of each level glob-imports every module of the next
+        // level. Probing an absent name would visit 6^6 modules without the
+        // budget; with it the lookup stops and keeps the crate root.
+        const LEVELS: usize = 6;
+        const WIDTH: usize = 6;
+        let temp = tempfile::tempdir().unwrap();
+        let mut lib = String::from("pub mod consumer;\n");
+        for level in 0..LEVELS {
+            for index in 0..WIDTH {
+                lib.push_str(&format!("pub mod l{level}_{index};\n"));
+            }
+        }
+        for index in 0..WIDTH {
+            lib.push_str(&format!("pub use l0_{index}::*;\n"));
+        }
+        write_syntax_only_fixture(temp.path(), &lib);
+        for level in 0..LEVELS {
+            for index in 0..WIDTH {
+                let mut source = String::new();
+                if level + 1 < LEVELS {
+                    for next in 0..WIDTH {
+                        source.push_str(&format!("pub use crate::l{}_{next}::*;\n", level + 1));
+                    }
+                }
+                fs::write(temp.path().join(format!("src/l{level}_{index}.rs")), source).unwrap();
+            }
+        }
+        fs::write(temp.path().join("src/consumer.rs"), "use crate::Missing;\n").unwrap();
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let consumer = file_id("src/consumer.rs");
+        let site = result
+            .sites
+            .iter()
+            .find(|site| site.kind == "rust_use" && site.source == consumer)
+            .expect("use site");
+        assert_eq!(site.target_ids, vec![file_id("src/lib.rs")]);
     }
 
     #[test]
