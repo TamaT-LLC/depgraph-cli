@@ -79,8 +79,9 @@ crate, which syntax analysis resolves to the package rather than a file, and
 imports through a re-export that syntax analysis cannot follow to the defining
 file (an ambiguous glob or a re-export whose target differs per `cfg`; other
 re-export chains within a crate are followed since Issue #622). `--rollup symbols` (not combinable with `--transitive`)
-adds `symbol_rollup` without changing the edge list, `total_items`, or
-`traversed_items`: the semantic edges of the nodes the file owns (their
+adds `symbol_rollup` without changing the edges listed, `total_items`, or
+`traversed_items` (a page can hold fewer `items`, because the rollup counts
+toward `--max-bytes`, and the cursor is bound to the option): the semantic edges of the nodes the file owns (their
 `source_path` names the file, or the file `declares` them) grouped by the other
 file. For `dependents` the other file is where the edge is written (its
 evidence path; the owner of the source node when the edge has no evidence);

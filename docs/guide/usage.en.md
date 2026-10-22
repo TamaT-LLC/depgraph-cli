@@ -124,9 +124,11 @@ depgraph dependents path:crates/depgraph-core/src/config.rs --rollup symbols --j
 depgraph deps path:crates/depgraph-core/src/lib.rs --rollup symbols
 ```
 
-- The edge list (`items`, `total_items`, `traversed_items`) is the same as
+- The edges listed, `total_items`, and `traversed_items` are the same as
   without the option. The rollup is added as a separate `symbol_rollup` field,
-  and no edge is created.
+  and no edge is created. The rollup counts toward `--max-bytes`, so one page
+  can hold fewer `items` than without the option, and a rollup larger than the
+  budget fails. A `--cursor` is bound to the option.
 - The rollup groups the semantic edges of the nodes the selected file owns. A
   file owns a node when the node's `source_path` names the file or the file
   `declares` the node.

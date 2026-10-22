@@ -8890,3 +8890,45 @@ fn issue_623_rollup_of_a_syntax_only_store_reports_no_semantic_edges() {
     );
     assert_eq!(value["total_items"], 1);
 }
+
+/// A page cursor is bound to `--rollup`, which takes part of the page budget;
+/// without it the cursor keeps its legacy binding (Issue #623).
+#[test]
+fn issue_623_a_cursor_is_bound_to_the_rollup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("store.sqlite");
+    seed_issue_579_snapshot(&store, &root, false, 3);
+    let first = |rollup: bool| {
+        let mut arguments = vec!["dependents", "id:file:model", "--json", "--max-items", "1"];
+        if rollup {
+            arguments.extend_from_slice(&["--rollup", "symbols"]);
+        }
+        let page: serde_json::Value =
+            serde_json::from_str(&run_issue_623(&store, &arguments)).unwrap();
+        page["next_cursor"].as_str().unwrap().to_owned()
+    };
+    let resume = |cursor: &str, rollup: bool| {
+        let mut command = Command::cargo_bin("depgraph").unwrap();
+        command.arg("--store").arg(&store).args([
+            "dependents",
+            "id:file:model",
+            "--json",
+            "--max-items",
+            "1",
+            "--cursor",
+            cursor,
+        ]);
+        if rollup {
+            command.args(["--rollup", "symbols"]);
+        }
+        command.output().unwrap().status.success()
+    };
+    let with = first(true);
+    let without = first(false);
+    assert!(resume(&with, true));
+    assert!(resume(&without, false));
+    assert!(!resume(&with, false));
+    assert!(!resume(&without, true));
+}

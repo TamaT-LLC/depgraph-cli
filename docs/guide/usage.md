@@ -97,7 +97,8 @@ depgraph dependents path:crates/depgraph-core/src/config.rs --rollup symbols --j
 depgraph deps path:crates/depgraph-core/src/lib.rs --rollup symbols
 ```
 
-- 辺の一覧（`items`、`total_items`、`traversed_items`）は、オプションなしのときと同じです。まとめた結果は別のフィールド`symbol_rollup`に入ります。新しい辺は作りません。
+- 一覧に出る辺、`total_items`、`traversed_items`は、オプションなしのときと同じです。まとめた結果は別のフィールド`symbol_rollup`に入ります。新しい辺は作りません。
+- `symbol_rollup`は`--max-bytes`の予算に含まれます。そのため、1 ページの`items`はオプションなしのときより少なくなることがあり、`symbol_rollup`が予算を超えるとエラーになります。`--cursor`はオプションの有無に結び付きます。
 - まとめる対象は、選んだファイルが所有するノードの semantic の辺です。ノードの`source_path`がそのファイルを指すか、そのファイルがノードを`declares`しているとき、そのファイルが所有すると見なします。
 - `dependents`では、所有するノードへ入る辺を、辺が書かれたファイル（辺の evidence の path）ごとにまとめます。`deps`では、そのファイルに書かれた出る辺を、相手のノードを所有するファイルごとにまとめます。`mod name;`で宣言した Rust のモジュールは宣言したファイルが所有しますが、モジュールのファイルに書いた`use`は、そのファイルの`deps`に出ます。
 - `symbol_rollup.files[]`の各要素は、`path`、`node_id`、`edge_count`、kind ごとの件数`edge_kinds`、元の辺の ID（ID 順に最大 16 件の`edge_ids`）を持ちます。`file_edge`は、そのファイルとの直接の辺が辺の一覧にもあるかを示します。

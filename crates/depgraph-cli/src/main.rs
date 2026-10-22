@@ -3464,6 +3464,11 @@ fn interactive_dependencies_page(
                 serde_json::json!(edge_kind_filter.structural_edges().as_str());
         }
     }
+    // The rollup takes part of the page budget, so it binds the cursor; without
+    // it the cursor keeps its legacy binding (Issue #623).
+    if let Some(rollup) = request.rollup() {
+        context["rollup"] = serde_json::json!(rollup.as_str());
+    }
     paginate_interactive_query(
         execution.items(),
         traversal_summary(execution.traversal()),

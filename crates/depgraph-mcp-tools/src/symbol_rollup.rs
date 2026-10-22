@@ -102,9 +102,8 @@ impl TryFrom<AgentSymbolRollupFileWire> for AgentSymbolRollupFile {
             || wire
                 .edge_kinds
                 .iter()
-                .map(|kind| kind.edge_count)
-                .sum::<u64>()
-                != wire.edge_count
+                .try_fold(0_u64, |total, kind| total.checked_add(kind.edge_count))
+                != Some(wire.edge_count)
         {
             return Err(ContractBuildError::TooManySnapshotMetadataItems);
         }
@@ -292,5 +291,30 @@ impl<'de> Deserialize<'de> for AgentSymbolRollup {
         D: Deserializer<'de>,
     {
         Self::try_from(AgentSymbolRollupWire::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(edge_count: u64, kinds: &[u64]) -> serde_json::Value {
+        let edge_kinds = kinds
+            .iter()
+            .enumerate()
+            .map(|(index, count)| serde_json::json!({"kind": format!("kind{index}"), "edge_count": count}))
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "node_id": "file:model", "path": "src/model.rs", "edge_count": edge_count,
+            "edge_kinds": edge_kinds, "edge_ids": [], "file_edge": false
+        })
+    }
+
+    #[test]
+    fn a_rollup_file_counts_its_kinds_without_overflowing() {
+        assert!(serde_json::from_value::<AgentSymbolRollupFile>(file(3, &[1, 2])).is_ok());
+        assert!(serde_json::from_value::<AgentSymbolRollupFile>(file(4, &[1, 2])).is_err());
+        // A sum that wraps around must not match the declared count.
+        assert!(serde_json::from_value::<AgentSymbolRollupFile>(file(1, &[u64::MAX, 2])).is_err());
     }
 }
