@@ -195,35 +195,35 @@ const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.2";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:655615e98358c15499075240856fcc150fc9b0298eb46dee93b60d136de87685",
-        query_result_digest: "bounded-query-result:sha256:83026bd6a05da6e4860259c82384c7d2a62a73655d010a44aa2e2da60f436012",
-        query_output_sha256: "1d16962ef1835f7dc85c12081b1ffc9c27cf6beb2fc6a949f109f770b15523cf",
-        profile_plan_digest: "profile-selection-plan:sha256:462c46653643a3d18ef55f8a3d7d313cac85ed0d5e6d599a7d22f7684b25e9d2",
-        profile_plan_output_sha256: "b580913993099777903f77ea1e570577368ed0fc1e3155dd2cc0cc818f44578f",
+        query_plan_digest: "bounded-query-plan:sha256:61d2dd265a20ea138566e0c990d7fca927169c3eda6d464e9d684226f8007e99",
+        query_result_digest: "bounded-query-result:sha256:bd19f67e62d65498b4b9ace38bd41de1b03250e887f77a1b4826274199c1a531",
+        query_output_sha256: "58a0266625fbb9b090dec6dd913003d11be2ea4ab2bfe567e001f99702cdba8d",
+        profile_plan_digest: "profile-selection-plan:sha256:d11db3c0f8e66280f71cdcb209d7ff05467b9f23f81c87dd2295fc93e2561bdd",
+        profile_plan_output_sha256: "ed72fa8c0888d111101893911f616adec00958b14e7650c5b1a4efca4af5aea4",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:e5070d058780fc2e414cf318bbc9fe910c0ab7e2b26be5932040d30747ac33bf",
-        query_result_digest: "bounded-query-result:sha256:d7de22fcca4cbd1d73615522fea03f42bbcf2e630dd370ca512862d484048e49",
-        query_output_sha256: "3bcbca05c803dbc3f34dde94cb275e20d8704d9bdb7ee7100467ec827743f273",
-        profile_plan_digest: "profile-selection-plan:sha256:f21764f9c1eae3cd421bc1d3ad5fe72a9b7d86f50bea01c73969c8ffdb7c310c",
-        profile_plan_output_sha256: "c1bca983d3225b351484d6b210b75c53c23f97ae9a78461bdab645b8ac3e1ff5",
+        query_plan_digest: "bounded-query-plan:sha256:ba01dcebae5e33ecede1847417ae41045d975dbb183e31a50efad7befc5a4efa",
+        query_result_digest: "bounded-query-result:sha256:0f61ef9903d2939d0df9d74f44ebdea2f63a88d9ec78cf5b72f78553ed2b5f72",
+        query_output_sha256: "943be952bab9ed52aeda5e2e98ccce80522099fd945359bdcd9858d30cf02239",
+        profile_plan_digest: "profile-selection-plan:sha256:9393235c5bd100a1662afcc6ebb0287f66ba291191ef47d41a03fa31c0bf597e",
+        profile_plan_output_sha256: "a7ca784f25d349790ba0a02b3508dd94381ef951d438b11a0c370f5c5677adf8",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:dc47fdd0b317d581b8e4c65228bb8f34cd7153bde3b3d873da4dcab503bbbb4a",
-        query_result_digest: "bounded-query-result:sha256:f2c7efbfe9960eec4c417343f89c765f7a0d61f3565862a82466e33238a9a177",
-        query_output_sha256: "8acf3aa686184e4457bc4301f0b5a1fb60353974c8691cc8fd1639d5dc206aec",
-        profile_plan_digest: "profile-selection-plan:sha256:570ed675575f7de5f4a4ac9b5f0e9caf33b3944bdbd43bf4084e22ea83bdad60",
-        profile_plan_output_sha256: "cd026f9f39f96f1ddbe41bcc4cd0d6777368a99a21d05439027599554a44c314",
+        query_plan_digest: "bounded-query-plan:sha256:ab7a0c8966703c6d290768f99fd20e5ddc26c795bdd8e5b51737b7c7848c9bf2",
+        query_result_digest: "bounded-query-result:sha256:46460e6288bdbd51d039a63822e2f4c25917392e577e8c92fe3294e2bd486945",
+        query_output_sha256: "02e911c8613382f96bdf0bd6dcc19b0bed1334bd3a1f1cc2389bce4a52f685ba",
+        profile_plan_digest: "profile-selection-plan:sha256:ffbea7571cba2d9c89c9e6d6eed624a4eb56bc25f347eee844f252d6436e3ba4",
+        profile_plan_output_sha256: "331ef05a105f5e6a56d9911876ba2479346f49d35a225054eee4b36dc2a3d5f6",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:e1f22ba4efe805c74d35631bdbca9abb34c57fd0e30267ef92e7435754cbe229",
-        query_result_digest: "bounded-query-result:sha256:394a4bf15e2aa122e44708f1d156d34817fe298d52e394caabfba5ec00eaefec",
-        query_output_sha256: "19f233834bd8f336877208f4b48595c2fafeab95ed3182092d89d8d0bab4258d",
-        profile_plan_digest: "profile-selection-plan:sha256:804df798547c03b5bf745ba6678851aaf301a8fdeea65c5f76b516a9fe25381d",
-        profile_plan_output_sha256: "3d002439c09410b4b7699e5930ed0e2096c227a4f4474e7585f2dff2978f0c7d",
+        query_plan_digest: "bounded-query-plan:sha256:abb6e92290a52406dda25bea3c8f4d2860872276cca570980107afc3962c3d2f",
+        query_result_digest: "bounded-query-result:sha256:34fe18755b4ff5379bb76b12f52c4d60cabdd17eb7d25c7a7b31065771a08a04",
+        query_output_sha256: "ff041f5fc5b39dacfccd02750c7dc8eb6f7b9e80dffe600b520b20de204f0fde",
+        profile_plan_digest: "profile-selection-plan:sha256:98231381470feda21f80ce849a29e4c49d52c352bdab22728e09b92999af4005",
+        profile_plan_output_sha256: "ff19548c88201e4c40cae99dbb46b2afc0cb93b17217ccfe2a799790a54c0c8a",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -7618,7 +7618,7 @@ jobs:
     #[test]
     fn native_smoke_pins_match_recorded_native_observations() {
         let evidence: Value = serde_json::from_str(include_str!(
-            "../fixtures/native-smoke-v0.7.1-observations.json"
+            "../fixtures/native-smoke-v0.7.2-observations.json"
         ))
         .unwrap();
         assert_eq!(evidence["version"], VERSION);
@@ -7633,24 +7633,24 @@ jobs:
             let observed = observations[0];
             let (run, job, source_commit) = match *target {
                 "aarch64-apple-darwin" => (
-                    39395768146_u64,
-                    118538001160_u64,
-                    "912198b87294dc0e5934a2c2abf88e77422fca09",
+                    39719365765_u64,
+                    119629342296_u64,
+                    "d6c8cf648842a8987b33a1f3d86f3a497611a8fd",
                 ),
                 "aarch64-unknown-linux-gnu" => (
-                    39395278063_u64,
-                    118536377284_u64,
-                    "e7be6557a1abd96545cbd64b58e148f8bf7cf181",
+                    39719365765_u64,
+                    119629342362_u64,
+                    "d6c8cf648842a8987b33a1f3d86f3a497611a8fd",
                 ),
                 "x86_64-pc-windows-msvc" => (
-                    39395768146_u64,
-                    118538001269_u64,
-                    "912198b87294dc0e5934a2c2abf88e77422fca09",
+                    39719365765_u64,
+                    119629342482_u64,
+                    "d6c8cf648842a8987b33a1f3d86f3a497611a8fd",
                 ),
                 "x86_64-unknown-linux-gnu" => (
-                    39395768146_u64,
-                    118538001296_u64,
-                    "912198b87294dc0e5934a2c2abf88e77422fca09",
+                    39719365765_u64,
+                    119629342411_u64,
+                    "d6c8cf648842a8987b33a1f3d86f3a497611a8fd",
                 ),
                 _ => panic!("missing recorded native job for {target}"),
             };
