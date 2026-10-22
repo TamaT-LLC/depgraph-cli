@@ -80,6 +80,33 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
 
 MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`edge_kinds`と`structural_edges`を使います。
 
+### dependents と impact の結果の違い（symbol 単位の依存）
+
+同じファイルでも、`dependents`と`impact`の結果の大きさは大きく違うことがあります。
+例えば Rust HIR を通した depgraph-cli 自身の Store では、`crates/depgraph-core/src/config.rs`の`dependents`は 12 ファイル、`impact`は 146 ファイルでした。`--rollup symbols`で symbol の依存をまとめると 17 ファイルになり、そのうち 5 ファイルは`dependents`の一覧にないファイルでした。
+
+- `dependents` / `deps`は、選んだノードに直接つながる辺だけを返します。既定では構造上の辺も除きます。
+- `impact`は、すべての種類の辺を逆向きに推移的にたどります。構造上の辺（モジュールがファイルを宣言する`declares`など）も、その先の semantic の辺もたどります。
+- Rust HIR と Web の semantic 解析が出す辺（`calls`、`type_uses`、`imports`など）は、symbol / type / module のノードに張られます。file のノードには張られません。そのため、ファイルを選んだ`dependents` / `deps`には symbol 単位の依存が出ません。
+- crate をまたぐ import（`use depgraph_core::...`）は、syntax 解析では相手の package に結び付き、file → file の辺になりません。re-export 越しの import（`pub use`を経由した`use`）は、同じ crate の中なら syntax 解析が re-export をたどって定義元の file に結び付けます。ただし、曖昧な glob や`cfg`ごとに先が変わる re-export など、たどれない場合は途中のモジュールの file に残ります。HIR ではこれらが module / type / symbol への semantic の辺になるので、ファイルの`dependents` / `deps`には出ません。
+
+ファイル単位で symbol の依存を見たいときは、`--rollup symbols`を付けます。
+
+```bash
+depgraph dependents path:crates/depgraph-core/src/config.rs --rollup symbols --json
+depgraph deps path:crates/depgraph-core/src/lib.rs --rollup symbols
+```
+
+- 辺の一覧（`items`、`total_items`、`traversed_items`）は、オプションなしのときと同じです。まとめた結果は別のフィールド`symbol_rollup`に入ります。新しい辺は作りません。
+- まとめる対象は、選んだファイルが所有するノードの semantic の辺です。ノードの`source_path`がそのファイルを指すか、そのファイルがノードを`declares`しているとき、そのファイルが所有すると見なします。
+- `dependents`では、所有するノードへ入る辺を、辺が書かれたファイル（辺の evidence の path）ごとにまとめます。`deps`では、そのファイルに書かれた出る辺を、相手のノードを所有するファイルごとにまとめます。`mod name;`で宣言した Rust のモジュールは宣言したファイルが所有しますが、モジュールのファイルに書いた`use`は、そのファイルの`deps`に出ます。
+- `symbol_rollup.files[]`の各要素は、`path`、`node_id`、`edge_count`、kind ごとの件数`edge_kinds`、元の辺の ID（ID 順に最大 16 件の`edge_ids`）を持ちます。`file_edge`は、そのファイルとの直接の辺が辺の一覧にもあるかを示します。
+- 相手にファイルがない辺（外部 crate、解決できなかった呼び出し先など）は`unattributed_edges`に数えます。
+- `--edge-kind`と`--phase`などの絞り込みは、まとめる辺にもかかります。構造上の辺はまとめません。`--transitive`とは一緒に使えません。
+- snapshot に semantic の辺が 1 本もないとき（Rust を syntax-only で解析した Store など）は、`status`が`no_semantic_edges`になります。理由は`analysis_degradations`で確かめます。選んだノードがファイルでないときは`root_not_file`です。
+
+MCPの`graph_dependencies_list`と`graph_dependents_list`では、同じ意味の`rollup: "symbols"`を使います。
+
 ## health の confidence の読み方
 
 `health`の結果には、どこまで確信できるかを示すconfidenceが付きます。

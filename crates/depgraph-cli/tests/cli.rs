@@ -8518,3 +8518,375 @@ fn issue_579_degraded_profiles_count_toward_the_page_byte_budget() {
         assert!(returned > 0 && returned < 121, "{value}");
     }
 }
+
+/// `src/user.rs` imports `src/model.rs` at file level and calls into it
+/// through symbols; `src/other.rs` reaches the model only through the `use`
+/// item of the module `other`, which `src/lib.rs` declares (Issue #623).
+fn seed_issue_623_snapshot(store_path: &Path, root: &Path) {
+    let mut store = depgraph_store::Store::open(store_path).unwrap();
+    store
+        .start_scan_with_revision("issue-623", root, false, Some("revision-623"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1, "files_discovered": 0, "files_analyzed": 0, "files_skipped": 0,
+        "dependency_sites": 1, "resolved": 1, "candidates": 0, "external": 0,
+        "unresolved": 0, "unsupported_syntax": 0, "project_code_executed": false,
+        "completeness": [], "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event, "protocol_version": "1.0", "scan_id": "issue-623",
+            "adapter": "rust", "adapter_version": "0.7.0", "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root.to_string_lossy());
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "profile:rust", "language": "rust", "features": [], "environment": {},
+        "properties": {"rust_hir_mode": "full"}
+    });
+    store.ingest_event(&profile).unwrap();
+    let files = [
+        ("file:lib", "src/lib.rs"),
+        ("file:model", "src/model.rs"),
+        ("file:other", "src/other.rs"),
+        ("file:user", "src/user.rs"),
+    ];
+    for (id, path) in files {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": "file", "locator": format!("file:{path}"),
+            "display_name": path, "properties": {"language": "rust", "path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    for (id, kind, path) in [
+        ("module:other", "module", "src/lib.rs"),
+        ("type:thing", "type", "src/model.rs"),
+        ("symbol:make", "symbol", "src/model.rs"),
+        ("symbol:run", "symbol", "src/user.rs"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": kind, "locator": format!("rust-{kind}:{id}"),
+            "display_name": id, "properties": {"language": "rust", "source_path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let evidence = |path: &str, line: u64| {
+        json!([{
+            "kind": "semantic", "extractor": "rust-analyzer-hir", "extractor_version": "0.7.0",
+            "path": path, "start_line": line, "start_column": 1,
+            "end_line": line, "end_column": 12, "properties": {}
+        }])
+    };
+    let mut site = next("dependency_site");
+    site["site"] = json!({
+        "id": "site:use", "source": "file:user", "kind": "rust_use",
+        "specifier": "crate::model::Thing", "resolution_status": "resolved",
+        "target_ids": ["file:model"], "profile_id": "profile:rust",
+        "condition": {"op": "true"}, "precision": "exact", "evidence": evidence("src/user.rs", 1)
+    });
+    store.ingest_event(&site).unwrap();
+    for (id, site_id, source, target, kind, phase, path, line) in [
+        (
+            "edge:use",
+            Some("site:use"),
+            "file:user",
+            "file:model",
+            "imports",
+            "source",
+            "src/user.rs",
+            1,
+        ),
+        (
+            "edge:mod",
+            None,
+            "file:lib",
+            "module:other",
+            "declares",
+            "source",
+            "src/lib.rs",
+            1,
+        ),
+        (
+            "edge:call",
+            None,
+            "symbol:run",
+            "symbol:make",
+            "calls",
+            "semantic",
+            "src/user.rs",
+            3,
+        ),
+        (
+            "edge:type",
+            None,
+            "symbol:run",
+            "type:thing",
+            "type_uses",
+            "semantic",
+            "src/user.rs",
+            4,
+        ),
+        (
+            "edge:import",
+            None,
+            "module:other",
+            "type:thing",
+            "imports",
+            "semantic",
+            "src/other.rs",
+            1,
+        ),
+        (
+            "edge:internal",
+            None,
+            "symbol:make",
+            "type:thing",
+            "type_uses",
+            "semantic",
+            "src/model.rs",
+            2,
+        ),
+    ] {
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": id, "site_id": site_id, "source": source, "target": target, "kind": kind,
+            "phase": phase, "environment": "host", "profile_id": "profile:rust",
+            "condition": {"op": "true"}, "resolution_status": "resolved",
+            "precision": "exact", "generated": false, "evidence": evidence(path, line)
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("profile:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-623", "completed", None, true)
+        .unwrap();
+}
+
+fn run_issue_623(store: &Path, arguments: &[&str]) -> String {
+    let output = Command::cargo_bin("depgraph")
+        .unwrap()
+        .arg("--store")
+        .arg(store)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Without `--rollup` the JSON and text output of `deps` / `dependents` is
+/// byte-identical to the release before Issue #623. The digests were recorded
+/// with the binary built from origin/main `70958ce` on this snapshot.
+#[test]
+fn issue_623_dependency_lists_without_a_rollup_keep_their_bytes() {
+    use sha2::{Digest, Sha256};
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("store.sqlite");
+    seed_issue_623_snapshot(&store, &root);
+    let mut digests = Vec::new();
+    for (command, selector) in [("dependents", "id:file:model"), ("deps", "id:file:user")] {
+        for extra in [
+            &[][..],
+            &["--json"][..],
+            &["--all"][..],
+            &["--all", "--json"][..],
+        ] {
+            let mut arguments = vec![command, selector];
+            arguments.extend_from_slice(extra);
+            let stdout = run_issue_623(&store, &arguments);
+            digests.push(format!(
+                "{} {:x}",
+                arguments.join(" "),
+                Sha256::digest(stdout.as_bytes())
+            ));
+        }
+    }
+    assert_eq!(digests, ISSUE_623_DEFAULT_OUTPUT_DIGESTS, "{digests:#?}");
+}
+
+const ISSUE_623_DEFAULT_OUTPUT_DIGESTS: [&str; 8] = [
+    "dependents id:file:model 5e4904fbdb2f0575f26df2cf2040d20316f9ad96b4865fb9ff1ecce3c37fc382",
+    "dependents id:file:model --json cc4e6dece8da33e95942dd81ca8407b6603742b647230ae8afceed20de7b33d3",
+    "dependents id:file:model --all 7cc25a71ec67890238205a6957cc3781c83457a34868a8df6bbe23f69dd52b62",
+    "dependents id:file:model --all --json 0250d7f87d8c27b733a6a8ba1fb95cafe180ffc3cdb80bbd7163fcd6195229b0",
+    "deps id:file:user 0e5d1b4c76cdf96dc3071753159a4add5d9802a5e4d0daa0c1f7fa56055862aa",
+    "deps id:file:user --json bacdc5a9cf1237ba8ad7c1845a2e6c7c4759302a469aac5a8ab0b75f5b0241e8",
+    "deps id:file:user --all 7cc25a71ec67890238205a6957cc3781c83457a34868a8df6bbe23f69dd52b62",
+    "deps id:file:user --all --json 54795af2319b78e5d6fbf2189a3de026ce5c0beec804e28ba56212fb67c8becf",
+];
+
+#[test]
+fn issue_623_rollup_symbols_groups_the_semantic_edges_by_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("store.sqlite");
+    seed_issue_623_snapshot(&store, &root);
+    let expected_dependents = json!({
+        "rollup": "symbols",
+        "status": "rolled_up",
+        "owned_nodes": 2,
+        "attributed_edges": 3,
+        "unattributed_edges": 0,
+        "total_files": 2,
+        "files": [
+            {
+                "node_id": "file:other", "path": "src/other.rs", "edge_count": 1,
+                "edge_kinds": [{"kind": "imports", "edge_count": 1}],
+                "edge_ids": ["edge:import"], "file_edge": false
+            },
+            {
+                "node_id": "file:user", "path": "src/user.rs", "edge_count": 2,
+                "edge_kinds": [
+                    {"kind": "calls", "edge_count": 1},
+                    {"kind": "type_uses", "edge_count": 1}
+                ],
+                "edge_ids": ["edge:call", "edge:type"], "file_edge": true
+            }
+        ]
+    });
+    for extra in [&[][..], &["--all"][..]] {
+        let mut arguments = vec![
+            "dependents",
+            "id:file:model",
+            "--json",
+            "--rollup",
+            "symbols",
+        ];
+        arguments.extend_from_slice(extra);
+        let with: serde_json::Value =
+            serde_json::from_str(&run_issue_623(&store, &arguments)).unwrap();
+        assert_eq!(with["symbol_rollup"], expected_dependents, "{arguments:?}");
+        // The edge list itself is the one without the rollup.
+        let mut plain_arguments = vec!["dependents", "id:file:model", "--json"];
+        plain_arguments.extend_from_slice(extra);
+        let plain: serde_json::Value =
+            serde_json::from_str(&run_issue_623(&store, &plain_arguments)).unwrap();
+        let mut stripped = with.clone();
+        stripped.as_object_mut().unwrap().remove("symbol_rollup");
+        if extra.is_empty() {
+            // serialized_output_bytes counts the rollup too.
+            stripped["serialized_output_bytes"] = plain["serialized_output_bytes"].clone();
+        }
+        assert_eq!(stripped, plain, "{arguments:?}");
+    }
+
+    // The `use` item of module `other` is written in src/other.rs.
+    let other: serde_json::Value = serde_json::from_str(&run_issue_623(
+        &store,
+        &["deps", "id:file:other", "--json", "--rollup", "symbols"],
+    ))
+    .unwrap();
+    assert_eq!(other["total_items"], 0, "{other}");
+    assert_eq!(other["symbol_rollup"]["files"][0]["path"], "src/model.rs");
+    assert_eq!(
+        other["symbol_rollup"]["files"][0]["edge_ids"],
+        json!(["edge:import"])
+    );
+    let lib: serde_json::Value = serde_json::from_str(&run_issue_623(
+        &store,
+        &["deps", "id:file:lib", "--json", "--rollup", "symbols"],
+    ))
+    .unwrap();
+    assert_eq!(lib["symbol_rollup"]["owned_nodes"], 1);
+    assert_eq!(lib["symbol_rollup"]["files"], json!([]));
+
+    let text = run_issue_623(
+        &store,
+        &["dependents", "id:file:model", "--rollup", "symbols"],
+    );
+    assert!(
+        text.contains(
+            "symbol rollup: status=rolled_up; files=2/2; attributed_edges=3; unattributed_edges=0; owned_nodes=2"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("  src/other.rs edges=1 [imports=1] (no file edge)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  src/user.rs edges=2 [calls=1, type_uses=1]\n"),
+        "{text}"
+    );
+
+    // A selector that is not a file owns nothing.
+    let symbol: serde_json::Value = serde_json::from_str(&run_issue_623(
+        &store,
+        &[
+            "dependents",
+            "id:symbol:make",
+            "--json",
+            "--rollup",
+            "symbols",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(symbol["symbol_rollup"]["status"], "root_not_file");
+
+    // The rollup groups direct edges only.
+    Command::cargo_bin("depgraph")
+        .unwrap()
+        .arg("--store")
+        .arg(&store)
+        .args([
+            "dependents",
+            "id:file:model",
+            "--transitive",
+            "--rollup",
+            "symbols",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// A Store without semantic edges, such as Rust in syntax-only mode, reports
+/// why the rollup is empty next to its analysis_degradations (Issue #623).
+#[test]
+fn issue_623_rollup_of_a_syntax_only_store_reports_no_semantic_edges() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("degraded.sqlite");
+    seed_issue_579_snapshot(&store, &root, true, 0);
+    let value: serde_json::Value = serde_json::from_str(&run_issue_623(
+        &store,
+        &[
+            "dependents",
+            "id:file:model",
+            "--json",
+            "--rollup",
+            "symbols",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(value["symbol_rollup"]["status"], "no_semantic_edges");
+    assert_eq!(value["symbol_rollup"]["files"], json!([]));
+    assert_eq!(
+        value["analysis_degradations"][0]["analysis_mode"],
+        "syntax-only"
+    );
+    assert_eq!(value["total_items"], 1);
+}

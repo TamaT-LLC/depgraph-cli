@@ -32,7 +32,7 @@ use depgraph_core::{
 };
 use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
 use depgraph_mcp_tools::{
-    AGENT_IMPORT_GROUPS_PAGE_BYTES, AgentContextDetail, AgentContextOutput,
+    AGENT_IMPORT_GROUPS_PAGE_BYTES, AgentContextDetail, AgentContextOutput, AgentDependencyRollup,
     AgentEdgesImportsResponse, AgentFanInItem, AgentImportGroup,
 };
 use depgraph_mcp_tools::{
@@ -519,6 +519,11 @@ struct GraphDependenciesArguments {
     /// rejected rather than read as omitted.
     #[serde(default, deserialize_with = "deserialize_present")]
     structural_edges: Option<StructuralEdgeSelection>,
+    /// `symbols` also rolls up the semantic edges of the nodes the selector
+    /// file owns by the other file (Issue #623). Omitted keeps the response
+    /// unchanged; `null` is rejected rather than read as omitted.
+    #[serde(default, deserialize_with = "deserialize_present")]
+    rollup: Option<AgentDependencyRollup>,
     #[serde(default)]
     detail: AgentDependencyDetail,
     #[serde(default)]
@@ -3626,6 +3631,13 @@ fn execute_catalog_read_tool(
             // with the same reason as agent_edges_list (Issue #581).
             EdgeKindFilter::try_new(arguments.edge_kinds.clone(), arguments.structural_edges)
                 .map_err(edge_kinds_argument_error)?;
+            // A rollup groups the direct edges of the selector file only.
+            if arguments.rollup.is_some() && arguments.transitive {
+                return Err(invalid_argument(
+                    Some("rollup"),
+                    AgentArgumentReason::InvalidValue,
+                ));
+            }
             let request = DependenciesRequest::try_new(
                 arguments.selector.as_str(),
                 direction,
@@ -3633,7 +3645,8 @@ fn execute_catalog_read_tool(
                 filter,
                 max_traversal,
             )?
-            .with_edge_kind_filter(arguments.edge_kinds, arguments.structural_edges)?;
+            .with_edge_kind_filter(arguments.edge_kinds, arguments.structural_edges)?
+            .with_rollup(arguments.rollup.map(AgentDependencyRollup::to_core))?;
             let mut normalized = serde_json::json!({
                 "direction": match direction {
                     DependencyDirection::Outgoing => "outgoing",
@@ -3659,6 +3672,10 @@ fn execute_catalog_read_tool(
                     normalized["structural_edges"] =
                         serde_json::json!(edge_kind_filter.structural_edges().as_str());
                 }
+            }
+            // Without a rollup the cursor keeps its legacy binding (Issue #623).
+            if let Some(rollup) = arguments.rollup {
+                normalized["rollup"] = serde_json::json!(rollup.as_str());
             }
             let pagination = PaginationContext::new(
                 cursor_key,

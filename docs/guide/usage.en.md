@@ -91,6 +91,68 @@ depgraph deps path:src/app.ts --transitive --edge-kind imports --edge-kind type_
 The MCP `graph_dependencies_list` and `graph_dependents_list` tools accept the
 same selection as `edge_kinds` and `structural_edges`.
 
+### Why dependents and impact differ (symbol-level dependencies)
+
+For the same file, `dependents` and `impact` can return results of very
+different size. In a Rust HIR Store of depgraph-cli itself, `dependents` of
+`crates/depgraph-core/src/config.rs` lists 12 files and `impact` lists 146.
+`--rollup symbols` groups its symbol dependencies into 17 files, 5 of which
+the `dependents` list does not contain.
+
+- `dependents` / `deps` return only the edges directly attached to the
+  selected node, without structural edges by default.
+- `impact` follows every edge kind in reverse, transitively. It also follows
+  structural edges (such as a module that `declares` a file) and the semantic
+  edges beyond them.
+- The edges of Rust HIR and the Web semantic analysis (`calls`, `type_uses`,
+  `imports`, and so on) attach to symbol, type, and module nodes, never to file
+  nodes. A file's `dependents` / `deps` therefore omit symbol-level
+  dependencies.
+- An import from another crate (`use depgraph_core::...`) resolves to that
+  package in syntax analysis, not to a file-to-file edge. An import through a
+  re-export (a `use` that goes through `pub use`) within the same crate is
+  followed by syntax analysis to the file that defines the name, except when
+  the re-export cannot be followed (an ambiguous glob, a re-export whose
+  target differs per `cfg`, and so on), which leaves it at the intermediate
+  module's file. With HIR these imports become semantic edges to modules,
+  types, and symbols, which a file's `dependents` / `deps` do not list.
+
+To see symbol-level dependencies per file, pass `--rollup symbols`.
+
+```bash
+depgraph dependents path:crates/depgraph-core/src/config.rs --rollup symbols --json
+depgraph deps path:crates/depgraph-core/src/lib.rs --rollup symbols
+```
+
+- The edge list (`items`, `total_items`, `traversed_items`) is the same as
+  without the option. The rollup is added as a separate `symbol_rollup` field,
+  and no edge is created.
+- The rollup groups the semantic edges of the nodes the selected file owns. A
+  file owns a node when the node's `source_path` names the file or the file
+  `declares` the node.
+- For `dependents`, the incoming edges of those nodes are grouped by the file
+  where each edge is written (the path of its evidence). For `deps`, the
+  outgoing edges written in the file are grouped by the file that owns the
+  target. A Rust module declared with `mod name;` belongs to the declaring
+  file, but the `use` items written in the module file appear in the `deps` of
+  that module file.
+- Each `symbol_rollup.files[]` entry has `path`, `node_id`, `edge_count`,
+  `edge_kinds` (the count per kind), and `edge_ids` (at most 16 IDs of the
+  edges behind it, in ID order). `file_edge` tells whether the edge list also
+  has a direct edge with that file.
+- Edges whose far end has no file (an external crate, an unresolved callee)
+  are counted in `unattributed_edges`.
+- `--edge-kind`, `--phase`, and the other filters apply to the grouped edges
+  too. Structural edges are never grouped. `--transitive` cannot be combined
+  with it.
+- When the snapshot has no semantic edge at all (for example a Store with Rust
+  analyzed in syntax-only mode), `status` is `no_semantic_edges`; check
+  `analysis_degradations` for the reason. When the selected node is not a
+  file, `status` is `root_not_file`.
+
+The MCP `graph_dependencies_list` and `graph_dependents_list` tools accept the
+same option as `rollup: "symbols"`.
+
 ## Reading code-health confidence
 
 Confidence on `health` findings reserves `confirmed` for `unused-file`,

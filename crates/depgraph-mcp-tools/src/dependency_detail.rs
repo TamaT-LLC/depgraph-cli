@@ -440,6 +440,11 @@ pub struct AgentDependenciesSummaryResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 256))]
     analysis_degradations: Vec<AgentAnalysisDegradation>,
+    /// File-level rollup of the selector's symbol dependencies (Issue #623).
+    /// Present only when the request sets `rollup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "crate::AgentSymbolRollup")]
+    symbol_rollup: Option<crate::AgentSymbolRollup>,
 }
 
 impl AgentDependenciesSummaryResponse {
@@ -472,6 +477,7 @@ impl AgentDependenciesSummaryResponse {
             common,
             edges,
             analysis_degradations: Vec::new(),
+            symbol_rollup: None,
         })
     }
 
@@ -488,6 +494,18 @@ impl AgentDependenciesSummaryResponse {
     #[must_use]
     pub fn analysis_degradations(&self) -> &[AgentAnalysisDegradation] {
         &self.analysis_degradations
+    }
+
+    /// Attaches the file-level symbol rollup (Issue #623).
+    #[must_use]
+    pub fn with_symbol_rollup(mut self, symbol_rollup: Option<crate::AgentSymbolRollup>) -> Self {
+        self.symbol_rollup = symbol_rollup;
+        self
+    }
+
+    #[must_use]
+    pub const fn symbol_rollup(&self) -> Option<&crate::AgentSymbolRollup> {
+        self.symbol_rollup.as_ref()
     }
 
     #[must_use]
@@ -515,6 +533,8 @@ struct AgentDependenciesSummaryResponseWire {
     edges: Page<AgentEdgeSummary>,
     #[serde(default, deserialize_with = "deserialize_analysis_degradations")]
     analysis_degradations: Vec<AgentAnalysisDegradation>,
+    #[serde(default)]
+    symbol_rollup: Option<crate::AgentSymbolRollup>,
 }
 
 impl<'de> Deserialize<'de> for AgentDependenciesSummaryResponse {
@@ -532,7 +552,11 @@ impl<'de> Deserialize<'de> for AgentDependenciesSummaryResponse {
             wire.common,
             wire.edges,
         )
-        .map(|response| response.with_analysis_degradations(wire.analysis_degradations))
+        .map(|response| {
+            response
+                .with_analysis_degradations(wire.analysis_degradations)
+                .with_symbol_rollup(wire.symbol_rollup)
+        })
         .map_err(D::Error::custom)
     }
 }
@@ -750,6 +774,11 @@ pub struct AgentDependencyPathsResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 256))]
     analysis_degradations: Vec<AgentAnalysisDegradation>,
+    /// File-level rollup of the selector's symbol dependencies (Issue #623).
+    /// Present only when the request sets `rollup`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "crate::AgentSymbolRollup")]
+    symbol_rollup: Option<crate::AgentSymbolRollup>,
 }
 
 impl AgentDependencyPathsResponse {
@@ -777,6 +806,7 @@ impl AgentDependencyPathsResponse {
             traversed_edges,
             paths,
             analysis_degradations: Vec::new(),
+            symbol_rollup: None,
         })
     }
 
@@ -793,6 +823,18 @@ impl AgentDependencyPathsResponse {
     #[must_use]
     pub fn analysis_degradations(&self) -> &[AgentAnalysisDegradation] {
         &self.analysis_degradations
+    }
+
+    /// Attaches the file-level symbol rollup (Issue #623).
+    #[must_use]
+    pub fn with_symbol_rollup(mut self, symbol_rollup: Option<crate::AgentSymbolRollup>) -> Self {
+        self.symbol_rollup = symbol_rollup;
+        self
+    }
+
+    #[must_use]
+    pub const fn symbol_rollup(&self) -> Option<&crate::AgentSymbolRollup> {
+        self.symbol_rollup.as_ref()
     }
 
     #[must_use]
@@ -814,6 +856,8 @@ struct AgentDependencyPathsResponseWire {
     paths: Page<AgentDependencyPath>,
     #[serde(default, deserialize_with = "deserialize_analysis_degradations")]
     analysis_degradations: Vec<AgentAnalysisDegradation>,
+    #[serde(default)]
+    symbol_rollup: Option<crate::AgentSymbolRollup>,
 }
 
 impl<'de> Deserialize<'de> for AgentDependencyPathsResponse {
@@ -830,7 +874,11 @@ impl<'de> Deserialize<'de> for AgentDependencyPathsResponse {
             wire.traversed_edges,
             wire.paths,
         )
-        .map(|response| response.with_analysis_degradations(wire.analysis_degradations))
+        .map(|response| {
+            response
+                .with_analysis_degradations(wire.analysis_degradations)
+                .with_symbol_rollup(wire.symbol_rollup)
+        })
         .map_err(D::Error::custom)
     }
 }

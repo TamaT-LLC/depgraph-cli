@@ -69,6 +69,36 @@ and the work that grows with the returned edges by a fixed 1,000,000. Either
 bound exits with code 3 and
 `request exhausted a service resource limit: preprocessing_work_items=<maximum>`.
 
+`deps` and `dependents` list the edges directly attached to the selected node,
+while `impact` follows every edge kind in reverse, transitively, structural
+edges included, so `impact` of a file is usually much larger. Rust HIR and Web
+semantic edges (`calls`, `type_uses`, `imports`, `reexports`, and so on) attach
+to symbol, type, and module nodes and never to file nodes, so the edge list of
+a file omits symbol-level dependencies. That includes imports from another
+crate, which syntax analysis resolves to the package rather than a file, and
+imports through a re-export that syntax analysis cannot follow to the defining
+file (an ambiguous glob or a re-export whose target differs per `cfg`; other
+re-export chains within a crate are followed since Issue #622). `--rollup symbols` (not combinable with `--transitive`)
+adds `symbol_rollup` without changing the edge list, `total_items`, or
+`traversed_items`: the semantic edges of the nodes the file owns (their
+`source_path` names the file, or the file `declares` them) grouped by the other
+file. For `dependents` the other file is where the edge is written (its
+evidence path; the owner of the source node when the edge has no evidence);
+for `deps` it is the owner of the target, counting only the edges written in
+the selected file. Each file carries `node_id`, `path`, `edge_count`,
+`edge_kinds` (count per kind), up to 16 `edge_ids` in ID order, and
+`file_edge` (whether the edge list has a direct edge with it); `files` lists at
+most 4,096 files in path order and `total_files` counts all of them. Edges
+without a file at the far end count as `unattributed_edges`. `status` is
+`rolled_up`, `no_semantic_edges` (the snapshot has no semantic edge, for
+example Rust in syntax-only mode as `analysis_degradations` reports), or
+`root_not_file`. The rollup scans every node, edge, and evidence record of the
+snapshot against the same fixed 16,000,000 work items, and the work that grows
+with the grouped edges against 1,000,000. On a page it is part of the fixed
+bytes, so a rollup larger than `--max-bytes` exits with
+`symbol rollup exceeds the output budget`. Without `--rollup` the output is
+byte-identical to earlier releases.
+
 For `cycles`, `--max-traversal` (default 50,000) bounds the dependency edges
 the cycle search visits. For `unresolved`, it bounds the unresolved sites that
 match `--kind`; `--max-items` only pages those matches. Both commands also

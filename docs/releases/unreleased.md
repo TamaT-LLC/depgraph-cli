@@ -74,6 +74,24 @@ depgraph-cli 自身（origin/main `70958ce`）の syntax-only と HIR の scan �
 - 変化は Rust を再 scan した snapshot にだけ現れる。scan cache の key は worker バイナリの内容を含むので、更新後の scan で古い結果は再利用されない。Store の移行は不要。hotspot の fingerprint を baseline に保存している場合は、再 scan 後に作り直す。
 - symbol（HIR の semantic 辺の先）への依存を file にまとめる表示は、この変更の対象外。
 
+## dependents / deps で symbol 単位の依存を file にまとめて見せる
+
+CLI の `depgraph dependents` / `depgraph deps` に `--rollup symbols` を、MCP の `graph_dependents_list` / `graph_dependencies_list` に任意入力 `rollup: "symbols"` を足す（[#623](https://github.com/TamaT-LLC/depgraph-cli/issues/623)）。あわせて、`dependents` と `impact` の結果が違う理由をドキュメントに書く（[#624](https://github.com/TamaT-LLC/depgraph-cli/issues/624)）。
+
+Rust HIR と Web の semantic 解析が出す辺（`calls`、`type_uses`、`imports` など）は symbol / type / module のノードに張られ、file のノードには張られない。そのため file を選んだ `dependents` / `deps` には symbol 単位の依存が出ない。crate をまたぐ import（syntax 解析では package に結び付く）と、#622 でもたどれない re-export 越しの import（曖昧な glob、`cfg` ごとに先が変わるものなど）も、file の辺には出ない。一方の `impact` は、すべての種類の辺を逆向きに推移的にたどる。HIR を通した depgraph-cli 自身の Store（#622 の後）では、`crates/depgraph-core/src/config.rs` の `dependents` は 12 ファイル、`impact` は 146 ファイルだった。
+
+- オプションを付けると、選んだ file が所有するノード（`source_path` がその file を指すか、その file が `declares` するノード）の semantic の辺を、相手の file ごとにまとめた `symbol_rollup` を返す。dependents では辺が書かれた file（辺の evidence の path）ごと、deps ではその file に書かれた辺を相手のノードを所有する file ごとにまとめる。
+- 合成の辺は作らない。file ごとに `edge_count`、kind ごとの件数、元の辺の ID（最大 16 件）、既存の file 辺があるかを示す `file_edge` を返す。辺の一覧、`total_items`、`traversed_edges` は変えない。
+- 上の Store で、`config.rs` の dependents は 17 ファイル（うち既定の一覧にないもの 5）、`crates/depgraph-protocol/src/stable_id.rs` の dependents は 62 ファイル（既定の一覧は 4 ファイル）、`crates/depgraph-core/src/lib.rs` の dependents は 77 ファイル（既定の一覧は 4 ファイル）、deps は 64 ファイルになる。
+- snapshot 全体の走査は #620 と同じ固定の上限（16,000,000）で、まとめる辺に比例する作業は 1,000,000 で数える。上の Store では走査が約 195 万、request の作業量は最大で `lib.rs` の deps の 23,827 だった。
+- semantic の辺が 1 本もない Store（Rust を syntax-only で解析した場合など）では、`status` が `no_semantic_edges` になる。理由は同じ出力の `analysis_degradations` で確かめる。
+
+互換性:
+
+- オプションなしの CLI の JSON とテキスト、MCP の応答はバイト単位で変わらない。
+- `depgraph-mcp-tools` の 3 つの依存一覧の応答 DTO に任意フィールド `symbol_rollup` が加わる。shared schema（`depgraph-mcp-tools-v1`）と tool catalog の digest が変わる。`contract_version` は変えない。
+- core の `DependenciesResult` に `symbol_rollup()`、`DependenciesRequest` に `with_rollup()` が加わる。
+
 ## Go の file node にリポジトリ相対パスを持たせる
 
 Go worker が出す file node（通常の Go ソース、アセンブリ、`//go:embed` の対象）に、リポジトリ相対パスの `path` property を記録する（[#591](https://github.com/TamaT-LLC/depgraph-cli/issues/591)）。

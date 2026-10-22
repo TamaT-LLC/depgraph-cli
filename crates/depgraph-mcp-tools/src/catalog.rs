@@ -13,11 +13,11 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     AgentCompletedSnapshot, AgentContextDetail, AgentContextOutput, AgentCycle, AgentCycleLevel,
-    AgentDaemonStatus, AgentDependenciesOutput, AgentDoctor, AgentEdgeDetail, AgentEdgesOutput,
-    AgentEvidence, AgentFanInItem, AgentGraphExportResponse, AgentHealthAudit,
-    AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots, AgentHealthSummary,
-    AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot, AgentNode,
-    AgentNodeSummary, AgentOperation, AgentPathOutput, AgentPolicyEvaluationResponse,
+    AgentDaemonStatus, AgentDependenciesOutput, AgentDependencyRollup, AgentDoctor,
+    AgentEdgeDetail, AgentEdgesOutput, AgentEvidence, AgentFanInItem, AgentGraphExportResponse,
+    AgentHealthAudit, AgentHealthFindingDetail, AgentHealthFindingsPage, AgentHealthHotspots,
+    AgentHealthSummary, AgentId, AgentImpactResponse, AgentLabel, AgentLocator, AgentNamedSnapshot,
+    AgentNode, AgentNodeSummary, AgentOperation, AgentPathOutput, AgentPolicyEvaluationResponse,
     AgentProfilePlan, AgentQueryRow, AgentRepositoryInitOutcome, AgentRepositoryList,
     AgentRuntimeValidationResponse, AgentSite, AgentSnapshotDiffResponse, AgentToken,
     AgentUnresolved, Cursor, ErrorEnvelope, IdempotencyKey, LogicalRepositoryId,
@@ -454,7 +454,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependencies_list",
-        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision.",
+        "Traverse outgoing dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision. Rust HIR and web semantic edges (calls, type_uses, imports) attach to symbols, types and modules, never to file nodes, so for a file selector this list holds only file-level edges, and imports from another crate, or through a re-export that syntax analysis cannot follow to the defining file, are missing from it; graph_impact_get counts the dependents of the nodes the file owns and can therefore be much larger. Pass rollup=symbols to also get symbol_rollup, those semantic edges grouped by the other file with the IDs of the edges behind each file.",
         [
             "selector",
             "snapshot",
@@ -466,6 +466,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "max_traversal",
             "edge_kinds",
             "structural_edges",
+            "rollup",
             "detail",
             "cursor",
             "limit"
@@ -477,7 +478,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ),
     tool_spec!(
         "graph_dependents_list",
-        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision.",
+        "Traverse incoming dependency edges from one selector. Use detail to shrink the response: paths returns only unique source/target paths and edge kinds, summary drops evidence and states shared edge fields once in common, full (default) returns every edge with its evidence in the previous shape, without import facts. Evidence of one edge, including its import specifier and binding, is available individually through agent_sites_list and agent_evidence_list with the edge's site_id. Structural edges (contains: a package contains a file, declares: a file declares a symbol, generated_from: a generated file comes from its source) describe graph organization rather than a dependency and are excluded by default, so the result counts only dependent or dependency edges; pass structural_edges=include to follow them as well. edge_kinds restricts the traversal to an allowlist of edge kinds. Both selections apply during traversal, so total_items and traversed_edges count only the selected edges. When a snapshot profile was analyzed in a less precise mode, every detail adds analysis_degradations: one entry per profile with its profile_id, language, analysis_mode (syntax-only: Rust ran without rust-analyzer HIR imports, types, and calls, so edges can be missing) and reasons (rust-hir-memory-budget, rust-hir-syntax-only-fallback). The field is omitted when every profile ran at full precision. Rust HIR and web semantic edges (calls, type_uses, imports) attach to symbols, types and modules, never to file nodes, so for a file selector this list holds only file-level edges, and imports from another crate, or through a re-export that syntax analysis cannot follow to the defining file, are missing from it; graph_impact_get counts the dependents of the nodes the file owns and can therefore be much larger. Pass rollup=symbols to also get symbol_rollup, those semantic edges grouped by the other file with the IDs of the edges behind each file.",
         [
             "selector",
             "snapshot",
@@ -489,6 +490,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
             "max_traversal",
             "edge_kinds",
             "structural_edges",
+            "rollup",
             "detail",
             "cursor",
             "limit"
@@ -1215,6 +1217,11 @@ fn field_schema(tool_name: &str, field: &str) -> Value {
             "enum": [StructuralEdgeSelection::Include.as_str(), StructuralEdgeSelection::Exclude.as_str()],
             "default": DEFAULT_STRUCTURAL_EDGE_SELECTION.as_str(),
             "description": "Whether to follow structural edges: contains (a package contains a file), declares (a file declares a symbol) and generated_from (a generated file comes from its source). They describe graph organization, not dependencies. Defaults to exclude, which counts only files that actually depend on (or are depended on by) the selector; use include to follow structural edges as well. When edge_kinds is given, the allowlist alone decides and omission does not exclude structural kinds. A cursor is bound to the selection."
+        }),
+        "rollup" => json!({
+            "type": "string",
+            "enum": [AgentDependencyRollup::Symbols.as_str()],
+            "description": "symbols also returns symbol_rollup: the semantic edges (calls, type_uses, imports, reexports and so on) of the symbols, types and modules the selector file owns (their source_path names the file, or the file declares them), grouped by the other file at the far end. Rust HIR and the web semantic workers attach these edges to symbols, never to file nodes, so the edge list of a file omits them; graph_impact_get reaches them through the owned nodes. For direction=incoming the other file is where the edge is written (its evidence path); for outgoing, the file that owns the target, counting only the edges written in the selector file. Each file lists edge_count, edge_count by kind, the first 16 edge IDs (read them with agent_edges_list) and file_edge, whether the edge list already has a direct edge with that file. No edge is created and the edge list, total_items and traversed_edges are unchanged. status is no_semantic_edges when the snapshot has no semantic edge (Rust analyzed in syntax-only mode, see analysis_degradations) and root_not_file when the selector is not a file. Omitted returns the response without symbol_rollup. Not combinable with transitive=true. A cursor is bound to the rollup."
         }),
         "detail" if tool_name == "agent_edges_list" => json!({
             "type": "string",

@@ -991,6 +991,21 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Errors | どちらの上限に当たっても`preprocessing_work_items`（`argument`なし、`narrow_query`）を返し、`maximum`で上限を区別する。従来は上限名のない`ResourceExhausted`だった。evidence数・reason数・phase coverage数などの構造上の上限は従来どおりdetailsなし |
 | Output | 返すnode・edge・path step・evidence・correlationの内容と順序は変わらない（Issue #617のフィクスチャでの依存一覧とpathのdigestを修正前のコードで記録して固定） |
 
+## Issue #623 symbol rollup of dependency lists
+
+Rust HIRとWebのsemantic解析が出す辺（`calls`、`type_uses`、`imports`、`reexports`など）はsymbol / type / moduleのノードに張られ、fileのノードには張られない。そのためfileを選んだ`graph_dependents_list` / `graph_dependencies_list`（CLI `dependents` / `deps`）には、symbol単位の依存が出ない。crateをまたぐimport（syntax解析ではpackageに結び付く）と、Issue #622でもたどれないre-export越しのimport（曖昧なglob、`cfg`ごとに先が変わるものなど）も同じ。`graph_impact_get`はすべての種類の辺（構造上の辺を含む）を逆向きに推移的にたどるので、同じfileでも結果が大きく違う（HIRを通したdepgraph-cli自身のStoreで`crates/depgraph-core/src/config.rs`の`dependents`は12ファイル、`impact`は146ファイル）。既定の出力は変えず、任意入力`rollup: "symbols"`（CLI `--rollup symbols`）を付けたときだけ、symbolの依存をfile単位にまとめた`symbol_rollup`を返す。
+
+| Area | Evidence |
+| --- | --- |
+| Input | `rollup`は`symbols`だけを受け付ける。省略時は従来と同じで、cursorの束縛も変えない。指定時は正規化した入力に`rollup`を加えてcursorを束縛する。`null`と`transitive=true`との組み合わせは`INVALID_ARGUMENT`（後者は`argument: "rollup"`、`invalid_value`）。CLIは`--transitive`と同時に指定できない |
+| Ownership | fileが所有するノードは、`source_path`がそのfileを指すノードと、そのfileが`declares`するノード。`mod name;`で宣言したRustのmoduleは宣言したfileが所有する |
+| Grouping | phaseが`semantic`で構造上の辺でない辺のうち、`edge_kinds`・`phases`・`profiles`などの選択に合う辺をまとめる。dependentsは所有ノードへ入る辺を、辺が書かれたfile（edge evidenceのpath。evidenceがなければsourceノードの所有file）ごとにまとめる。depsは選んだfileに書かれた出る辺を、targetの所有fileごとにまとめる。moduleのfileに書いた`use`は、moduleを宣言したfileではなくそのfileの`deps`に出る |
+| Output | `symbol_rollup`は`rollup`、`status`（`rolled_up` / `no_semantic_edges` / `root_not_file`）、`owned_nodes`、`attributed_edges`、`unattributed_edges`、`total_files`、path順の`files`（最大4,096）。各fileは`node_id`、`path`、`edge_count`、kind順の`edge_kinds`、ID順に最大16件の`edge_ids`、`file_edge`。合成の辺は作らず、`edges` / `paths`のpage、`total_items`、`traversed_edges`は変えない |
+| Relation to file edges | 和集合にせず別フィールドにする。既存のfile辺は実在のgraph edgeでevidenceやcursorと結び付いており、まとめた結果と混ぜるとどれが実在の辺か区別できなくなるため。重なりは`file_edge`で示す |
+| Syntax-only | snapshotにsemanticの辺が1本もなければ`status: "no_semantic_edges"`と空の`files`を返し、理由は同じ応答の`analysis_degradations`で示す。degradeしたprofileがあってもsemanticの辺が残っていれば`rolled_up`で、そのprofileの依存は含まれない |
+| Budget | 全node・全edge（2〜3回）・全evidenceの走査はIssue #620と同じ固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000）で、所有ノードの収集、まとめる辺の数え上げ、出力の組み立ては前処理上限（1,000,000）で数える。どちらに当たっても`preprocessing_work_items`。HIRを通したdepgraph-cli自身のStore（node 205,923、edge 289,242、evidence 796,192）で、走査はdependents 1,659,737、deps 1,948,979。requestの作業量は`lib.rs`のdepsが最大で23,827、`stable_id.rs`のdependentsは1,621 |
+| Compatibility | `rollup`なしのCLIのJSONとテキスト、MCPの応答はバイト単位で同じ（小さいfixtureでdigestを修正前のコードで記録して固定し、上のStoreでも修正前のbinaryと比べた）。shared schemaとcatalogのdigestは、任意入力と任意の出力フィールドが加わるため変わる。`contract_version`は変えない |
+
 ## Issue #568 standard schema formats
 
 schemarsはRustの整数型から`format: "uint32"`などJSON Schema 2020-12にない値を出す。Ajvを使うMCP client（Claude Codeなど）は、tool一覧の取得時にこれを`unknown format "…" ignored`として1件ずつ警告していた（39 toolで1,134件）。

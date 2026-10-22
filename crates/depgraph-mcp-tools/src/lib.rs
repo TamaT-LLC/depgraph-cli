@@ -16,6 +16,7 @@ mod repository;
 mod response;
 mod scalar;
 mod schema;
+mod symbol_rollup;
 
 pub use catalog::{
     ALL_CLI_ACTIONS, CapabilityProfile, CliAction, OperationBehavior, ToolAuthorization,
@@ -61,6 +62,11 @@ pub use dto::{
     MAX_AGENT_PATH_STEPS, MAX_AGENT_PHASES, MAX_AGENT_QUERY_TEXT_BYTES, MAX_AGENT_QUERY_VALUES,
     MAX_AGENT_SNAPSHOT_METADATA_ITEMS, MAX_AGENT_TARGET_ITEMS, project_bounded_query_rows,
     project_bounded_query_rows_cancellable,
+};
+pub use symbol_rollup::{
+    AgentDependencyRollup, AgentSymbolRollup, AgentSymbolRollupEdgeKind, AgentSymbolRollupFile,
+    AgentSymbolRollupStatus, MAX_AGENT_SYMBOL_ROLLUP_EDGE_IDS, MAX_AGENT_SYMBOL_ROLLUP_EDGE_KINDS,
+    MAX_AGENT_SYMBOL_ROLLUP_FILES,
 };
 // The get_context output granularity (Issue #566).
 pub use dto::{
