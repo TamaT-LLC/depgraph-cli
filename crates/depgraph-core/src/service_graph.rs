@@ -33,6 +33,7 @@ use crate::{
         MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS, MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
         MAX_UNRESOLVED_CORRELATION_REASONS, MAX_UNRESOLVED_PHASES,
     },
+    symbol_rollup::{DependencyRollup, SymbolRollup, SymbolRollupWork, symbol_rollup_cancellable},
 };
 
 const MAX_GRAPH_SELECTOR_BYTES: usize = 4_096;
@@ -316,6 +317,7 @@ pub struct DependenciesRequest {
     filter: GraphQueryFilter,
     max_traversal: usize,
     edge_kind_filter: EdgeKindFilter,
+    rollup: Option<DependencyRollup>,
 }
 
 impl DependenciesRequest {
@@ -337,7 +339,25 @@ impl DependenciesRequest {
             filter,
             max_traversal,
             edge_kind_filter: EdgeKindFilter::default(),
+            rollup: None,
         })
+    }
+
+    /// Also roll up the dependencies of the nodes below the selector
+    /// (Issue #623). `None` keeps the dependency list unchanged. A rollup
+    /// groups the direct edges of the selector file, so it rejects a
+    /// transitive traversal.
+    pub fn with_rollup(mut self, rollup: Option<DependencyRollup>) -> DepgraphServiceResult<Self> {
+        if rollup.is_some() && self.transitive {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        self.rollup = rollup;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn rollup(&self) -> Option<DependencyRollup> {
+        self.rollup
     }
 
     /// Choose which edge kinds the traversal follows (Issue #541).
@@ -400,6 +420,7 @@ pub struct DependenciesResult {
     traversed_edges: u64,
     diagnostics: Vec<QueryPageDiagnostic>,
     analysis_degradations: Vec<AnalysisDegradation>,
+    symbol_rollup: Option<SymbolRollup>,
 }
 
 impl DependenciesResult {
@@ -442,6 +463,13 @@ impl DependenciesResult {
     #[must_use]
     pub fn analysis_degradations(&self) -> &[AnalysisDegradation] {
         &self.analysis_degradations
+    }
+
+    /// File-level rollup of the selector's symbol dependencies, present only
+    /// when the request asked for it (Issue #623).
+    #[must_use]
+    pub const fn symbol_rollup(&self) -> Option<&SymbolRollup> {
+        self.symbol_rollup.as_ref()
     }
 }
 
@@ -638,6 +666,32 @@ impl DepgraphService {
         ensure_dependency_traversal_complete(&execution, request.max_traversal())?;
         let items =
             traversal_page_items(&execution.result).map_err(|_| DepgraphServiceError::Integrity)?;
+        let symbol_rollup = request
+            .rollup()
+            .map(|_| {
+                let file_neighbors = execution
+                    .result
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let mut work = SymbolRollupWork::new(
+                    MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+                    MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
+                );
+                symbol_rollup_cancellable(
+                    &snapshot,
+                    &execution.result.root,
+                    request.direction().is_incoming(),
+                    request.filter(),
+                    request.edge_kind_filter(),
+                    &file_neighbors,
+                    &mut work,
+                    &mut || cancellation.is_cancelled(),
+                )
+            })
+            .transpose()
+            .map_err(|source| graph_query_service_error(source, cancellation))?;
         Ok(DependenciesResult {
             snapshot_id,
             scan_id,
@@ -647,6 +701,7 @@ impl DepgraphService {
             traversed_edges: execution.traversed_edges,
             diagnostics: execution.diagnostics,
             analysis_degradations: snapshot_analysis_degradations(&snapshot),
+            symbol_rollup,
         })
     }
 

@@ -577,6 +577,7 @@ fn graph_dependency_and_path_tools_advertise_their_exact_closed_contracts() {
                 "phases",
                 "profiles",
                 "repository_id",
+                "rollup",
                 "selector",
                 "sessions",
                 "snapshot",

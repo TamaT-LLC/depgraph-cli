@@ -1363,12 +1363,18 @@ pub fn project_dependencies_output_cancellable(
     }
     let root = AgentNode::try_from(source).map_err(impact_contract_error)?;
     let degradations = AgentAnalysisDegradation::project_core(source.analysis_degradations());
-    project_dependency_items_with_degradations_cancellable(
+    let symbol_rollup = source
+        .symbol_rollup()
+        .map(crate::AgentSymbolRollup::project_core)
+        .transpose()
+        .map_err(impact_contract_error)?;
+    project_dependency_items_with_metadata_cancellable(
         root,
         source.items(),
         source.traversed_edges(),
         projection,
         &degradations,
+        symbol_rollup.as_ref(),
         pagination,
         request,
         cancellation,
@@ -1416,6 +1422,35 @@ pub fn project_dependency_items_with_degradations_cancellable(
     request: &PageRequest,
     cancellation: &CancellationToken,
 ) -> Result<AgentDependenciesOutput, AgentError> {
+    project_dependency_items_with_metadata_cancellable(
+        root,
+        items,
+        traversed_edges,
+        projection,
+        degradations,
+        None,
+        pagination,
+        request,
+        cancellation,
+    )
+}
+
+/// [`project_dependency_items_with_degradations_cancellable`] that also
+/// attaches the file-level symbol rollup when the request asked for one
+/// (Issue #623). Like the degradations it is part of the fixed response bytes
+/// of every page.
+#[allow(clippy::too_many_arguments)]
+fn project_dependency_items_with_metadata_cancellable(
+    root: AgentNode,
+    items: &[depgraph_core::query::TraversalPageItem],
+    traversed_edges: u64,
+    projection: DependencyProjectionRequest,
+    degradations: &[AgentAnalysisDegradation],
+    symbol_rollup: Option<&crate::AgentSymbolRollup>,
+    pagination: &PaginationContext,
+    request: &PageRequest,
+    cancellation: &CancellationToken,
+) -> Result<AgentDependenciesOutput, AgentError> {
     let mut is_cancelled = || cancellation.is_cancelled();
     if is_cancelled() {
         return Err(cancelled_error());
@@ -1440,7 +1475,11 @@ pub fn project_dependency_items_with_degradations_cancellable(
                         traversed_edges,
                         page,
                     )
-                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
+                    .map(|response| {
+                        response
+                            .with_analysis_degradations(degradations.to_vec())
+                            .with_symbol_rollup(symbol_rollup.cloned())
+                    })
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Full)
@@ -1466,7 +1505,11 @@ pub fn project_dependency_items_with_degradations_cancellable(
                         common.clone(),
                         page,
                     )
-                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
+                    .map(|response| {
+                        response
+                            .with_analysis_degradations(degradations.to_vec())
+                            .with_symbol_rollup(symbol_rollup.cloned())
+                    })
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Summary)
@@ -1483,7 +1526,11 @@ pub fn project_dependency_items_with_degradations_cancellable(
                         traversed_edges,
                         page,
                     )
-                    .map(|response| response.with_analysis_degradations(degradations.to_vec()))
+                    .map(|response| {
+                        response
+                            .with_analysis_degradations(degradations.to_vec())
+                            .with_symbol_rollup(symbol_rollup.cloned())
+                    })
                     .map_err(impact_contract_error)
                 })
                 .map(AgentDependenciesOutput::Paths)

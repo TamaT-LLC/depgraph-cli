@@ -21,6 +21,7 @@ use depgraph_core::service::{
     SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
     SnapshotNameCreateSelector, SnapshotReadRequest, StructuralEdgeSelection, UnresolvedRequest,
 };
+use depgraph_core::symbol_rollup::{DependencyRollup, SymbolRollup};
 use depgraph_core::{
     BoundedQueryExecutionError, BoundedQueryPlan, BoundedQueryResult, BuildOutcomeKind,
     CancellationToken, ChangedSetImpactRequest, ChangedSetImpactResult, CycleLevel,
@@ -260,6 +261,17 @@ enum Commands {
         /// the listed kinds alone decide. Use include to follow them as well.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
+        /// Also report symbols: the semantic edges (calls, type_uses, imports
+        /// and so on) of the symbols, types and modules the selector file
+        /// owns, grouped by the other file, as symbol_rollup. The edge list
+        /// itself is unchanged. Not combinable with --transitive.
+        #[arg(
+            long,
+            value_name = "MODE",
+            value_parser = parse_rollup,
+            conflicts_with = "transitive"
+        )]
+        rollup: Option<DependencyRollup>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -291,6 +303,17 @@ enum Commands {
         /// the listed kinds alone decide. Use include to follow them as well.
         #[arg(long, value_name = "MODE", value_parser = parse_structural_edges)]
         structural_edges: Option<StructuralEdgeSelection>,
+        /// Also report symbols: the semantic edges (calls, type_uses, imports
+        /// and so on) of the symbols, types and modules the selector file
+        /// owns, grouped by the other file, as symbol_rollup. The edge list
+        /// itself is unchanged. Not combinable with --transitive.
+        #[arg(
+            long,
+            value_name = "MODE",
+            value_parser = parse_rollup,
+            conflicts_with = "transitive"
+        )]
+        rollup: Option<DependencyRollup>,
         #[arg(long, value_name = "PHASE")]
         phase: Vec<String>,
         #[arg(long, value_name = "PROFILE_ID")]
@@ -1626,6 +1649,7 @@ async fn run(cli: Cli) -> Result<u8> {
             max_traversal,
             edge_kind,
             structural_edges,
+            rollup,
             phase,
             profile,
             session,
@@ -1647,7 +1671,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
             )?
-            .with_edge_kind_filter(edge_kind, structural_edges)?;
+            .with_edge_kind_filter(edge_kind, structural_edges)?
+            .with_rollup(rollup)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -1657,6 +1682,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.traversal(),
                     json,
                     result.analysis_degradations(),
+                    result.symbol_rollup(),
                 )?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
@@ -1672,12 +1698,16 @@ async fn run(cli: Cli) -> Result<u8> {
                         .max_bytes
                         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
                     result.analysis_degradations(),
+                    result.symbol_rollup(),
                 )?;
                 if !json {
                     for item in &page.items {
                         print_path_steps(std::slice::from_ref(&item.step));
                     }
                 }
+            }
+            if !json && let Some(rollup) = result.symbol_rollup() {
+                print_symbol_rollup(rollup);
             }
             Ok(0)
         }
@@ -1687,6 +1717,7 @@ async fn run(cli: Cli) -> Result<u8> {
             max_traversal,
             edge_kind,
             structural_edges,
+            rollup,
             phase,
             profile,
             session,
@@ -1708,7 +1739,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL)
                 },
             )?
-            .with_edge_kind_filter(edge_kind, structural_edges)?;
+            .with_edge_kind_filter(edge_kind, structural_edges)?
+            .with_rollup(rollup)?;
             let result =
                 service.dependencies(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
@@ -1718,6 +1750,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.traversal(),
                     json,
                     result.analysis_degradations(),
+                    result.symbol_rollup(),
                 )?;
                 if !json {
                     print_path_steps(&result.traversal().steps);
@@ -1738,12 +1771,16 @@ async fn run(cli: Cli) -> Result<u8> {
                         .max_bytes
                         .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES),
                     result.analysis_degradations(),
+                    result.symbol_rollup(),
                 )?;
                 if !json {
                     for item in &page.items {
                         print_path_steps(std::slice::from_ref(&item.step));
                     }
                 }
+            }
+            if !json && let Some(rollup) = result.symbol_rollup() {
+                print_symbol_rollup(rollup);
             }
             Ok(0)
         }
@@ -3389,6 +3426,10 @@ fn parse_structural_edges(value: &str) -> std::result::Result<StructuralEdgeSele
         .ok_or_else(|| format!("expected include or exclude, got {value:?}"))
 }
 
+fn parse_rollup(value: &str) -> std::result::Result<DependencyRollup, String> {
+    DependencyRollup::parse(value).ok_or_else(|| format!("expected symbols, got {value:?}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn interactive_dependencies_page(
     execution: &depgraph_core::service::DependenciesResult,
@@ -3423,6 +3464,11 @@ fn interactive_dependencies_page(
                 serde_json::json!(edge_kind_filter.structural_edges().as_str());
         }
     }
+    // The rollup takes part of the page budget, so it binds the cursor; without
+    // it the cursor keeps its legacy binding (Issue #623).
+    if let Some(rollup) = request.rollup() {
+        context["rollup"] = serde_json::json!(rollup.as_str());
+    }
     paginate_interactive_query(
         execution.items(),
         traversal_summary(execution.traversal()),
@@ -3436,6 +3482,7 @@ fn interactive_dependencies_page(
             max_bytes: dependency_page_budget(
                 snapshot,
                 execution.analysis_degradations(),
+                execution.symbol_rollup(),
                 max_bytes,
             )?,
             traversal_complete: execution.complete(),
@@ -3470,9 +3517,18 @@ fn partial_page_budget(snapshot: &SnapshotReadRequest, max_bytes: usize) -> Resu
 fn dependency_page_budget(
     snapshot: &SnapshotReadRequest,
     degradations: &[AnalysisDegradation],
+    rollup: Option<&SymbolRollup>,
     max_bytes: usize,
 ) -> Result<usize> {
-    let budget = partial_page_budget(snapshot, max_bytes)?;
+    let mut budget = partial_page_budget(snapshot, max_bytes)?;
+    // The symbol rollup is added after page selection as well (Issue #623).
+    if let Some(rollup) = rollup {
+        let reserved =
+            canonical_json(&serde_json::to_value(rollup)?).len() + "symbol_rollup".len() + 32;
+        budget = budget
+            .checked_sub(reserved)
+            .context("symbol rollup exceeds the output budget")?;
+    }
     if degradations.is_empty() {
         return Ok(budget);
     }
@@ -3492,7 +3548,7 @@ fn print_graph_page<T: Serialize>(
     snapshot: &SnapshotReadRequest,
     max_bytes: usize,
 ) -> Result<()> {
-    print_dependency_page(page, json_output, snapshot, max_bytes, &[])
+    print_dependency_page(page, json_output, snapshot, max_bytes, &[], None)
 }
 
 /// Prints a line per profile analyzed in a less precise mode (Issue #579).
@@ -3521,9 +3577,10 @@ fn print_dependency_page<T: Serialize>(
     snapshot: &SnapshotReadRequest,
     max_bytes: usize,
     degradations: &[AnalysisDegradation],
+    rollup: Option<&SymbolRollup>,
 ) -> Result<()> {
     let partial = partial_query_metadata(snapshot);
-    if partial.is_none() && degradations.is_empty() {
+    if partial.is_none() && degradations.is_empty() && rollup.is_none() {
         return print_interactive_page(page, json_output);
     }
     if !json_output {
@@ -3543,10 +3600,16 @@ fn print_dependency_page<T: Serialize>(
     if !degradations.is_empty() {
         value["analysis_degradations"] = serde_json::to_value(degradations)?;
     }
+    if let Some(rollup) = rollup {
+        value["symbol_rollup"] = serde_json::to_value(rollup)?;
+    }
     // Include the metadata and the length field itself in the byte contract.
     loop {
         let encoded = canonical_json(&value);
         if encoded.len() > max_bytes {
+            if rollup.is_some() {
+                anyhow::bail!("symbol rollup exceeds the output budget");
+            }
             if degradations.is_empty() {
                 anyhow::bail!("partial analysis metadata exceeds the output budget");
             }
@@ -3568,8 +3631,9 @@ fn print_dependency_structured<T: Serialize>(
     data: &T,
     json_output: bool,
     degradations: &[AnalysisDegradation],
+    rollup: Option<&SymbolRollup>,
 ) -> Result<()> {
-    if degradations.is_empty() {
+    if degradations.is_empty() && rollup.is_none() {
         return print_graph_structured(command, snapshot, data, json_output);
     }
     if !json_output {
@@ -3581,8 +3645,13 @@ fn print_dependency_structured<T: Serialize>(
         "command": command,
         "scan_id": snapshot.scan_id(),
         "data": data,
-        "analysis_degradations": degradations,
     });
+    if !degradations.is_empty() {
+        value["analysis_degradations"] = serde_json::to_value(degradations)?;
+    }
+    if let Some(rollup) = rollup {
+        value["symbol_rollup"] = serde_json::to_value(rollup)?;
+    }
     if let Some(partial) = partial_query_metadata(snapshot) {
         value["partial"] = partial;
     }
@@ -3883,6 +3952,39 @@ fn coverage_summary(coverage: &CoverageRecord) -> String {
         display_list(&coverage.reasons),
         coverage.project_code_executed,
     )
+}
+
+/// Prints the file-level rollup of the selector's symbol dependencies
+/// (Issue #623): one line per other file with its edge count by kind.
+fn print_symbol_rollup(rollup: &SymbolRollup) {
+    println!(
+        "symbol rollup: status={}; files={}/{}; attributed_edges={}; unattributed_edges={}; owned_nodes={}",
+        rollup.status.as_str(),
+        rollup.files.len(),
+        rollup.total_files,
+        rollup.attributed_edges,
+        rollup.unattributed_edges,
+        rollup.owned_nodes,
+    );
+    for file in &rollup.files {
+        let kinds = file
+            .edge_kinds
+            .iter()
+            .map(|kind| format!("{}={}", kind.kind, kind.edge_count))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {} edges={} [{}]{}",
+            file.path,
+            file.edge_count,
+            kinds,
+            if file.file_edge {
+                ""
+            } else {
+                " (no file edge)"
+            }
+        );
+    }
 }
 
 fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {

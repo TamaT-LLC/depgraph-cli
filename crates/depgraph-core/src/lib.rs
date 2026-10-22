@@ -66,6 +66,7 @@ mod service_limits;
 mod service_repository;
 mod service_snapshot;
 mod service_store_write;
+pub mod symbol_rollup;
 pub mod worker;
 mod worker_memory;
 mod worker_progress;

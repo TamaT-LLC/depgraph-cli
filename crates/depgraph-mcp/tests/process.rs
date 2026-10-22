@@ -12114,3 +12114,326 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
         assert!(stderr.contains(&message), "{arguments:?}: {stderr}");
     }
 }
+
+/// `src/user.rs` imports `src/model.rs` at file level and calls into it
+/// through symbols; `src/other.rs` reaches the model only through the `use`
+/// item of the module `other`, which `src/lib.rs` declares (Issue #623).
+fn seed_issue_623_store(path: &Path, root: &Path) {
+    let mut store = Store::open(path).unwrap();
+    store
+        .start_scan_with_revision("issue-623", root, false, Some("revision-623"))
+        .unwrap();
+    let coverage = json!({
+        "profiles": 1, "files_discovered": 0, "files_analyzed": 0, "files_skipped": 0,
+        "dependency_sites": 1, "resolved": 1, "candidates": 0, "external": 0,
+        "unresolved": 0, "unsupported_syntax": 0, "project_code_executed": false,
+        "completeness": [], "reasons": []
+    });
+    let mut seq = 0_u64;
+    let mut next = |event: &str| {
+        seq += 1;
+        json!({
+            "event": event, "protocol_version": "1.0", "scan_id": "issue-623",
+            "adapter": "rust", "adapter_version": "0.7.0", "seq": seq
+        })
+    };
+    let mut started = next("scan_started");
+    started["root"] = json!(root);
+    started["project_code_executed"] = json!(false);
+    started["safe_mode"] = json!(true);
+    store.ingest_event(&started).unwrap();
+    let mut profile = next("profile_declared");
+    profile["profile"] = json!({
+        "id": "profile:rust", "language": "rust", "features": [], "environment": {},
+        "properties": {"rust_hir_mode": "full"}
+    });
+    store.ingest_event(&profile).unwrap();
+    for (id, path) in [
+        ("file:lib", "src/lib.rs"),
+        ("file:model", "src/model.rs"),
+        ("file:other", "src/other.rs"),
+        ("file:user", "src/user.rs"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": "file", "locator": format!("file:{path}"),
+            "display_name": path, "properties": {"language": "rust", "path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    for (id, kind, path) in [
+        ("module:other", "module", "src/lib.rs"),
+        ("type:thing", "type", "src/model.rs"),
+        ("symbol:make", "symbol", "src/model.rs"),
+        ("symbol:run", "symbol", "src/user.rs"),
+    ] {
+        let mut node = next("node_upsert");
+        node["node"] = json!({
+            "id": id, "kind": kind, "locator": format!("rust-{kind}:{id}"),
+            "display_name": id, "properties": {"language": "rust", "source_path": path}
+        });
+        store.ingest_event(&node).unwrap();
+    }
+    let evidence = |path: &str, line: u64| {
+        json!([{
+            "kind": "semantic", "extractor": "rust-analyzer-hir", "extractor_version": "0.7.0",
+            "path": path, "start_line": line, "start_column": 1,
+            "end_line": line, "end_column": 12, "properties": {}
+        }])
+    };
+    let mut site = next("dependency_site");
+    site["site"] = json!({
+        "id": "site:use", "source": "file:user", "kind": "rust_use",
+        "specifier": "crate::model::Thing", "resolution_status": "resolved",
+        "target_ids": ["file:model"], "profile_id": "profile:rust",
+        "condition": {"op": "true"}, "precision": "exact", "evidence": evidence("src/user.rs", 1)
+    });
+    store.ingest_event(&site).unwrap();
+    for (id, site_id, source, target, kind, phase, path, line) in [
+        (
+            "edge:use",
+            Some("site:use"),
+            "file:user",
+            "file:model",
+            "imports",
+            "source",
+            "src/user.rs",
+            1,
+        ),
+        (
+            "edge:mod",
+            None,
+            "file:lib",
+            "module:other",
+            "declares",
+            "source",
+            "src/lib.rs",
+            1,
+        ),
+        (
+            "edge:call",
+            None,
+            "symbol:run",
+            "symbol:make",
+            "calls",
+            "semantic",
+            "src/user.rs",
+            3,
+        ),
+        (
+            "edge:type",
+            None,
+            "symbol:run",
+            "type:thing",
+            "type_uses",
+            "semantic",
+            "src/user.rs",
+            4,
+        ),
+        (
+            "edge:import",
+            None,
+            "module:other",
+            "type:thing",
+            "imports",
+            "semantic",
+            "src/other.rs",
+            1,
+        ),
+    ] {
+        let mut edge = next("edge_upsert");
+        edge["edge"] = json!({
+            "id": id, "site_id": site_id, "source": source, "target": target, "kind": kind,
+            "phase": phase, "environment": "host", "profile_id": "profile:rust",
+            "condition": {"op": "true"}, "resolution_status": "resolved",
+            "precision": "exact", "generated": false, "evidence": evidence(path, line)
+        });
+        store.ingest_event(&edge).unwrap();
+    }
+    let mut profile_completed = next("profile_completed");
+    profile_completed["profile_id"] = json!("profile:rust");
+    profile_completed["coverage"] = coverage.clone();
+    store.ingest_event(&profile_completed).unwrap();
+    let mut completed = next("scan_completed");
+    completed["coverage"] = coverage;
+    store.ingest_event(&completed).unwrap();
+    store
+        .finish_scan("issue-623", "completed", None, true)
+        .unwrap();
+}
+
+/// The response text of a call, with the per-checkout repository ID replaced
+/// so its digest does not depend on the temporary root.
+fn issue_623_response_text(result: &Value) -> String {
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let repository_id = result["structuredContent"]["repository_id"]
+        .as_str()
+        .unwrap();
+    text.replace(repository_id, "<repository>")
+}
+
+/// Without `rollup` the dependency tools answer with the bytes of the release
+/// before Issue #623. The digests were recorded with the server built from
+/// origin/main `70958ce` on this snapshot.
+#[test]
+fn issue_623_dependency_tools_without_a_rollup_keep_their_bytes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store_path = temporary.path().join("store.sqlite");
+    seed_issue_623_store(&store_path, &root);
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let mut id = 1;
+    let mut digests = Vec::new();
+    for (tool, selector) in [
+        ("graph_dependents_list", "id:file:model"),
+        ("graph_dependencies_list", "id:file:user"),
+    ] {
+        for detail in [None, Some("summary"), Some("paths")] {
+            id += 1;
+            let mut arguments = json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "selector": selector
+            });
+            if let Some(detail) = detail {
+                arguments["detail"] = json!(detail);
+            }
+            let result = interactive_tool_call(&mut mcp, id, tool, arguments);
+            assert_eq!(result["isError"], false, "{tool} {detail:?}: {result}");
+            digests.push(format!(
+                "{tool} {} {:x}",
+                detail.unwrap_or("full"),
+                Sha256::digest(issue_623_response_text(&result).as_bytes())
+            ));
+        }
+    }
+    mcp.finish();
+    assert_eq!(digests, ISSUE_623_DEFAULT_RESPONSE_DIGESTS, "{digests:#?}");
+}
+
+const ISSUE_623_DEFAULT_RESPONSE_DIGESTS: [&str; 6] = [
+    "graph_dependents_list full 58c8cfc66f8f5362a9d655b709ef3baa9965da8a2f8ab90c09b2c8ad4d92532a",
+    "graph_dependents_list summary e448e6abea0fda73f9bdad2e505ec98b81d5305ff393feee0a95ca7ca0343c3c",
+    "graph_dependents_list paths b005379d350f1a34f98760838af3814ab555550a94d27dc1650360c17557ccff",
+    "graph_dependencies_list full b9979654ab7ed5ebd9089959c82f91a5625e7a09f8ad13384fefc170f5656d6f",
+    "graph_dependencies_list summary d5276047eebc647f48c6e39790256c1f7cbff9510e919f10cfe26496459b275c",
+    "graph_dependencies_list paths b6a1d871104d6d6df2949af2d9c9ab508be9afdc234377fc9bf6161c43ab2d7a",
+];
+
+#[test]
+fn issue_623_rollup_symbols_adds_symbol_rollup_to_every_detail() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store_path = temporary.path().join("store.sqlite");
+    seed_issue_623_store(&store_path, &root);
+    let shared_schema: Value = serde_json::from_slice(include_bytes!(
+        "../../../schemas/depgraph-mcp-tools-v1.schema.json"
+    ))
+    .unwrap();
+    let shared = jsonschema::draft202012::new(&shared_schema).unwrap();
+    let mut mcp = InteractiveMcp::start(&root, &store_path);
+    initialize_interactive_mcp(&mut mcp, 1);
+    let listed = mcp.request(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}
+    }));
+    let tools = listed["result"]["tools"].as_array().unwrap().clone();
+    let expected_dependents = json!({
+        "rollup": "symbols",
+        "status": "rolled_up",
+        "owned_nodes": 2,
+        "attributed_edges": 3,
+        "unattributed_edges": 0,
+        "total_files": 2,
+        "files": [
+            {
+                "node_id": "file:other", "path": "src/other.rs", "edge_count": 1,
+                "edge_kinds": [{"kind": "imports", "edge_count": 1}],
+                "edge_ids": ["edge:import"], "file_edge": false
+            },
+            {
+                "node_id": "file:user", "path": "src/user.rs", "edge_count": 2,
+                "edge_kinds": [
+                    {"kind": "calls", "edge_count": 1},
+                    {"kind": "type_uses", "edge_count": 1}
+                ],
+                "edge_ids": ["edge:call", "edge:type"], "file_edge": true
+            }
+        ]
+    });
+    let mut id = 2;
+    for (tool, selector) in [
+        ("graph_dependents_list", "id:file:model"),
+        ("graph_dependencies_list", "id:file:other"),
+    ] {
+        let advertised = tools.iter().find(|entry| entry["name"] == tool).unwrap();
+        assert_eq!(
+            advertised["inputSchema"]["properties"]["rollup"]["enum"],
+            json!(["symbols"])
+        );
+        let output = jsonschema::draft202012::new(&advertised["outputSchema"]).unwrap();
+        for detail in ["full", "summary", "paths"] {
+            let mut call = |rollup: bool| {
+                id += 1;
+                let mut arguments = json!({
+                    "contract_version": "depgraph-mcp-tools-v1",
+                    "selector": selector,
+                    "detail": detail
+                });
+                if rollup {
+                    arguments["rollup"] = json!("symbols");
+                }
+                let result = interactive_tool_call(&mut mcp, id, tool, arguments);
+                assert_eq!(result["isError"], false, "{tool} {detail}: {result}");
+                output.validate(&result["structuredContent"]).unwrap();
+                shared.validate(&result["structuredContent"]).unwrap();
+                assert_tool_text_matches_structured(&result);
+                result["structuredContent"]["result"].clone()
+            };
+            let with = call(true);
+            let without = call(false);
+            let mut stripped = with.clone();
+            let rollup = stripped
+                .as_object_mut()
+                .unwrap()
+                .remove("symbol_rollup")
+                .unwrap();
+            // The edge list is unchanged; the rollup is the only addition.
+            assert_eq!(stripped, without, "{tool} {detail}");
+            if tool == "graph_dependents_list" {
+                assert_eq!(rollup, expected_dependents, "{detail}");
+            } else {
+                assert_eq!(rollup["files"][0]["path"], "src/model.rs", "{rollup}");
+                assert_eq!(rollup["files"][0]["file_edge"], false, "{rollup}");
+            }
+        }
+    }
+
+    // A rollup groups direct edges; null is not read as omitted.
+    for (rollup, transitive) in [(json!("symbols"), true), (Value::Null, false)] {
+        id += 1;
+        let result = interactive_tool_call(
+            &mut mcp,
+            id,
+            "graph_dependents_list",
+            json!({
+                "contract_version": "depgraph-mcp-tools-v1",
+                "selector": "id:file:model",
+                "transitive": transitive,
+                "rollup": rollup
+            }),
+        );
+        assert_eq!(result["isError"], true, "{result}");
+        shared.validate(&result["structuredContent"]).unwrap();
+        let error = &result["structuredContent"]["error"];
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+        if transitive {
+            assert_eq!(
+                error["details"],
+                json!({"kind": "argument", "argument": "rollup", "reason": "invalid_value"})
+            );
+        }
+    }
+    mcp.finish();
+}

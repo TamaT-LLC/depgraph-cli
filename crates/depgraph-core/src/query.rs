@@ -121,6 +121,18 @@ struct QueryPostprocessingWorkExhausted {
 #[error("graph path-step postprocessing was cancelled")]
 struct QueryPostprocessingCancelled;
 
+/// Work budget error of a graph postprocessing step outside path-step
+/// materialization, such as the symbol rollup (Issue #623). It reports the
+/// same `preprocessing_work_items` limit.
+pub(crate) fn postprocessing_work_exhausted(maximum: usize) -> anyhow::Error {
+    QueryPostprocessingWorkExhausted { maximum }.into()
+}
+
+/// Cancellation error of a graph postprocessing step.
+pub(crate) fn postprocessing_cancelled() -> anyhow::Error {
+    QueryPostprocessingCancelled.into()
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("graph path-step postprocessing found inconsistent correlation data")]
 struct QueryPostprocessingIntegrity;

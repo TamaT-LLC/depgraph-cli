@@ -967,8 +967,9 @@ fn every_generated_object_schema_has_additional_properties_false() {
     // AgentCurrentSnapshotSummary branches and the AgentContextOutput success
     // envelope), the agent_edges_list imports response with AgentImportGroup and
     // its page, and the graph_fan_in_list AgentFanInItem, its page and success
-    // envelope.
-    assert_eq!(objects, 222, "review newly added object schemas explicitly");
+    // envelope. Issue #623 adds AgentSymbolRollup, AgentSymbolRollupFile and
+    // AgentSymbolRollupEdgeKind.
+    assert_eq!(objects, 225, "review newly added object schemas explicitly");
 }
 
 #[test]
