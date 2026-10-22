@@ -6,7 +6,7 @@ below. Copy one privileged profile only when its effects are required; do not
 register several profiles for the same repository as an accidental privilege
 fallback.
 
-The examples target the `v0.7.1` release candidate, which retains the v0.6.0
+The examples target the `v0.7.2` release candidate, which retains the v0.6.0
 Store schema `19` and code-health contract/API. Until its official Release
 and matching post-publish evidence exist, `v0.6.3` is the published stable.
 The published `v0.5.4` package is an immutable historical schema-17 baseline.
@@ -144,15 +144,15 @@ gh api "repos/TamaT-LLC/depgraph-cli/releases/tags/RELEASE_TAG" \
 ```
 
 ```sh
-/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph agent-config \
+/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph agent-config \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
-  --release-archive /absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE.tar.gz \
-  --release-checksum /absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE.tar.gz.sha256 \
+  --release-archive /absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE.tar.gz \
+  --release-checksum /absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE.tar.gz.sha256 \
   --release-evidence /absolute/path/to/release-post-publish-evidence-RELEASE_TAG.json \
   --trusted-release-evidence-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  --release-manifest /absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/release-manifest.json \
-  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.7.1-TARGET_TRIPLE.requirement.json \
+  --release-manifest /absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/release-manifest.json \
+  --compiler-pack-requirement /absolute/path/to/depgraph-compiler-pack-0.7.2-TARGET_TRIPLE.requirement.json \
   --host codex
 ```
 
@@ -173,7 +173,7 @@ read-only capability. Start every Agent host with this profile.
 
 <!-- depgraph-mcp-package-smoke:command -->
 ```sh
-/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp \
+/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp \
   --root /absolute/path/to/repository \
   --store /absolute/path/to/state/depgraph.sqlite \
   --capability read \
@@ -189,7 +189,7 @@ form to copy unless an operator has approved a narrower privileged use case.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -304,7 +304,7 @@ instead.
 <!-- depgraph-agent-config:codex -->
 ```toml
 [mcp_servers.depgraph]
-command = "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp"
+command = "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp"
 args = ["--root", "/absolute/path/to/repository", "--store", "/absolute/path/to/state/depgraph.sqlite", "--capability", "read", "--compiler-pack-requirement", "/absolute/path/to/compiler-pack-requirement.json", "--log-level", "warn"]
 enabled = true
 required = true
@@ -321,7 +321,7 @@ the following entry into the user or workspace `mcp.json` `servers` object.
   "servers": {
     "depgraph": {
       "type": "stdio",
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root",
         "/absolute/path/to/repository",
@@ -377,7 +377,7 @@ writes, daemon control, or project-code execution.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -402,7 +402,7 @@ symlinks, reparse points, and repository escapes remain denied.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -427,7 +427,7 @@ valid closure is `read` plus `store-write` plus `daemon-control`; omitting
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -453,7 +453,7 @@ project code. The valid closure is `read` plus `store-write` plus
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
@@ -479,7 +479,7 @@ effects.
 {
   "mcpServers": {
     "depgraph": {
-      "command": "/absolute/path/to/depgraph-0.7.1-TARGET_TRIPLE/bin/depgraph-mcp",
+      "command": "/absolute/path/to/depgraph-0.7.2-TARGET_TRIPLE/bin/depgraph-mcp",
       "args": [
         "--root", "/absolute/path/to/repository",
         "--store", "/absolute/path/to/state/depgraph.sqlite",
