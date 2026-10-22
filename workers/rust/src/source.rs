@@ -250,6 +250,9 @@ pub(crate) enum Occurrence {
         visible: bool,
         inline_ancestors: Vec<String>,
     },
+    /// A macro invocation in item position at module scope (#622), which may
+    /// define items that the syntax index does not see.
+    ItemMacroInvocation { inline_ancestors: Vec<String> },
     Include {
         macro_name: String,
         argument: Option<String>,
@@ -1386,6 +1389,10 @@ impl<'ast> Visit<'ast> for Collector {
         // through a glob, so it only counts as a local name.
         if let Some(ident) = &node.ident {
             self.record_item_definition(ident, &syn::Visibility::Inherited);
+        } else if self.type_use_frames.is_empty() {
+            self.occurrences.push(Occurrence::ItemMacroInvocation {
+                inline_ancestors: self.inline_modules.clone(),
+            });
         }
         self.collect_macro(&node.mac, self.condition(&node.attrs));
     }

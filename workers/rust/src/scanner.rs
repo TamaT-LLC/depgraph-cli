@@ -200,20 +200,35 @@ struct ModuleBindings {
     /// Items with a visibility other than private, which a glob re-export of
     /// the module can see.
     visible: BTreeSet<String>,
-    /// `pub use` / `pub(crate) use` leaves at module scope.
-    reexports: Vec<ModuleReexport>,
+    /// `pub use` / `pub(crate) use` leaves at module scope that bind a name.
+    named_reexports: Vec<ModuleReexport>,
+    /// Glob `use` leaves at module scope, public or private.
+    globs: Vec<ModuleGlob>,
+    /// A macro invocation at module scope may define items that the index
+    /// does not see, and such an item would shadow a glob.
+    opaque_items: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ModuleReexport {
-    /// The name the re-export binds; `None` for a glob.
-    name: Option<String>,
+    /// The name the re-export binds.
+    name: String,
     target_specifier: String,
     path: String,
     span: SourceSpan,
 }
 
-/// One `pub use` leaf that a `use` path was followed through.
+#[derive(Clone, Debug)]
+struct ModuleGlob {
+    /// `pub use path::*`; a private `use path::*` is only visible to the
+    /// module itself and its descendants.
+    public: bool,
+    target_specifier: String,
+    path: String,
+    span: SourceSpan,
+}
+
+/// One `use` leaf that a `use` path was followed through.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ReexportHop {
     path: String,
@@ -222,11 +237,11 @@ struct ReexportHop {
 }
 
 impl ReexportHop {
-    fn of(reexport: &ModuleReexport) -> Self {
+    fn new(path: &str, span: SourceSpan, target_specifier: &str) -> Self {
         Self {
-            path: reexport.path.clone(),
-            line: reexport.span.start_line,
-            target_specifier: reexport.target_specifier.clone(),
+            path: path.to_owned(),
+            line: span.start_line,
+            target_specifier: target_specifier.to_owned(),
         }
     }
 }
@@ -243,12 +258,16 @@ enum ReexportLookup {
     /// without guessing: several bindings, an ambiguous glob, or a target the
     /// syntax index does not know.
     Undecided,
-    /// The chain is cyclic or deeper than `MAX_REEXPORT_CHAIN_DEPTH`.
+    /// The chain is cyclic, deeper than `MAX_REEXPORT_CHAIN_DEPTH`, or took
+    /// more than `MAX_REEXPORT_LOOKUP_STEPS` lookups.
     Abort,
 }
 
 /// The longest chain of `pub use` leaves followed from one `use` path.
 const MAX_REEXPORT_CHAIN_DEPTH: usize = 8;
+/// The most module lookups one `use` path may spend on glob probes and
+/// re-exports, so that modules with many globs stay linear in practice.
+const MAX_REEXPORT_LOOKUP_STEPS: usize = 256;
 
 #[derive(Debug)]
 struct AggregatedDiagnostic {
@@ -2357,6 +2376,12 @@ impl State {
     }
 
     fn index_module_bindings(&mut self, sources: &[SourceUnit]) {
+        enum Binding {
+            Local { name: String, visible: bool },
+            Named(ModuleReexport),
+            Glob(ModuleGlob),
+            OpaqueItems,
+        }
         for source in sources {
             let (Some(package_index), true) = (source.package_index, source.parsed) else {
                 continue;
@@ -2373,7 +2398,16 @@ impl State {
                         name,
                         visible,
                         inline_ancestors,
-                    } => (inline_ancestors, (Some(name.clone()), *visible, None)),
+                    } => (
+                        inline_ancestors,
+                        Binding::Local {
+                            name: name.clone(),
+                            visible: *visible,
+                        },
+                    ),
+                    Occurrence::ItemMacroInvocation { inline_ancestors } => {
+                        (inline_ancestors, Binding::OpaqueItems)
+                    }
                     Occurrence::Use {
                         target_specifier,
                         alias,
@@ -2384,21 +2418,34 @@ impl State {
                         span,
                         ..
                     } => {
-                        let name = if *glob {
-                            None
+                        let binding = if *glob {
+                            Binding::Glob(ModuleGlob {
+                                public: *reexport,
+                                target_specifier: target_specifier.clone(),
+                                path: source.rel_path.clone(),
+                                span: *span,
+                            })
                         } else {
-                            use_binding_name(target_specifier, alias.as_deref())
+                            // `use path as _` binds no name.
+                            let Some(name) = use_binding_name(target_specifier, alias.as_deref())
+                            else {
+                                continue;
+                            };
+                            if *reexport {
+                                Binding::Named(ModuleReexport {
+                                    name,
+                                    target_specifier: target_specifier.clone(),
+                                    path: source.rel_path.clone(),
+                                    span: *span,
+                                })
+                            } else {
+                                Binding::Local {
+                                    name,
+                                    visible: false,
+                                }
+                            }
                         };
-                        if !*reexport && name.is_none() {
-                            continue;
-                        }
-                        let reexport = reexport.then(|| ModuleReexport {
-                            name: name.clone(),
-                            target_specifier: target_specifier.clone(),
-                            path: source.rel_path.clone(),
-                            span: *span,
-                        });
-                        (inline_ancestors, (name, false, reexport))
+                        (inline_ancestors, binding)
                     }
                     Occurrence::ExternCrate {
                         specifier,
@@ -2409,11 +2456,16 @@ impl State {
                         let Some(name) = use_binding_name(specifier, alias.as_deref()) else {
                             continue;
                         };
-                        (inline_ancestors, (Some(name), false, None))
+                        (
+                            inline_ancestors,
+                            Binding::Local {
+                                name,
+                                visible: false,
+                            },
+                        )
                     }
                     _ => continue,
                 };
-                let (name, visible, reexport) = binding;
                 for context in contexts {
                     let mut path = context.path.clone();
                     path.extend(inline_ancestors.iter().cloned());
@@ -2425,15 +2477,16 @@ impl State {
                             path,
                         })
                         .or_default();
-                    match &reexport {
-                        Some(reexport) => bindings.reexports.push(reexport.clone()),
-                        None => {
-                            let name = name.clone().expect("a local binding has a name");
-                            if visible {
+                    match &binding {
+                        Binding::Local { name, visible } => {
+                            if *visible {
                                 bindings.visible.insert(name.clone());
                             }
-                            bindings.local.insert(name);
+                            bindings.local.insert(name.clone());
                         }
+                        Binding::Named(reexport) => bindings.named_reexports.push(reexport.clone()),
+                        Binding::Glob(glob) => bindings.globs.push(glob.clone()),
+                        Binding::OpaqueItems => bindings.opaque_items = true,
                     }
                 }
             }
@@ -2510,26 +2563,29 @@ impl State {
     /// `pub use` re-exports (#622). `named` says that the caller knows the
     /// module binds the name (a `use` path or a named re-export points at
     /// it); a glob probe passes `false`, and then only a binding the glob can
-    /// see counts.
+    /// see counts. `steps` is the lookup budget left for the whole `use` path.
     fn lookup_reexported_name(
         &self,
         module: &ModuleKey,
         name: &str,
         named: bool,
         visiting: &mut Vec<(ModuleKey, String)>,
+        steps: &mut usize,
     ) -> ReexportLookup {
-        if visiting.len() > MAX_REEXPORT_CHAIN_DEPTH
+        if *steps == 0
+            || visiting.len() > MAX_REEXPORT_CHAIN_DEPTH
             || visiting
                 .iter()
                 .any(|(key, visited)| key == module && visited == name)
         {
             return ReexportLookup::Abort;
         }
+        *steps -= 1;
         let empty = ModuleBindings::default();
         let bindings = self.module_bindings.get(module).unwrap_or(&empty);
         let mut named_reexports: Vec<&ModuleReexport> = Vec::new();
-        for reexport in &bindings.reexports {
-            if reexport.name.as_deref() == Some(name)
+        for reexport in &bindings.named_reexports {
+            if reexport.name == name
                 && !named_reexports
                     .iter()
                     .any(|seen| seen.target_specifier == reexport.target_specifier)
@@ -2551,7 +2607,8 @@ impl State {
         match named_reexports.as_slice() {
             [] => {}
             [reexport] => {
-                let hop = ReexportHop::of(reexport);
+                let hop =
+                    ReexportHop::new(&reexport.path, reexport.span, &reexport.target_specifier);
                 let Some((target, rest)) = self.reexport_target(module, &reexport.target_specifier)
                 else {
                     return ReexportLookup::Undecided;
@@ -2561,7 +2618,8 @@ impl State {
                     [] => ReexportLookup::Found(target, vec![hop]),
                     [item] => {
                         visiting.push((module.clone(), name.to_owned()));
-                        let found = self.lookup_reexported_name(&target, item, true, visiting);
+                        let found =
+                            self.lookup_reexported_name(&target, item, true, visiting, steps);
                         visiting.pop();
                         match found {
                             ReexportLookup::Found(holder, hops) => {
@@ -2584,45 +2642,63 @@ impl State {
             }
             _ => return ReexportLookup::Undecided,
         }
+        // A private glob is visible to the module itself and its
+        // descendants, which a direct `use` path may be, but a glob of the
+        // module never re-exports it.
+        let mut globs: Vec<&ModuleGlob> = Vec::new();
+        for glob in bindings.globs.iter().filter(|glob| glob.public || named) {
+            if !globs
+                .iter()
+                .any(|seen| seen.target_specifier == glob.target_specifier)
+            {
+                globs.push(glob);
+            }
+        }
+        if bindings.opaque_items {
+            // A macro may define the name here: as a glob probe it may provide
+            // it, and as a direct path it would shadow every glob.
+            return if named && globs.is_empty() {
+                ReexportLookup::Found(module.clone(), Vec::new())
+            } else {
+                ReexportLookup::Undecided
+            };
+        }
         let mut providers = Vec::new();
-        let mut undecided = false;
-        for reexport in bindings
-            .reexports
-            .iter()
-            .filter(|reexport| reexport.name.is_none())
-        {
+        for glob in globs {
             // A glob of something other than a known module (an enum, an
-            // external crate) is not followed. Code that compiles cannot
-            // import a name that two globs provide, so a glob proven to
-            // provide the name is the only one that does.
-            let Some((target, rest)) = self.reexport_target(module, &reexport.target_specifier)
-            else {
-                continue;
+            // external crate) may provide the name in another namespace, so
+            // the name is not decided.
+            let Some((target, rest)) = self.reexport_target(module, &glob.target_specifier) else {
+                return ReexportLookup::Undecided;
             };
             if !rest.is_empty() {
-                continue;
+                return ReexportLookup::Undecided;
             }
             visiting.push((module.clone(), name.to_owned()));
-            let found = self.lookup_reexported_name(&target, name, false, visiting);
+            let found = self.lookup_reexported_name(&target, name, false, visiting, steps);
             visiting.pop();
             match found {
                 ReexportLookup::Found(holder, hops) => {
-                    let mut chain = vec![ReexportHop::of(reexport)];
+                    let mut chain = vec![ReexportHop::new(
+                        &glob.path,
+                        glob.span,
+                        &glob.target_specifier,
+                    )];
                     chain.extend(hops);
                     providers.push((holder, chain));
                 }
                 ReexportLookup::NotFound => {}
-                ReexportLookup::Undecided => undecided = true,
+                ReexportLookup::Undecided => return ReexportLookup::Undecided,
                 ReexportLookup::Abort => return ReexportLookup::Abort,
             }
         }
-        if undecided || providers.len() > 1 {
+        if providers.len() > 1 {
+            // Two globs may provide the name in different namespaces.
             return ReexportLookup::Undecided;
         }
         match providers.pop() {
             Some((holder, chain)) => ReexportLookup::Found(holder, chain),
-            // The name may come from a glob the index cannot follow or from
-            // an item it does not record (a macro-generated item).
+            // The name comes from an item the index does not record.
             None if named => ReexportLookup::Found(module.clone(), Vec::new()),
             None => ReexportLookup::NotFound,
         }
@@ -2753,7 +2829,8 @@ impl State {
                     Occurrence::Call { .. }
                     | Occurrence::Module { inline: true, .. }
                     | Occurrence::TypeDefinition { .. }
-                    | Occurrence::ItemDefinition { .. } => None,
+                    | Occurrence::ItemDefinition { .. }
+                    | Occurrence::ItemMacroInvocation { .. } => None,
                     _ => Some(occurrence.clone()),
                 })
             {
@@ -3222,7 +3299,9 @@ impl State {
                     }
                     Occurrence::Call { .. } => {}
                     Occurrence::Module { inline: true, .. } => {}
-                    Occurrence::TypeDefinition { .. } | Occurrence::ItemDefinition { .. } => {}
+                    Occurrence::TypeDefinition { .. }
+                    | Occurrence::ItemDefinition { .. }
+                    | Occurrence::ItemMacroInvocation { .. } => {}
                 }
             }
         }
@@ -3649,20 +3728,23 @@ impl State {
                         .filter(|file| Some(*file) != own_file.as_ref())
                         .cloned()
                         .collect();
-                    if !other_files.is_empty() {
-                        if let (Some(chain), [item]) =
+                    // The module's re-exports may lead out of the importing
+                    // file even when the module body is that file.
+                    if body_files.is_some()
+                        && let (Some(chain), [item]) =
                             (reexport_chain.as_deref_mut(), &module_path[prefix_len..])
-                            && let Some((files, hops)) =
-                                self.reexported_item_files(&key, item, own_file.as_ref())
-                        {
-                            targets.extend(files);
-                            for hop in hops {
-                                if !chain.contains(&hop) {
-                                    chain.push(hop);
-                                }
+                        && let Some((files, hops)) =
+                            self.reexported_item_files(&key, item, own_file.as_ref())
+                    {
+                        targets.extend(files);
+                        for hop in hops {
+                            if !chain.contains(&hop) {
+                                chain.push(hop);
                             }
-                            break;
                         }
+                        break;
+                    }
+                    if !other_files.is_empty() {
                         targets.extend(other_files);
                         break;
                     }
@@ -3714,8 +3796,9 @@ impl State {
         item: &str,
         own_file: Option<&String>,
     ) -> Option<(Vec<String>, Vec<ReexportHop>)> {
+        let mut steps = MAX_REEXPORT_LOOKUP_STEPS;
         let ReexportLookup::Found(holder, hops) =
-            self.lookup_reexported_name(module, item, true, &mut Vec::new())
+            self.lookup_reexported_name(module, item, true, &mut Vec::new(), &mut steps)
         else {
             return None;
         };
@@ -6115,6 +6198,183 @@ pub struct Local;
                 "{reexports} re-exports"
             );
         }
+    }
+
+    #[test]
+    fn syntax_reexport_chains_keep_the_module_when_a_binding_may_be_hidden() {
+        // #622 review: a glob is followed only when no binding that the index
+        // cannot see (a macro-generated item, an external glob, a private
+        // glob) may provide the same name.
+        let temp = tempfile::tempdir().unwrap();
+        write_syntax_only_fixture(
+            temp.path(),
+            r#"pub mod config;
+pub mod consumer;
+pub mod external;
+pub mod generated;
+pub mod mixed;
+pub mod unnamed;
+
+pub use config::Config;
+
+pub mod inline_consumer {
+    use crate::Config;
+}
+"#,
+        );
+        let files = [
+            ("src/config.rs", "pub struct Config;\n"),
+            (
+                "src/generated/mod.rs",
+                "pub mod inner;\npub use self::inner::*;\nmake_items!();\n",
+            ),
+            ("src/generated/inner.rs", "pub struct Shadowed;\n"),
+            (
+                "src/external/mod.rs",
+                "pub mod local;\npub use self::local::*;\npub use std::fmt::*;\n",
+            ),
+            ("src/external/local.rs", "pub struct Debug;\n"),
+            (
+                "src/mixed/mod.rs",
+                "mod functions;\nmod types;\nuse self::types::*;\npub use self::functions::*;\n",
+            ),
+            ("src/mixed/types.rs", "pub struct Both {}\n"),
+            ("src/mixed/functions.rs", "pub fn Both() {}\n"),
+            (
+                "src/unnamed/mod.rs",
+                "pub mod a;\npub mod b;\npub use self::a as _;\npub use self::b::*;\n",
+            ),
+            ("src/unnamed/a.rs", "pub struct Only;\n"),
+            ("src/unnamed/b.rs", "pub struct Only;\n"),
+            (
+                "src/consumer.rs",
+                concat!(
+                    "use crate::generated::Shadowed;\n",
+                    "use crate::external::Debug;\n",
+                    "use crate::mixed::Both;\n",
+                    "use crate::unnamed::Only;\n",
+                ),
+            ),
+        ];
+        for (path, source) in files {
+            let path = temp.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let target_of = |source: &str, specifier: &str| {
+            let source = file_id(source);
+            result
+                .sites
+                .iter()
+                .find(|site| {
+                    site.kind == "rust_use" && site.source == source && site.specifier == specifier
+                })
+                .unwrap_or_else(|| panic!("missing use site {specifier}"))
+                .target_ids
+                .clone()
+        };
+        for (source, specifier, target) in [
+            // A macro invocation may define an item that shadows the glob.
+            (
+                "src/consumer.rs",
+                "crate::generated::Shadowed",
+                "src/generated/mod.rs",
+            ),
+            // An external glob may provide the name in another namespace.
+            (
+                "src/consumer.rs",
+                "crate::external::Debug",
+                "src/external/mod.rs",
+            ),
+            // A private glob may provide the name in another namespace.
+            ("src/consumer.rs", "crate::mixed::Both", "src/mixed/mod.rs"),
+            // `use path as _` binds no name and is not a glob.
+            (
+                "src/consumer.rs",
+                "crate::unnamed::Only",
+                "src/unnamed/b.rs",
+            ),
+            // A module inline in the importing file still follows the root's
+            // re-exports out of that file.
+            ("src/lib.rs", "crate::Config", "src/config.rs"),
+        ] {
+            assert_eq!(
+                target_of(source, specifier),
+                vec![file_id(target)],
+                "{specifier}"
+            );
+        }
+    }
+
+    #[test]
+    fn syntax_reexport_glob_probes_stay_within_the_lookup_budget() {
+        // Every module of each level glob-imports every module of the next
+        // level. Probing an absent name would visit 6^6 modules without the
+        // budget; with it the lookup stops and keeps the crate root.
+        const LEVELS: usize = 6;
+        const WIDTH: usize = 6;
+        let temp = tempfile::tempdir().unwrap();
+        let mut lib = String::from("pub mod consumer;\n");
+        for level in 0..LEVELS {
+            for index in 0..WIDTH {
+                lib.push_str(&format!("pub mod l{level}_{index};\n"));
+            }
+        }
+        for index in 0..WIDTH {
+            lib.push_str(&format!("pub use l0_{index}::*;\n"));
+        }
+        write_syntax_only_fixture(temp.path(), &lib);
+        for level in 0..LEVELS {
+            for index in 0..WIDTH {
+                let mut source = String::new();
+                if level + 1 < LEVELS {
+                    for next in 0..WIDTH {
+                        source.push_str(&format!("pub use crate::l{}_{next}::*;\n", level + 1));
+                    }
+                }
+                fs::write(temp.path().join(format!("src/l{level}_{index}.rs")), source).unwrap();
+            }
+        }
+        fs::write(temp.path().join("src/consumer.rs"), "use crate::Missing;\n").unwrap();
+        let result = scan_with_inventory_and_semantic_extractor(
+            temp.path(),
+            None,
+            semantic_extractor_must_not_run,
+            HirMode::SyntaxOnly,
+        )
+        .unwrap();
+        let file_id = |path: &str| {
+            result
+                .nodes
+                .iter()
+                .find(|node| node.kind == "file" && node.locator == format!("file:{path}"))
+                .unwrap_or_else(|| panic!("missing file node {path}"))
+                .id
+                .clone()
+        };
+        let consumer = file_id("src/consumer.rs");
+        let site = result
+            .sites
+            .iter()
+            .find(|site| site.kind == "rust_use" && site.source == consumer)
+            .expect("use site");
+        assert_eq!(site.target_ids, vec![file_id("src/lib.rs")]);
     }
 
     #[test]
