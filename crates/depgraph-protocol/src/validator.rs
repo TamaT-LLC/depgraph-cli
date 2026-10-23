@@ -401,10 +401,8 @@ impl ProtocolValidator {
                         .coverage
                         .completeness
                         .contains(&CompletenessLevel::SemanticComplete)
-                    && let Some(site) = self.sites.values().find(|site| {
-                        site.profile_id == completed.profile_id
-                            && source_fallback_edge_kind_for_site(site).is_some()
-                    })
+                    && let Some(site) =
+                        unrefined_rust_source_fallback_site(&self.sites, &completed.profile_id)
                 {
                     return Err(ProtocolError::Invariant(format!(
                         "Rust semantic-complete profile {} cannot retain source fallback dependency site {}",
@@ -1716,6 +1714,47 @@ fn is_evidence_driven_semantic_site(site: &DependencySite) -> bool {
             .evidence
             .first()
             .is_some_and(|evidence| evidence.kind == EvidenceKind::Semantic)
+}
+
+/// The first source fallback site of a Rust profile that HIR did not refine.
+///
+/// The Rust worker unions the HIR delta into its syntax graph, so a module
+/// `use` keeps its file-level source `rust_use` / `rust_reexport` site even
+/// after rust-analyzer resolved the same occurrence. That syntax site is not a
+/// fallback for a missing HIR result: a semantic site of the same kind cites
+/// its primary source evidence as supporting evidence. A source `type_use`
+/// site, on the other hand, exists only for an occurrence HIR did not refine,
+/// so it always counts.
+fn unrefined_rust_source_fallback_site<'a>(
+    sites: &'a BTreeMap<String, DependencySite>,
+    profile_id: &str,
+) -> Option<&'a DependencySite> {
+    let refined_imports: BTreeSet<_> = sites
+        .values()
+        .filter(|site| {
+            site.profile_id == profile_id
+                && is_rust_import_site_kind(&site.kind)
+                && is_evidence_driven_semantic_site(site)
+        })
+        .flat_map(|site| {
+            site.evidence[1..]
+                .iter()
+                .filter(|evidence| {
+                    evidence.kind == EvidenceKind::Source && has_complete_span(evidence)
+                })
+                .map(move |evidence| (site.kind.as_str(), primary_evidence_anchor(evidence)))
+        })
+        .collect();
+    sites.values().find(|site| {
+        site.profile_id == profile_id
+            && source_fallback_edge_kind_for_site(site).is_some()
+            && !(is_rust_import_site_kind(&site.kind)
+                && has_complete_span(&site.evidence[0])
+                && refined_imports.contains(&(
+                    site.kind.as_str(),
+                    primary_evidence_anchor(&site.evidence[0]),
+                )))
+    })
 }
 
 fn source_fallback_edge_kind_for_site(site: &DependencySite) -> Option<&'static str> {
