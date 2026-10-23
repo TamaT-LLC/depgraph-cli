@@ -5,7 +5,7 @@ v0.7.2 向けの変更と移行手順は [v0.7.2 リリースノート](v0.7.2.m
 
 ## HIR を通した大きな Store で impact が失敗する問題を直す
 
-Rust HIR を通した depgraph-cli 自身の Store で、CLI の `depgraph impact` と MCP の `graph_impact_get` が、selector・`--depth`・`--max-nodes` に関係なく `request exhausted a service resource limit: preprocessing_work_items=1000000 (observed 1020958)`（終了コード 3）で失敗していた問題を直す。`--changed` / `changed_since` の経路も同じだった。v0.7.2 の #620 の修正は path step の後処理だけを直したもので、impact にはほかにも snapshot 全体に比例する作業を返す結果に比例する作業と同じ上限（1,000,000）で数えている箇所が残っていた。
+Rust HIR を通した depgraph-cli 自身の Store で、CLI の `depgraph impact` と MCP の `graph_impact_get` が、selector・`--depth`・`--max-nodes` に関係なく失敗していた問題を直す。CLI は `request exhausted a service resource limit: preprocessing_work_items=1000000 (observed 1020958)` を出して終了コード 3 で終わり、MCP は `RESOURCE_EXHAUSTED` と `{"kind":"resource_limit","limit":"preprocessing_work_items","maximum":1000000,"observed":1020958}` の details を返していた。`--changed` / `changed_since` の経路も同じだった。v0.7.2 の #620 の修正は path step の後処理だけを直したもので、impact にはほかにも snapshot 全体に比例する作業を返す結果に比例する作業と同じ上限（1,000,000）で数えている箇所が残っていた。
 
 - impact の前処理は、node・site・edge・evidence の件数を 1 つずつ 1,000,000 と比べていた。上の Store は evidence だけで 1,020,958 件ある。この検査をやめ、全 node・全 site・全 edge・全 evidence を 1 回ずつ訪ねる作業の合計を、cycles / unresolved の索引や #620 の走査と同じ固定の上限（16,000,000）で数える。上の Store では 1,959,234 になる。
 - filter を通る全 edge を並べる adjacency（向きごと）と、`--session` / `--environment` を指定したときの runtime context の索引も、snapshot 全体に比例するので 16,000,000 で数える。上の Store の adjacency は向きごとに 1,229,916 で、前処理の検査を直しても 1,000,000 を超えていた。
