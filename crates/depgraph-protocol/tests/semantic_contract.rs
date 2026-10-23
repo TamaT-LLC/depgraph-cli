@@ -1326,6 +1326,78 @@ fn source_fallback_contract_rejects_mutated_primary_evidence_and_metadata() {
 }
 
 #[test]
+fn rust_semantic_complete_profile_accepts_syntax_twins_of_hir_refined_imports() {
+    // The Rust worker unions the HIR delta into its syntax graph, so a
+    // refined `use` also keeps its source-primary syntax site. A semantic site
+    // of the same kind cites that syntax evidence as supporting evidence.
+    let mut events = rust_semantic_dependency_values();
+    add_source_import_twin(&mut events, "rust_use");
+    add_source_import_twin(&mut events, "rust_reexport");
+    promote_rust_profile_to_semantic_complete(&mut events);
+    let validated = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events.clone())))
+        .expect("syntax twins of HIR-refined imports must not block semantic-complete");
+    assert_eq!(
+        validated
+            .sites
+            .values()
+            .filter(|site| site.evidence[0].kind == EvidenceKind::Source)
+            .count(),
+        2
+    );
+
+    let mut cases = Vec::<(&str, Vec<Value>)>::new();
+
+    let mut moved_twin = events.clone();
+    let twin = moved_twin
+        .iter_mut()
+        .find(|event| {
+            event["event"] == "dependency_site"
+                && event["site"]["kind"] == "rust_use"
+                && event["site"]["evidence"][0]["kind"] == "source"
+        })
+        .expect("source rust_use twin");
+    twin["site"]["evidence"][0]["start_line"] = json!(9);
+    twin["site"]["evidence"][0]["end_line"] = json!(9);
+    let old_id = twin["site"]["id"].as_str().expect("site ID").to_owned();
+    let new_id = rehash_json_site(&mut twin["site"]);
+    let edge = linked_edge_mut(&mut moved_twin, &old_id);
+    edge["site_id"] = json!(new_id);
+    edge["evidence"][0]["start_line"] = json!(9);
+    edge["evidence"][0]["end_line"] = json!(9);
+    rehash_json_edge(edge);
+    sort_site_events(&mut moved_twin);
+    sort_edge_events(&mut moved_twin);
+    resequence(&mut moved_twin);
+    cases.push((
+        "source rust_use site that no semantic site refines",
+        moved_twin,
+    ));
+
+    let mut source_type_use = rust_source_dependency_values();
+    let envelope_id = node_id_by_display_name(&source_type_use, "Envelope");
+    set_source_type_use_resolution(
+        &mut source_type_use,
+        "resolved",
+        "heuristic",
+        &envelope_id,
+        "type",
+        Some("source declaration and explicit path prove the type target"),
+    );
+    promote_rust_profile_to_semantic_complete(&mut source_type_use);
+    cases.push(("source type_use fallback site", source_type_use));
+
+    for (name, events) in cases {
+        let error = validate_safe_semantic_ndjson(Cursor::new(values_to_ndjson(events)))
+            .expect_err(name)
+            .to_string();
+        assert!(
+            error.contains("cannot retain source fallback dependency site"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
 fn rust_semantic_nodes_and_site_less_relations_follow_their_hash_contract() {
     let validated = rust_semantic_fixture();
     let semantic_nodes: Vec<_> = validated
@@ -3274,6 +3346,135 @@ fn rust_source_dependency_values() -> Vec<Value> {
     );
     resequence(&mut events);
     events
+}
+
+/// Adds the source-primary syntax site (and its source edge) that the Rust
+/// worker keeps next to the semantic site of a HIR-refined import.
+fn add_source_import_twin(events: &mut Vec<Value>, site_kind: &str) {
+    // Syntax import sites start at the file node, not at the HIR module.
+    let file_id = "file:rust:src/lib.rs";
+    if !events
+        .iter()
+        .any(|event| event["event"] == "node_upsert" && event["node"]["id"] == file_id)
+    {
+        insert_plain_node(events, file_id, "file");
+    }
+    let semantic_id = semantic_site_id(events, site_kind);
+    let mut site_event = events
+        .iter()
+        .find(|event| event["event"] == "dependency_site" && event["site"]["id"] == semantic_id)
+        .expect("semantic import site")
+        .clone();
+    let support = site_event["site"]["evidence"][1].clone();
+    site_event["site"]["source"] = json!(file_id);
+    site_event["site"]["evidence"] = json!([support]);
+    let twin_id = rehash_json_site(&mut site_event["site"]);
+    let mut edge = linked_edge_mut(events, &semantic_id).clone();
+    edge["source"] = json!(file_id);
+    edge["site_id"] = json!(twin_id);
+    edge["phase"] = json!("source");
+    edge["evidence"] = json!([support]);
+    rehash_json_edge(&mut edge);
+    let edge_event = json!({
+        "event": "edge_upsert",
+        "protocol_version": "1.0",
+        "scan_id": site_event["scan_id"],
+        "adapter": "rust",
+        "adapter_version": site_event["adapter_version"],
+        "seq": 0,
+        "edge": edge,
+    });
+    let site_index = events
+        .iter()
+        .position(|event| event["event"] == "dependency_site")
+        .expect("dependency-site events");
+    events.insert(site_index, site_event);
+    let edge_index = events
+        .iter()
+        .position(|event| event["event"] == "edge_upsert")
+        .expect("edge events");
+    events.insert(edge_index, edge_event);
+    sort_site_events(events);
+    sort_edge_events(events);
+    for event in events.iter_mut() {
+        match event["event"].as_str() {
+            Some("file_completed") => {
+                for key in ["discovered_sites", "emitted_sites"] {
+                    event[key] = json!(event[key].as_u64().expect("site count") + 1);
+                }
+            }
+            Some("profile_completed" | "scan_completed") => {
+                for key in ["dependency_sites", "resolved"] {
+                    event["coverage"][key] =
+                        json!(event["coverage"][key].as_u64().expect("coverage count") + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    resequence(events);
+}
+
+/// Gives the Rust fixture profile every property a semantic-complete Rust
+/// profile must carry and marks its coverage semantic-complete.
+fn promote_rust_profile_to_semantic_complete(events: &mut [Value]) {
+    for event in events.iter_mut() {
+        match event["event"].as_str() {
+            Some("profile_declared") => {
+                event["profile"]["properties"] = json!({
+                    "analysis": "syntax+hir-imports-types-calls",
+                    "analysis_backend": "static-syntax+rust-analyzer-hir",
+                    "rust_hir_backend": "rust-analyzer-hir",
+                    "rust_hir_status": "import-type-call-graph-emitted",
+                    "rust_hir_project_model": "ready",
+                    "rust_hir_enable_gate": "release-gate-verified",
+                    "rust_hir_sysroot_status": "attested",
+                    "rust_hir_sysroot_file_count": 3,
+                    "rust_hir_sysroot_crate_count": 3,
+                    "rust_hir_project_external_count": 0,
+                    "rust_hir_sysroot_contract_version": "rust-src-data-tree-v1",
+                    "rust_hir_sysroot_component_version": "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+                    "rust_hir_sysroot_source_layout": "rustup-rust-src-library-v1",
+                    "crate_graph_source": "confined-cargo-metadata",
+                    "cargo_metadata_input": "confined-mirror",
+                    "rust_toolchain_probe_status": "unsupported",
+                    "rust_hir_toolchain_status": "compatible",
+                    "rust_hir_toolchain_selection": "installed-verified-baseline",
+                    "rust_hir_toolchain_attestation": {
+                        "contract": "installed-verified-rust-toolchain-v1",
+                        "selection": "installed-verified-baseline",
+                        "status": "compatible",
+                        "rustc": {
+                            "command": "rustc 1.93.1",
+                            "release": "1.93.1",
+                            "commit_hash": "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+                            "host": "test-host",
+                            "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        },
+                        "cargo": {
+                            "command": "cargo 1.93.1",
+                            "release": "1.93.1",
+                            "commit_hash": "083ac5135f967fd9dc906ab057a2315861c7a80d",
+                            "host": "test-host",
+                            "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        }
+                    },
+                    "proc_macro_expansion": "disabled",
+                    "build_script_policy": "disabled",
+                    "proc_macro_policy": "disabled",
+                    "rust_hir_semantic_issue_count": 0,
+                    "project_code_executed": false,
+                    "project_toolchain_executed": false,
+                    "build_scripts_executed": false,
+                    "proc_macros_executed": false
+                });
+            }
+            Some("profile_completed" | "scan_completed") => {
+                event["coverage"]["completeness"] = json!(["syntax-complete", "semantic-complete"]);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn set_source_type_use_resolution(

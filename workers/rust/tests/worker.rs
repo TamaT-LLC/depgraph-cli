@@ -3216,6 +3216,89 @@ fn release_gate_environment_requires_the_exact_verified_value() {
     }
 }
 
+#[test]
+fn semantic_complete_profile_keeps_syntax_sites_of_hir_refined_imports() {
+    // A crate whose only `use` stays inside the crate reaches semantic-complete
+    // with an attested sysroot. The syntax graph still holds the file-level
+    // `rust_use` / `rust_reexport` site of each import that HIR refined, and
+    // the validator used to reject that site as a leftover source fallback,
+    // so `depgraph scan` failed with exit 3.
+    let temp = tempfile::tempdir().unwrap();
+    let sysroot = temp.path().join("rust-sysroot");
+    write_attested_sysroot(&sysroot, |crate_name| format!("pub struct {crate_name};\n"));
+    let reexport = temp.path().join("local-reexport");
+    copy_tree(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/semantic-complete-local-use"),
+        &reexport,
+    );
+    fs::write(
+        reexport.join("src/lib.rs"),
+        "pub mod config;\npub use config::Config as Settings;\npub fn z(_c: Settings) {}\n",
+    )
+    .unwrap();
+
+    for (root, site_kind) in [
+        (
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/semantic-complete-local-use"),
+            "rust_use",
+        ),
+        (reexport, "rust_reexport"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_depgraph-rust-worker"))
+            .arg("--root")
+            .arg(&root)
+            .arg("--scan-id")
+            .arg(format!("semantic-complete-{site_kind}"))
+            .env_remove("DEPGRAPH_PROFILE_CONFIG")
+            .env("DEPGRAPH_RUST_RELEASE_GATE", "release-gate-verified")
+            .env("DEPGRAPH_RUST_SYSROOT_ROOT", &sysroot)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "worker failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let validated = validate_safe_semantic_ndjson(Cursor::new(output.stdout))
+            .unwrap_or_else(|error| panic!("{site_kind} stream must validate: {error}"));
+        let profile = validated.profiles.values().next().unwrap();
+        if profile.properties["rust_hir_toolchain_status"] != "compatible" {
+            // Hosts without the verified toolchain never reach the HIR backend.
+            return;
+        }
+        let coverage = validated
+            .events
+            .iter()
+            .find_map(|event| match event {
+                ProtocolEvent::ProfileCompleted(completed) => Some(&completed.coverage),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            coverage
+                .completeness
+                .contains(&CompletenessLevel::SemanticComplete),
+            "{site_kind}: {coverage:?}"
+        );
+        let spans_by_evidence = |kind: EvidenceKind| -> BTreeSet<_> {
+            validated
+                .sites
+                .values()
+                .filter(|site| site.kind == site_kind && site.evidence[0].kind == kind)
+                .map(|site| (site.evidence[0].path.clone(), site.evidence[0].start_line))
+                .collect()
+        };
+        let syntax = spans_by_evidence(EvidenceKind::Source);
+        assert!(!syntax.is_empty(), "{site_kind}: syntax site is missing");
+        assert_eq!(
+            syntax,
+            spans_by_evidence(EvidenceKind::Semantic),
+            "{site_kind}"
+        );
+    }
+}
+
 /// Writes a minimal bundled sysroot that the worker accepts as attested when
 /// it also receives the verified release gate.
 fn write_attested_sysroot(sysroot: &Path, source: impl Fn(&str) -> String) {
