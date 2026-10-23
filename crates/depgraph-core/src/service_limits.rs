@@ -35,8 +35,8 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 
 /// Maximum snapshot-wide work of one cycle or unresolved listing: indexing
 /// every node, edge, evidence record, site, and profile correlation, the
-/// per-node steps of the cycle search, and the materialization of the
-/// returned items. The path steps of dependency listing, path explanation,
+/// strongly connected component search over every edge of the level, and the
+/// materialization of every matching item. The path steps of dependency listing, path explanation,
 /// and impact count their scans of every evidence record, profile
 /// correlation, and profile entry against it too (Issue #620). So do the
 /// snapshot-wide steps of impact: its preflight over every node, site, edge,
@@ -46,8 +46,9 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 /// Each snapshot record is visited a bounded number of times, so this work
 /// grows with the snapshot rather than with the request, and the ceiling is
 /// the one hotspot analysis uses for its whole-snapshot work
-/// ([`MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS`]). Request `max_traversal` bounds only what the request asks for: the edge visits of
-/// the cycle search and the unresolved sites returned. Counting the whole
+/// ([`MAX_HOTSPOT_PREPROCESSING_WORK_ITEMS`]). Request `max_traversal` bounds only what the request returns: the edge visits
+/// that build the returned representative cycles and the unresolved sites of
+/// one page. Counting the whole
 /// snapshot against `max_traversal` (default 50,000) made both listings fail
 /// on a snapshot of about 250 files (Issues #617 / #618). A generated snapshot
 /// of that shape (23,500 sites, 6,750 of them unresolved, 30,000 edges,

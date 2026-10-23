@@ -11,15 +11,16 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
     DependenciesRequest, DependencyDirection, DepgraphCapability, DepgraphCapabilitySet,
-    DepgraphService, DepgraphServiceConfig, DepgraphServiceError, DepgraphServiceLimits,
-    DoctorRequest, ExplainPathRequest, ExportFileRequest, GraphExportFormat, GraphExportRequest,
-    HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest, HealthHotspotsRequest,
-    HealthSummaryRequest, ImpactRequest, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES,
-    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest, ProfilePlanRequest,
-    RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy, RepositoryRelativePath,
-    ResolveBuildRequest, RuntimeValidateRequest, ScanRequest, ServiceSnapshotSelector,
-    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator, SnapshotNameCreateRequest,
-    SnapshotNameCreateSelector, SnapshotReadRequest, StructuralEdgeSelection, UnresolvedRequest,
+    DepgraphResourceLimit, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
+    DepgraphServiceLimits, DoctorRequest, ExplainPathRequest, ExportFileRequest, GraphExportFormat,
+    GraphExportRequest, HealthAuditRequest, HealthFindingGetRequest, HealthFindingsRequest,
+    HealthHotspotsRequest, HealthSummaryRequest, ImpactRequest, MAX_GRAPH_EXPORT_EDGES,
+    MAX_GRAPH_EXPORT_NODES, MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FINDINGS, PolicyEvaluateRequest,
+    ProfilePlanRequest, RepositoryFileError, RepositoryInitRequest, RepositoryOverwritePolicy,
+    RepositoryRelativePath, ResolveBuildRequest, RuntimeValidateRequest, ScanRequest,
+    ServiceSnapshotSelector, SnapshotDiffFilters, SnapshotDiffRequest, SnapshotLocator,
+    SnapshotNameCreateRequest, SnapshotNameCreateSelector, SnapshotReadRequest,
+    StructuralEdgeSelection, UnresolvedRequest,
 };
 use depgraph_core::symbol_rollup::{DependencyRollup, SymbolRollup};
 use depgraph_core::{
@@ -384,8 +385,9 @@ enum Commands {
     Cycles {
         #[arg(long, value_enum, default_value_t = CycleLevelArg::File)]
         level: CycleLevelArg,
-        /// Stop the cycle search after this many visited dependency edges
-        /// (default 50000).
+        /// Fail when building the returned cycles visits more dependency
+        /// edges than this (default 50000). Finding the strongly connected
+        /// components is bounded by a fixed snapshot-wide work limit instead.
         #[arg(long, value_name = "N")]
         max_traversal: Option<usize>,
         #[arg(long)]
@@ -396,7 +398,8 @@ enum Commands {
         /// Include unresolved sites with one of these exact kinds.
         #[arg(long, value_name = "KIND")]
         kind: Vec<String>,
-        /// Fail when more unresolved sites than this match (default 50000).
+        /// Fail when one page (`--max-items`), or every match with `--all`,
+        /// holds more unresolved sites than this (default 50000).
         #[arg(long, value_name = "N")]
         max_traversal: Option<usize>,
         #[arg(long)]
@@ -574,6 +577,14 @@ enum Commands {
         session: Vec<String>,
         #[arg(long, value_name = "ENVIRONMENT")]
         environment: Vec<String>,
+        /// Fail when the exported graph has more nodes than this
+        /// (default 50000, at most 1000000).
+        #[arg(long, value_name = "N")]
+        max_nodes: Option<usize>,
+        /// Fail when the exported graph has more edges than this
+        /// (default 100000, at most 1000000).
+        #[arg(long, value_name = "N")]
+        max_edges: Option<usize>,
     },
 }
 
@@ -973,8 +984,60 @@ async fn cli_main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("error: {error:#}");
+            if let Some(hint) = error_hint(&error) {
+                eprintln!("hint: {hint}");
+            }
             ExitCode::from(error_exit_code(&error))
         }
+    }
+}
+
+/// The CLI option that widens a service bound the request hit, or the
+/// alternative when no option does.
+fn error_hint(error: &anyhow::Error) -> Option<String> {
+    let service_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<DepgraphServiceError>())?;
+    match service_error {
+        DepgraphServiceError::ResourceLimitExceeded {
+            limit,
+            maximum,
+            observed,
+        } => {
+            let option = match limit {
+                DepgraphResourceLimit::MaxTraversal => "--max-traversal",
+                DepgraphResourceLimit::ImpactNodes | DepgraphResourceLimit::ExportNodes => {
+                    "--max-nodes"
+                }
+                DepgraphResourceLimit::ImpactEdges | DepgraphResourceLimit::ExportEdges => {
+                    "--max-edges"
+                }
+                // No option raises the export byte bound.
+                DepgraphResourceLimit::OutputBytes => {
+                    return Some(
+                        "narrow the export with --phase or --profile, or choose a more compact --format such as dot"
+                            .to_owned(),
+                    );
+                }
+                _ => return None,
+            };
+            // Every CLI option above accepts 1..=1000000.
+            let ceiling = depgraph_core::MAX_INTERACTIVE_QUERY_TRAVERSAL as u64;
+            Some(match observed {
+                Some(observed) if *observed > ceiling => format!(
+                    "this request needs {option} {observed}, above the largest accepted value {ceiling}; narrow the request instead"
+                ),
+                Some(observed) if observed > maximum => {
+                    format!("rerun with {option} {observed} or more (accepted 1..={ceiling})")
+                }
+                _ => format!("rerun with a larger {option} (accepted 1..={ceiling})"),
+            })
+        }
+        DepgraphServiceError::InlineExportTooLarge { .. } => Some(
+            "write the export to a file with --output <PATH>, which accepts up to 512 MiB"
+                .to_owned(),
+        ),
+        _ => None,
     }
 }
 
@@ -1685,7 +1748,11 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.symbol_rollup(),
                 )?;
                 if !json {
-                    print_path_steps(&result.traversal().steps);
+                    let traversal = result.traversal();
+                    print_path_steps(
+                        &traversal.steps,
+                        &NodeLabels::new(std::iter::once(&traversal.root).chain(&traversal.nodes)),
+                    );
                 }
             } else {
                 let page =
@@ -1702,7 +1769,10 @@ async fn run(cli: Cli) -> Result<u8> {
                 )?;
                 if !json {
                     for item in &page.items {
-                        print_path_steps(std::slice::from_ref(&item.step));
+                        print_path_steps(
+                            std::slice::from_ref(&item.step),
+                            &NodeLabels::new([&item.source, &item.target]),
+                        );
                     }
                 }
             }
@@ -1753,7 +1823,11 @@ async fn run(cli: Cli) -> Result<u8> {
                     result.symbol_rollup(),
                 )?;
                 if !json {
-                    print_path_steps(&result.traversal().steps);
+                    let traversal = result.traversal();
+                    print_path_steps(
+                        &traversal.steps,
+                        &NodeLabels::new(std::iter::once(&traversal.root).chain(&traversal.nodes)),
+                    );
                 }
             } else {
                 let page = interactive_dependencies_page(
@@ -1775,7 +1849,10 @@ async fn run(cli: Cli) -> Result<u8> {
                 )?;
                 if !json {
                     for item in &page.items {
-                        print_path_steps(std::slice::from_ref(&item.step));
+                        print_path_steps(
+                            std::slice::from_ref(&item.step),
+                            &NodeLabels::new([&item.source, &item.target]),
+                        );
                     }
                 }
             }
@@ -1811,7 +1888,10 @@ async fn run(cli: Cli) -> Result<u8> {
             if !json {
                 if result.path().path_found {
                     println!("{}", result.path().from.locator);
-                    print_why_steps(&result.path().steps);
+                    print_why_steps(
+                        &result.path().steps,
+                        &NodeLabels::new([&result.path().from, &result.path().to]),
+                    );
                 } else {
                     println!(
                         "no dependency path exists from {} to {}",
@@ -1893,8 +1973,17 @@ async fn run(cli: Cli) -> Result<u8> {
                 if result.cycles().is_empty() {
                     println!("no cycles");
                 }
+                let labels = NodeLabels::new(result.nodes());
                 for cycle in result.cycles() {
-                    println!("{}", cycle.node_ids.join(" -> "));
+                    println!(
+                        "{}",
+                        cycle
+                            .node_ids
+                            .iter()
+                            .map(|id| labels.display(id))
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    );
                 }
             }
             Ok(0)
@@ -1905,12 +1994,28 @@ async fn run(cli: Cli) -> Result<u8> {
             json,
             output,
         } => {
+            let max_items = output
+                .max_items
+                .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
+            let max_bytes = output
+                .max_bytes
+                .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
+            if !output.all {
+                validate_interactive_query_bounds(max_items, max_bytes, None)?;
+            }
             let (service, mut snapshot) =
                 graph_snapshot_request(cli.store, cli.scan_id.as_deref())?;
             let request = UnresolvedRequest::try_new(
                 kind,
                 max_traversal.unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_TRAVERSAL),
             )?;
+            // A page returns at most --max-items sites, so only those count
+            // against --max-traversal; --all returns every match.
+            let request = if output.all {
+                request
+            } else {
+                request.with_page_items(max_items)?
+            };
             let result = service.unresolved(&mut snapshot, &request, &CancellationToken::new())?;
             if output.all {
                 print_graph_structured("unresolved", &snapshot, &result.items(), json)?;
@@ -1920,13 +2025,6 @@ async fn run(cli: Cli) -> Result<u8> {
             } else {
                 let snapshot_id = result.snapshot_id().as_str();
                 let scan_id = result.scan_id();
-                let max_items = output
-                    .max_items
-                    .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_ITEMS);
-                let max_bytes = output
-                    .max_bytes
-                    .unwrap_or(DEFAULT_INTERACTIVE_QUERY_MAX_BYTES);
-                validate_interactive_query_bounds(max_items, max_bytes, None)?;
                 let context = serde_json::json!({
                     "query":"unresolved",
                     "kinds": request.kinds(),
@@ -2497,6 +2595,8 @@ async fn run(cli: Cli) -> Result<u8> {
             profile,
             session,
             environment,
+            max_nodes,
+            max_edges,
         } => {
             let filter = GraphQueryFilter::new(phase, profile, session, environment)?;
             let format = match format {
@@ -2523,13 +2623,13 @@ async fn run(cli: Cli) -> Result<u8> {
                 }
                 None => SnapshotLocator::Current,
             };
-            let request = GraphExportRequest::try_new(
+            let request = GraphExportRequest::try_new_local(
                 locator,
                 format,
                 None,
                 filter,
-                MAX_GRAPH_EXPORT_NODES,
-                MAX_GRAPH_EXPORT_EDGES,
+                max_nodes.unwrap_or(MAX_GRAPH_EXPORT_NODES),
+                max_edges.unwrap_or(MAX_GRAPH_EXPORT_EDGES),
             )?;
             if let Some(output) = output.as_ref() {
                 let output_path = normalize_cli_repository_output(&root, output)?;
@@ -3583,16 +3683,7 @@ fn print_dependency_page<T: Serialize>(
     if partial.is_none() && degradations.is_empty() && rollup.is_none() {
         return print_interactive_page(page, json_output);
     }
-    if !json_output {
-        if partial.is_some() {
-            println!(
-                "partial analysis: {} (only analyzed dependencies are available)",
-                snapshot.scan_id()
-            );
-        }
-        print_analysis_degradation_notice(degradations);
-        return print_interactive_page(page, false);
-    }
+    let has_partial = partial.is_some();
     let mut value = serde_json::to_value(page)?;
     if let Some(partial) = partial {
         value["partial"] = partial;
@@ -3616,11 +3707,25 @@ fn print_dependency_page<T: Serialize>(
             anyhow::bail!("analysis metadata exceeds the output budget");
         }
         if value["serialized_output_bytes"].as_u64() == Some(encoded.len() as u64) {
-            println!("{encoded}");
-            return Ok(());
+            if json_output {
+                println!("{encoded}");
+                return Ok(());
+            }
+            break;
         }
         value["serialized_output_bytes"] = serde_json::json!(encoded.len());
     }
+    // The text summary reports the bytes of the JSON document the same
+    // options produce, metadata and symbol rollup included.
+    if has_partial {
+        println!(
+            "partial analysis: {} (only analyzed dependencies are available)",
+            snapshot.scan_id()
+        );
+    }
+    print_analysis_degradation_notice(degradations);
+    print_interactive_page_summary(page, value["serialized_output_bytes"].as_u64());
+    Ok(())
 }
 
 /// `print_graph_structured` that also reports the snapshot's degraded
@@ -3693,6 +3798,13 @@ fn print_interactive_page<T: Serialize>(
         println!("{}", canonical_json(&serde_json::to_value(page)?));
         return Ok(());
     }
+    print_interactive_page_summary(page, None);
+    Ok(())
+}
+
+/// The text header of a page. `output_bytes` replaces the page's own byte
+/// count when the JSON document adds metadata to the page.
+fn print_interactive_page_summary<T>(page: &InteractiveQueryPage<T>, output_bytes: Option<u64>) {
     println!(
         "{}: returned {}/{} items; complete={}; traversed={}; output_bytes={}",
         page.command,
@@ -3700,7 +3812,7 @@ fn print_interactive_page<T: Serialize>(
         page.total_items,
         page.complete,
         page.traversed_items,
-        page.serialized_output_bytes
+        output_bytes.unwrap_or(page.serialized_output_bytes)
     );
     for (label, summary) in [
         ("status", &page.summary.by_status),
@@ -3732,7 +3844,6 @@ fn print_interactive_page<T: Serialize>(
     if let Some(cursor) = &page.next_cursor {
         println!("next cursor: {cursor}");
     }
-    Ok(())
 }
 
 fn print_unresolved_items(items: &[UnresolvedResult]) {
@@ -3987,18 +4098,75 @@ fn print_symbol_rollup(rollup: &SymbolRollup) {
     }
 }
 
-fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
+/// Readable names of the nodes an edge line can name, by node ID.
+#[derive(Default)]
+struct NodeLabels<'a>(std::collections::HashMap<&'a str, String>);
+
+impl<'a> NodeLabels<'a> {
+    fn new(nodes: impl IntoIterator<Item = &'a depgraph_store::NodeRecord>) -> Self {
+        let mut labels = Self::default();
+        for node in nodes {
+            if let Some(label) = node_label(node) {
+                labels.0.entry(node.id.as_str()).or_insert(label);
+            }
+        }
+        labels
+    }
+
+    /// The node ID followed by its label, when there is one.
+    fn display(&self, id: &str) -> String {
+        match self.0.get(id) {
+            Some(label) => format!("{id} ({label})"),
+            None => id.to_owned(),
+        }
+    }
+}
+
+/// The repository-relative path of a file node, or the display name of any
+/// other node with the file that defines it. File nodes take the path from
+/// their `path` property or `file:<path>` locator, as the Agent node
+/// projection does (Issue #566).
+fn node_label(node: &depgraph_store::NodeRecord) -> Option<String> {
+    let property = |key: &str| {
+        node.properties
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    if node.kind == "file" {
+        return property("path")
+            .or_else(|| {
+                node.locator
+                    .strip_prefix("file:")
+                    .map(|path| path.strip_prefix("//").unwrap_or(path))
+                    .filter(|path| !path.is_empty())
+            })
+            .map(str::to_owned);
+    }
+    let name = Some(node.display_name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(node.locator.as_str());
+    if name.is_empty() {
+        return None;
+    }
+    Some(match property("source_path").or_else(|| property("path")) {
+        Some(path) if path != name => format!("{name} in {path}"),
+        _ => name.to_owned(),
+    })
+}
+
+fn print_path_steps(steps: &[depgraph_core::query::PathStep], labels: &NodeLabels<'_>) {
     for step in steps {
         let edge = &step.edge;
         println!(
             "{} --{} [{}; {}; {}; {}]--> {}",
-            edge.source,
+            labels.display(&edge.source),
             edge.kind,
             edge.phase,
             edge.resolution_status,
             edge.precision,
             edge.profile_id,
-            edge.target
+            labels.display(&edge.target)
         );
         println!("    condition: {}", step.condition_text);
         print_profile_correlation(step, "    ");
@@ -4006,7 +4174,7 @@ fn print_path_steps(steps: &[depgraph_core::query::PathStep]) {
     }
 }
 
-fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
+fn print_why_steps(steps: &[depgraph_core::query::PathStep], labels: &NodeLabels<'_>) {
     for step in steps {
         println!(
             "  --{} [{}; {}; {}; {}]--> {}",
@@ -4015,7 +4183,7 @@ fn print_why_steps(steps: &[depgraph_core::query::PathStep]) {
             step.edge.resolution_status,
             step.edge.precision,
             step.edge.profile_id,
-            step.edge.target
+            labels.display(&step.edge.target)
         );
         println!("      condition: {}", step.condition_text);
         print_profile_correlation(step, "      ");
@@ -4145,6 +4313,11 @@ fn print_human_impact(result: &ImpactResult) {
     if !result.root_impacted {
         println!("selected node is not affected by the mapped changed set");
     }
+    let labels = NodeLabels::new(
+        std::iter::once(&result.root)
+            .chain(&result.changed_nodes)
+            .chain(result.impacts.iter().map(|impact| &impact.node)),
+    );
     for impact in &result.impacts {
         println!(
             "{} ({}, id:{}) depth={} changed_node={}",
@@ -4154,7 +4327,7 @@ fn print_human_impact(result: &ImpactResult) {
             impact.depth,
             impact.changed_node_id,
         );
-        print_why_steps(&impact.dependency_path);
+        print_why_steps(&impact.dependency_path, &labels);
     }
     for diagnostic in &result.diagnostics {
         println!("diagnostic [{}] {}", diagnostic.code, diagnostic.message);
@@ -4213,6 +4386,50 @@ mod tests {
     };
     use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
     use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
+
+    #[test]
+    fn error_hints_name_the_option_that_widens_a_bound_or_the_alternative() {
+        use depgraph_core::service::{DepgraphResourceLimit, DepgraphServiceError};
+        let hint = |error: DepgraphServiceError| {
+            super::error_hint(&anyhow::Error::new(error).context("while running the command"))
+        };
+        let limit = |limit, maximum, observed| {
+            hint(DepgraphServiceError::resource_limit(
+                limit, maximum, observed,
+            ))
+        };
+        assert_eq!(
+            limit(DepgraphResourceLimit::MaxTraversal, 50_000, Some(61_234)).as_deref(),
+            Some("rerun with --max-traversal 61234 or more (accepted 1..=1000000)")
+        );
+        assert_eq!(
+            limit(DepgraphResourceLimit::MaxTraversal, 50_000, None).as_deref(),
+            Some("rerun with a larger --max-traversal (accepted 1..=1000000)")
+        );
+        assert_eq!(
+            limit(DepgraphResourceLimit::ExportNodes, 50_000, Some(1_200_000)).as_deref(),
+            Some(
+                "this request needs --max-nodes 1200000, above the largest accepted value 1000000; narrow the request instead"
+            )
+        );
+        assert_eq!(
+            limit(DepgraphResourceLimit::ImpactEdges, 10, Some(10)).as_deref(),
+            Some("rerun with a larger --max-edges (accepted 1..=1000000)")
+        );
+        assert!(
+            limit(DepgraphResourceLimit::OutputBytes, 1, Some(2))
+                .is_some_and(|hint| hint.contains("--phase or --profile"))
+        );
+        assert!(
+            hint(DepgraphServiceError::InlineExportTooLarge { maximum: 1 })
+                .is_some_and(|hint| hint.contains("--output <PATH>"))
+        );
+        assert_eq!(
+            limit(DepgraphResourceLimit::PreprocessingWorkItems, 1, None),
+            None
+        );
+        assert_eq!(hint(DepgraphServiceError::InvalidInput), None);
+    }
 
     #[test]
     fn issue_569_human_doctor_names_worker_route_reason_and_scan_impact() {

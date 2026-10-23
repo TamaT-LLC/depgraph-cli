@@ -40,6 +40,15 @@ pub const DEFAULT_GRAPH_EXPORT_MAX_NODES: usize = 1_000;
 pub const DEFAULT_GRAPH_EXPORT_MAX_EDGES: usize = 5_000;
 pub const MAX_GRAPH_EXPORT_NODES: usize = 50_000;
 pub const MAX_GRAPH_EXPORT_EDGES: usize = 100_000;
+/// Largest `max_nodes` of a local export (CLI `export --max-nodes`).
+///
+/// [`MAX_GRAPH_EXPORT_NODES`] keeps the inline Agent export bounded. A local
+/// export is still bounded by its output bytes (the service output limit for
+/// standard output, 512 MiB for a file), so it accepts the same ceiling as
+/// the other CLI result bounds such as `impact --max-nodes`.
+pub const MAX_LOCAL_GRAPH_EXPORT_NODES: usize = crate::query::MAX_INTERACTIVE_QUERY_TRAVERSAL;
+/// Largest `max_edges` of a local export (CLI `export --max-edges`).
+pub const MAX_LOCAL_GRAPH_EXPORT_EDGES: usize = crate::query::MAX_INTERACTIVE_QUERY_TRAVERSAL;
 pub const MAX_SHARED_ARTIFACT_ITEMS: usize = 50_000;
 pub const MAX_SHARED_ARTIFACT_WORK_ITEMS: usize = 1_000_000;
 const GRAPH_EXPORT_ENVELOPE_RESERVE_BYTES: usize = 4 * 1024;
@@ -571,6 +580,35 @@ impl GraphExportRequest {
             max_nodes,
             max_edges,
         })
+    }
+
+    /// A local export (the CLI), whose `max_nodes` / `max_edges` accept up
+    /// to [`MAX_LOCAL_GRAPH_EXPORT_NODES`] / [`MAX_LOCAL_GRAPH_EXPORT_EDGES`]
+    /// and name the argument and its range when they do not.
+    pub fn try_new_local(
+        snapshot: SnapshotLocator,
+        format: GraphExportFormat,
+        selector: Option<String>,
+        filter: GraphQueryFilter,
+        max_nodes: usize,
+        max_edges: usize,
+    ) -> DepgraphServiceResult<Self> {
+        for (argument, value, maximum) in [
+            ("max_nodes", max_nodes, MAX_LOCAL_GRAPH_EXPORT_NODES),
+            ("max_edges", max_edges, MAX_LOCAL_GRAPH_EXPORT_EDGES),
+        ] {
+            if !(1..=maximum).contains(&value) {
+                return Err(DepgraphServiceError::ArgumentOutOfRange {
+                    argument,
+                    minimum: 1,
+                    maximum: saturating_u64(maximum),
+                });
+            }
+        }
+        let mut request = Self::try_new(snapshot, format, selector, filter, 1, 1)?;
+        request.max_nodes = max_nodes;
+        request.max_edges = max_edges;
+        Ok(request)
     }
 
     #[must_use]
