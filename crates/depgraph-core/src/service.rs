@@ -935,9 +935,10 @@ pub enum DepgraphResourceLimit {
     AdjacencyEdgeInspection,
     /// Snapshot-wide preprocessing work items: selector resolution, path
     /// search adjacency, traversal postprocessing and its snapshot-wide
-    /// evidence and profile scans, the per-phase health analysis budget,
-    /// hotspot analysis, and the snapshot indexing of cycle and unresolved
-    /// listing.
+    /// evidence and profile scans, the snapshot-wide preflight, adjacency,
+    /// and runtime context index of impact, the per-phase health analysis
+    /// budget, hotspot analysis, and the snapshot indexing of cycle and
+    /// unresolved listing.
     PreprocessingWorkItems,
     /// Unique nodes an impact traversal keeps, set by its `max_nodes`.
     ImpactNodes,

@@ -38,7 +38,10 @@ pub const MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS: usize =
 /// per-node steps of the cycle search, and the materialization of the
 /// returned items. The path steps of dependency listing, path explanation,
 /// and impact count their scans of every evidence record, profile
-/// correlation, and profile entry against it too (Issue #620).
+/// correlation, and profile entry against it too (Issue #620). So do the
+/// snapshot-wide steps of impact: its preflight over every node, site, edge,
+/// and evidence record, the edge adjacency of each direction, and the runtime
+/// context index.
 ///
 /// Each snapshot record is visited a bounded number of times, so this work
 /// grows with the snapshot rather than with the request, and the ceiling is
