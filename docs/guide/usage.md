@@ -306,6 +306,8 @@ depgraph export --format json --output graph.json
 depgraph export --format dot > graph.dot
 depgraph export --format mermaid > graph.mmd
 depgraph export --format graphml --output graph.graphml
+# 既定の上限（node 50,000、edge 100,000）を超えるグラフは、上限を広げてファイルに書き出します。
+depgraph export --format json --max-nodes 300000 --max-edges 500000 --output graph.json
 ```
 
 ## さらに詳しく

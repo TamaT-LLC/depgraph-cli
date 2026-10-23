@@ -3904,8 +3904,13 @@ fn execute_catalog_read_tool(
             // max_traversal is range-checked first, so what try_new still
             // rejects is a kinds item (empty, too long, or a control character).
             let max_traversal = graph_max_traversal(arguments.max_traversal)?;
+            let page_request = page_request(arguments.limit, arguments.cursor)?;
             let request = UnresolvedRequest::try_new(arguments.kinds, max_traversal)
-                .map_err(|_| invalid_argument(Some("kinds"), AgentArgumentReason::InvalidValue))?;
+                .map_err(|_| invalid_argument(Some("kinds"), AgentArgumentReason::InvalidValue))?
+                // One page returns at most `limit` sites, so only those count
+                // against max_traversal.
+                .with_page_items(usize::from(page_request.max_items().get()))
+                .map_err(|_| invalid_argument(Some("limit"), AgentArgumentReason::OutOfRange))?;
             let locator = parse_snapshot_argument(
                 arguments.snapshot.as_deref().unwrap_or("current"),
                 "snapshot",
@@ -3924,7 +3929,6 @@ fn execute_catalog_read_tool(
                 snapshot_id.clone(),
                 &normalized,
             )?;
-            let page_request = page_request(arguments.limit, arguments.cursor)?;
             let found = service.unresolved(&mut snapshot_request, &request, cancellation)?;
             let page = project_unresolved_page_cancellable(
                 &found,
