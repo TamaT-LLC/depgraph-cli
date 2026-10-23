@@ -1027,6 +1027,11 @@ fn error_hint(error: &anyhow::Error) -> Option<String> {
                 Some(observed) if *observed > ceiling => format!(
                     "this request needs {option} {observed}, above the largest accepted value {ceiling}; narrow the request instead"
                 ),
+                // `deps --all` and an option already at its ceiling cannot
+                // be widened.
+                _ if *maximum >= ceiling => format!(
+                    "{option} is already at the largest accepted value {ceiling}; narrow the request instead"
+                ),
                 Some(observed) if observed > maximum => {
                     format!("rerun with {option} {observed} or more (accepted 1..={ceiling})")
                 }
@@ -4412,6 +4417,15 @@ mod tests {
                 "this request needs --max-nodes 1200000, above the largest accepted value 1000000; narrow the request instead"
             )
         );
+        for observed in [Some(1_000_000), None] {
+            assert_eq!(
+                limit(DepgraphResourceLimit::MaxTraversal, 1_000_000, observed).as_deref(),
+                Some(
+                    "--max-traversal is already at the largest accepted value 1000000; narrow the request instead"
+                ),
+                "{observed:?}"
+            );
+        }
         assert_eq!(
             limit(DepgraphResourceLimit::ImpactEdges, 10, Some(10)).as_deref(),
             Some("rerun with a larger --max-edges (accepted 1..=1000000)")
