@@ -991,6 +991,19 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Errors | どちらの上限に当たっても`preprocessing_work_items`（`argument`なし、`narrow_query`）を返し、`maximum`で上限を区別する。従来は上限名のない`ResourceExhausted`だった。evidence数・reason数・phase coverage数などの構造上の上限は従来どおりdetailsなし |
 | Output | 返すnode・edge・path step・evidence・correlationの内容と順序は変わらない（Issue #617のフィクスチャでの依存一覧とpathのdigestを修正前のコードで記録して固定） |
 
+## Issue #620 follow-up: impact snapshot scan bounds
+
+Issue #620の修正後も、`graph_impact_get`（CLI `impact`。`changed_since` / `--changed`の経路を含む）は、Rust HIRを通したdepgraph-cli自身のsnapshot（node 217,340、site 310,964、edge 409,972、evidence 1,020,958）でselector・`depth`・`max_nodes`に関係なく`preprocessing_work_items`（`maximum` 1,000,000、`observed` 1,020,958）で失敗していた。impactの前処理は、path stepの走査のほかにもsnapshot全体に比例する作業を前処理上限（1,000,000）で数えていた。
+
+| Area | Evidence |
+| --- | --- |
+| Preflight | node・site・edge・evidenceの件数を1件ずつ前処理上限と比べる検査をやめ、全node・全site・全edge・全evidenceを1回ずつ訪ねる作業の合計を固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000）で数える。上のsnapshotで1,959,234。edge / siteごとのevidence数の上限は従来どおり（detailsなしの`RESOURCE_EXHAUSTED`） |
+| Adjacency | filterを通る全edgeを並べる逆向き（selectorありは順向きも）のadjacencyは、向きごとに16,000,000で数える。上のsnapshotで向きごとに1,229,916（走査・挿入・出力が各409,972）で、前処理上限を超えていた |
+| Runtime context | `sessions` / `environments`を指定したときの全evidenceからのruntime contextの索引も16,000,000で数える |
+| Request work | selectorの解決、変更pathとnodeの対応付け、`changed_paths`の帰属、返すdependency pathの組み立て（Issue #620で分けた後処理）は、従来どおり前処理上限（1,000,000）で数える |
+| Errors | どちらの上限に当たっても`preprocessing_work_items`（`argument`なし、`narrow_query`）を返し、`maximum`で上限を区別する。16,000,000の上限は`observed`を持たない |
+| Output | 返すimpactの内容と順序は変わらない（1,000,000を超えるevidenceとedgeを足した生成snapshotで、足す前と同じ結果になることを確かめた）。上のsnapshotで`crates/depgraph-core/src/config.rs`のimpactは304件 |
+
 ## Issue #623 symbol rollup of dependency lists
 
 Rust HIRとWebのsemantic解析が出す辺（`calls`、`type_uses`、`imports`、`reexports`など）はsymbol / type / moduleのノードに張られ、fileのノードには張られない。そのためfileを選んだ`graph_dependents_list` / `graph_dependencies_list`（CLI `dependents` / `deps`）には、symbol単位の依存が出ない。crateをまたぐimport（syntax解析ではpackageに結び付く）と、Issue #622でもたどれないre-export越しのimport（曖昧なglob、`cfg`ごとに先が変わるものなど）も同じ。`graph_impact_get`はすべての種類の辺（構造上の辺を含む）を逆向きに推移的にたどるので、同じfileでも結果が大きく違う（HIRを通したdepgraph-cli自身のStoreで`crates/depgraph-core/src/config.rs`の`dependents`は12ファイル、`impact`は146ファイル）。既定の出力は変えず、任意入力`rollup: "symbols"`（CLI `--rollup symbols`）を付けたときだけ、symbolの依存をfile単位にまとめた`symbol_rollup`を返す。
