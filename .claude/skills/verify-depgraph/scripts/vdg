@@ -68,7 +68,8 @@ usage:
   vdg doctor                                read-only health check of the current run
   vdg run <label> [--expect-exit N] -- <depgraph args...>
                                             run depgraph (with --store injected) inside the fixture,
-                                            record cmd/stdout/stderr/exit as evidence/<label>.*
+                                            record cmd/stdout/stderr/exit as evidence/<label>.*,
+                                            fail unless it exits N (default 0)
   vdg fixture-change                        commit a change to src/cart.rs on branch feat (for impact --changed)
   vdg note <label> <text...>                append a free-form observation to evidence/NOTES.md
   vdg env                                   print the run's exported variables (eval-able)
@@ -289,7 +290,7 @@ cmd_doctor() {
 
 cmd_run() {
   [[ $# -ge 1 ]] || die "run: missing <label>"
-  local label="$1" expect=""
+  local label="$1" expect=0
   shift
   while [[ $# -gt 0 && "$1" != "--" ]]; do
     case "$1" in
@@ -311,9 +312,9 @@ cmd_run() {
   echo "- \`$label\`: exit $status — $(tail -n1 "$base.cmd" | cut -c6-)" >>"$VDG_EVIDENCE/NOTES.md"
   cat "$base.stdout"
   log "$label exit=$status evidence=$base.{cmd,stdout,stderr,exit}"
-  if [[ -n "$expect" && "$status" != "$expect" ]]; then
+  if [[ "$status" != "$expect" ]]; then
     sed 's/^/stderr: /' "$base.stderr" | head -n 20 >&2
-    die "$label: expected exit $expect, got $status"
+    die "$label: expected exit $expect, got $status (a step that expects a failure passes --expect-exit N)"
   fi
   return 0
 }
