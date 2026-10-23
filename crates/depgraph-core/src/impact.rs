@@ -24,7 +24,7 @@ use crate::{
     },
     service_limits::{
         MAX_DEPENDENCY_PATH_STEPS, MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
-        MAX_IMPACT_MATERIALIZED_PATH_STEPS,
+        MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS, MAX_IMPACT_MATERIALIZED_PATH_STEPS,
     },
     worker::resolve_safe_executable,
 };
@@ -1928,6 +1928,11 @@ impl ChangedPathAttributionWork {
     }
 }
 
+/// Orders every snapshot edge that passes the filters into one adjacency,
+/// whatever node the request selected. The work grows with the snapshot, so
+/// it counts against the fixed [`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`] ceiling,
+/// as the path-step scans do (Issue #620), not against the request work
+/// budget.
 fn adjacency_cancellable<'a>(
     snapshot: &'a GraphSnapshot,
     reverse: bool,
@@ -1940,7 +1945,7 @@ fn adjacency_cancellable<'a>(
         reverse,
         filters,
         runtime_contexts,
-        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
         is_cancelled,
     )
 }
@@ -2025,6 +2030,10 @@ static IMPACT_ADJACENCY_INSERT_VISITS: std::sync::atomic::AtomicUsize =
 static IMPACT_ADJACENCY_MATERIALIZATION_VISITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Indexes the runtime context of every runtime edge from every evidence
+/// record of the snapshot. Like the adjacency, the work grows with the
+/// snapshot, so it counts against the fixed
+/// [`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`] ceiling.
 fn runtime_context_index_cancellable(
     snapshot: &GraphSnapshot,
     filters: &ImpactFilters,
@@ -2033,7 +2042,7 @@ fn runtime_context_index_cancellable(
     runtime_context_index_with_limit(
         snapshot,
         filters,
-        MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS,
+        MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS,
         is_cancelled,
     )
 }

@@ -741,25 +741,13 @@ impl DepgraphService {
             .changed_since()
             .map(|git_ref| self.read_snapshot_changed_set(&snapshot, git_ref, cancellation))
             .transpose()?;
-        let result = impact_cancellable(
+        let result = impact_on_snapshot(
             &snapshot,
             request.selector(),
             changed_set.as_ref(),
-            request.filters().clone(),
-            || cancellation.is_cancelled(),
-        )
-        .map_err(|source| {
-            impact_service_error(tag_selector_argument(source, "selector"), cancellation)
-        })?;
-        if cancellation.is_cancelled() {
-            return Err(DepgraphServiceError::Cancelled);
-        }
-        if !result.complete {
-            return Err(impact_incomplete_error(
-                &result.diagnostics,
-                request.filters(),
-            ));
-        }
+            request.filters(),
+            cancellation,
+        )?;
         Ok(ImpactServiceResult {
             snapshot_id,
             scan_id: snapshot.scan.id.clone(),
@@ -784,22 +772,12 @@ impl DepgraphService {
         preflight_impact_snapshot(&snapshot, cancellation)?;
         let changed_set =
             self.read_snapshot_changed_set(&snapshot, request.changed_since(), cancellation)?;
-        let result = impact_changed_set_cancellable(
+        let result = changed_set_impact_on_snapshot(
             &snapshot,
             &changed_set,
-            request.filters().clone(),
-            || cancellation.is_cancelled(),
-        )
-        .map_err(|source| impact_service_error(source, cancellation))?;
-        if cancellation.is_cancelled() {
-            return Err(DepgraphServiceError::Cancelled);
-        }
-        if !result.complete {
-            return Err(impact_incomplete_error(
-                &result.diagnostics,
-                request.filters(),
-            ));
-        }
+            request.filters(),
+            cancellation,
+        )?;
         Ok(ChangedSetImpactServiceResult {
             snapshot_id,
             scan_id: snapshot.scan.id.clone(),
@@ -861,6 +839,52 @@ impl DepgraphService {
             items,
         })
     }
+}
+
+/// Impact of one selector on a snapshot that passed
+/// [`preflight_impact_snapshot`], with the service errors of `impact`.
+fn impact_on_snapshot(
+    snapshot: &GraphSnapshot,
+    selector: &str,
+    changed_set: Option<&GitChangedSet>,
+    filters: &ImpactFilters,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<ImpactResult> {
+    let result = impact_cancellable(snapshot, selector, changed_set, filters.clone(), || {
+        cancellation.is_cancelled()
+    })
+    .map_err(|source| {
+        impact_service_error(tag_selector_argument(source, "selector"), cancellation)
+    })?;
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    if !result.complete {
+        return Err(impact_incomplete_error(&result.diagnostics, filters));
+    }
+    Ok(result)
+}
+
+/// Impact of a whole changed set on a snapshot that passed
+/// [`preflight_impact_snapshot`], with the service errors of
+/// `impact_changed_set`.
+fn changed_set_impact_on_snapshot(
+    snapshot: &GraphSnapshot,
+    changed_set: &GitChangedSet,
+    filters: &ImpactFilters,
+    cancellation: &CancellationToken,
+) -> DepgraphServiceResult<ChangedSetImpactResult> {
+    let result = impact_changed_set_cancellable(snapshot, changed_set, filters.clone(), || {
+        cancellation.is_cancelled()
+    })
+    .map_err(|source| impact_service_error(source, cancellation))?;
+    if cancellation.is_cancelled() {
+        return Err(DepgraphServiceError::Cancelled);
+    }
+    if !result.complete {
+        return Err(impact_incomplete_error(&result.diagnostics, filters));
+    }
+    Ok(result)
 }
 
 /// An impact traversal that stopped at its `max_nodes` / `max_edges` result
@@ -1000,26 +1024,27 @@ fn preflight_impact_snapshot(
     snapshot: &GraphSnapshot,
     cancellation: &CancellationToken,
 ) -> DepgraphServiceResult<()> {
-    for length in [
-        snapshot.nodes.len(),
-        snapshot.sites.len(),
-        snapshot.profile_matrix.entries.len(),
-        snapshot.profile_matrix.correlations.len(),
-        snapshot.edges.len(),
-        snapshot.evidence.len(),
-    ] {
-        if cancellation.is_cancelled() {
-            return Err(DepgraphServiceError::Cancelled);
-        }
-        if length > MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS {
-            return Err(DepgraphServiceError::resource_limit(
-                DepgraphResourceLimit::PreprocessingWorkItems,
-                saturating_u64(MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS),
-                Some(saturating_u64(length)),
-            ));
-        }
-    }
-    let mut evidence_per_owner = BTreeMap::<(&str, &str), usize>::new();
+    preflight_impact_snapshot_with_budget(snapshot, MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS, &mut || {
+        cancellation.is_cancelled()
+    })
+}
+
+/// Bounds the snapshot-wide walks of impact that have no budget of their own
+/// (the node and edge maps and the changed-path index visit every node, site,
+/// edge, and evidence record) and checks the evidence of each edge and site.
+///
+/// The visits grow with the snapshot, not with the request, so they count
+/// together against `scan_maximum`, the fixed snapshot scan ceiling of cycle
+/// and unresolved listing and of the path-step scans (Issue #620). Comparing
+/// each record count with the request work budget (1,000,000) made `impact`
+/// fail on any selector of a Rust HIR snapshot of depgraph-cli itself, whose
+/// 1,020,958 evidence records exceeded it alone.
+fn preflight_impact_snapshot_with_budget(
+    snapshot: &GraphSnapshot,
+    scan_maximum: usize,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> DepgraphServiceResult<()> {
+    let mut work = 0;
     for _ in snapshot
         .nodes
         .iter()
@@ -1027,14 +1052,11 @@ fn preflight_impact_snapshot(
         .chain(snapshot.sites.iter().map(|_| ()))
         .chain(snapshot.edges.iter().map(|_| ()))
     {
-        if cancellation.is_cancelled() {
-            return Err(DepgraphServiceError::Cancelled);
-        }
+        phase_step(&mut work, scan_maximum, is_cancelled)?;
     }
+    let mut evidence_per_owner = BTreeMap::<(&str, &str), usize>::new();
     for evidence in &snapshot.evidence {
-        if cancellation.is_cancelled() {
-            return Err(DepgraphServiceError::Cancelled);
-        }
+        phase_step(&mut work, scan_maximum, is_cancelled)?;
         if matches!(evidence.owner_type.as_str(), "edge" | "site") {
             let count = evidence_per_owner
                 .entry((evidence.owner_type.as_str(), evidence.owner_id.as_str()))
@@ -1048,8 +1070,9 @@ fn preflight_impact_snapshot(
     Ok(())
 }
 
-/// The fixed snapshot scan ceiling of cycle and unresolved listing was hit.
-/// No request argument widens it (Issues #617 / #618).
+/// The fixed snapshot scan ceiling of cycle and unresolved listing, or of the
+/// impact preflight, was hit. No request argument widens it (Issues #617 /
+/// #618 / #620).
 fn snapshot_scan_limit(maximum: usize) -> DepgraphServiceError {
     DepgraphServiceError::resource_limit(
         DepgraphResourceLimit::PreprocessingWorkItems,
@@ -3048,6 +3071,215 @@ mod tests {
                 maximum: 500,
                 observed: Some(500),
             })
+        ));
+    }
+
+    /// Three files where `c` reaches `a` through `b` over runtime edges
+    /// observed in `session-1`.
+    fn issue_620_impact_snapshot() -> GraphSnapshot {
+        let file = |id: &str, path: &str| NodeRecord {
+            id: id.to_owned(),
+            kind: "file".to_owned(),
+            locator: format!("file:{path}"),
+            display_name: path.to_owned(),
+            properties: json!({"path": path}),
+        };
+        let edge = |id: &str, source: &str, target: &str| EdgeRecord {
+            id: id.to_owned(),
+            site_id: None,
+            source: source.to_owned(),
+            target: target.to_owned(),
+            kind: "calls".to_owned(),
+            phase: "runtime".to_owned(),
+            environment: "host".to_owned(),
+            profile_id: "fixture:profile".to_owned(),
+            resolution_status: "resolved".to_owned(),
+            precision: "exact".to_owned(),
+            condition: json!({"op":"all","conditions":[]}),
+            generated: false,
+        };
+        let evidence = |owner_id: &str, path: &str| EvidenceRecord {
+            owner_type: "edge".to_owned(),
+            owner_id: owner_id.to_owned(),
+            ordinal: 0,
+            kind: "runtime".to_owned(),
+            extractor: "runtime-trace".to_owned(),
+            extractor_version: "1.0".to_owned(),
+            path: path.to_owned(),
+            start_line: 1,
+            start_column: 1,
+            end_line: 1,
+            end_column: 2,
+            detail: None,
+            properties: json!({"session_id": "session-1", "count": 1}),
+        };
+        let mut snapshot = cycle_snapshot(0, 0);
+        snapshot.nodes = vec![
+            file("file:a", "src/a.rs"),
+            file("file:b", "src/b.rs"),
+            file("file:c", "src/c.rs"),
+        ];
+        snapshot.edges = vec![
+            edge("edge:b-a", "file:b", "file:a"),
+            edge("edge:c-b", "file:c", "file:b"),
+        ];
+        snapshot.evidence = vec![
+            evidence("edge:b-a", "src/b.rs"),
+            evidence("edge:c-b", "src/c.rs"),
+        ];
+        snapshot
+    }
+
+    /// Issue #620 left `impact` failing on a Rust HIR snapshot of
+    /// depgraph-cli itself: its preflight compared each record count with the
+    /// 1,000,000 request work budget, and the snapshot has 1,020,958 evidence
+    /// records. The edge adjacency and the runtime context index also counted
+    /// their snapshot-wide work against that budget. The generated snapshot
+    /// below exceeds it in all three; impact returns what it returns for the
+    /// same graph without the unrelated records.
+    #[test]
+    fn issue_620_impact_snapshot_wide_work_does_not_count_against_the_request_work()
+    -> DepgraphServiceResult<()> {
+        const UNRELATED_EVIDENCE: usize = 1_000_001;
+        const UNRELATED_EDGES: usize = 500_000;
+        let small = issue_620_impact_snapshot();
+        let mut large = small.clone();
+        // Records no traversal reaches; empty strings keep the fixture's
+        // memory proportional to the record count.
+        let unrelated_evidence = EvidenceRecord {
+            owner_type: "node".to_owned(),
+            owner_id: String::new(),
+            ordinal: 0,
+            kind: String::new(),
+            extractor: String::new(),
+            extractor_version: String::new(),
+            path: String::new(),
+            start_line: 0,
+            start_column: 0,
+            end_line: 0,
+            end_column: 0,
+            detail: None,
+            properties: serde_json::Value::Null,
+        };
+        large
+            .evidence
+            .extend(std::iter::repeat_n(unrelated_evidence, UNRELATED_EVIDENCE));
+        let unrelated_edge = EdgeRecord {
+            id: String::new(),
+            site_id: None,
+            source: String::new(),
+            target: String::new(),
+            kind: String::new(),
+            phase: String::new(),
+            environment: String::new(),
+            profile_id: String::new(),
+            resolution_status: String::new(),
+            precision: String::new(),
+            condition: serde_json::Value::Null,
+            generated: false,
+        };
+        large
+            .edges
+            .extend(std::iter::repeat_n(unrelated_edge, UNRELATED_EDGES));
+        // The removed preflight check, the unfiltered adjacency (one scan and
+        // one insertion per edge), and the runtime context index (one scan
+        // per evidence record) each exceed the request work budget.
+        assert!(large.evidence.len() > MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS);
+        assert!(large.edges.len() * 2 > MAX_GRAPH_SERVICE_PREPROCESSING_WORK_ITEMS);
+
+        let cancellation = CancellationToken::new();
+        let changed_set = GitChangedSet {
+            requested_ref: "main".to_owned(),
+            resolved_ref: "a".repeat(40),
+            merge_base: "a".repeat(40),
+            head: "b".repeat(40),
+            repository_prefix: String::new(),
+            changes: vec![crate::impact::GitChange {
+                status: "modified".to_owned(),
+                similarity: None,
+                old_path: Some("src/a.rs".to_owned()),
+                new_path: Some("src/a.rs".to_owned()),
+                sources: vec!["committed".to_owned()],
+            }],
+        };
+        let unfiltered = ImpactFilters::new(None, Vec::new(), Vec::new(), 100, 100)
+            .map_err(|_| DepgraphServiceError::InvalidInput)?;
+        let session = unfiltered
+            .clone()
+            .with_runtime_filters(Vec::new(), vec!["session-1".to_owned()], Vec::new())
+            .map_err(|_| DepgraphServiceError::InvalidInput)?;
+        preflight_impact_snapshot(&large, &cancellation)?;
+        for filters in [&unfiltered, &session] {
+            for changed in [None, Some(&changed_set)] {
+                let expected =
+                    impact_on_snapshot(&small, "id:file:a", changed, filters, &cancellation)?;
+                let actual =
+                    impact_on_snapshot(&large, "id:file:a", changed, filters, &cancellation)?;
+                assert_eq!(
+                    expected
+                        .impacts
+                        .iter()
+                        .map(|impact| (impact.node.id.as_str(), impact.depth))
+                        .collect::<Vec<_>>(),
+                    [("file:a", 0), ("file:b", 1), ("file:c", 2)]
+                );
+                assert_eq!(
+                    serde_json::to_value(&actual).map_err(|_| DepgraphServiceError::Integrity)?,
+                    serde_json::to_value(&expected).map_err(|_| DepgraphServiceError::Integrity)?
+                );
+            }
+            let expected =
+                changed_set_impact_on_snapshot(&small, &changed_set, filters, &cancellation)?;
+            let actual =
+                changed_set_impact_on_snapshot(&large, &changed_set, filters, &cancellation)?;
+            assert_eq!(expected.impacts.len(), 3);
+            assert_eq!(
+                serde_json::to_value(&actual).map_err(|_| DepgraphServiceError::Integrity)?,
+                serde_json::to_value(&expected).map_err(|_| DepgraphServiceError::Integrity)?
+            );
+        }
+
+        // The preflight visits every node, site, edge, and evidence record
+        // once against the fixed snapshot scan ceiling, exactly.
+        let scans =
+            large.nodes.len() + large.sites.len() + large.edges.len() + large.evidence.len();
+        preflight_impact_snapshot_with_budget(&large, scans, &mut || false)?;
+        assert!(matches!(
+            preflight_impact_snapshot_with_budget(&large, scans - 1, &mut || false),
+            Err(DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::PreprocessingWorkItems,
+                maximum,
+                observed: None,
+            }) if maximum == saturating_u64(scans - 1)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn issue_620_impact_preflight_keeps_the_per_owner_evidence_bound_and_cancellation() {
+        let mut snapshot = issue_620_impact_snapshot();
+        let first = snapshot.evidence[0].clone();
+        snapshot.evidence = (0..MAX_UNRESOLVED_EVIDENCE_PER_SITE)
+            .map(|ordinal| EvidenceRecord {
+                ordinal: ordinal as i64,
+                ..first.clone()
+            })
+            .collect();
+        assert!(
+            preflight_impact_snapshot_with_budget(&snapshot, usize::MAX, &mut || false).is_ok()
+        );
+        snapshot.evidence.push(first);
+        assert!(matches!(
+            preflight_impact_snapshot_with_budget(&snapshot, usize::MAX, &mut || false),
+            Err(DepgraphServiceError::ResourceExhausted)
+        ));
+        let mut polls = 0;
+        assert!(matches!(
+            preflight_impact_snapshot_with_budget(&snapshot, usize::MAX, &mut || {
+                polls += 1;
+                polls > 4
+            }),
+            Err(DepgraphServiceError::Cancelled)
         ));
     }
 }
