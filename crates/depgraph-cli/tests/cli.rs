@@ -1924,7 +1924,7 @@ fn runtime_import_is_atomic_deduplicated_queryable_and_deterministic() {
             "runtime-malformed.json",
         ])
         .assert()
-        .failure();
+        .code(2);
     let store = depgraph_store::Store::open(&store_path).unwrap();
     assert_eq!(store.current_snapshot_id().unwrap(), current_before_failure);
     assert_eq!(
@@ -2100,7 +2100,7 @@ fn runtime_validate_rejects_malformed_and_secret_input_with_bounded_errors() {
             "runtime-trace-v1.golden.json",
         ])
         .assert()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains("read-only"));
     assert!(!unopened_store_path.exists());
 }
@@ -3511,7 +3511,7 @@ fn writer_commands_respect_the_store_writer_lock() {
             root.path().to_str().unwrap(),
         ])
         .assert()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "another store writer is already running for store",
         ));
@@ -3527,7 +3527,7 @@ fn writer_commands_respect_the_store_writer_lock() {
             "locked",
         ])
         .assert()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "another store writer is already running for store",
         ));
@@ -3543,7 +3543,7 @@ fn writer_commands_respect_the_store_writer_lock() {
             "--allow-project-code",
         ])
         .assert()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "another store writer is already running for store",
         ));
@@ -4519,7 +4519,7 @@ fn resolve_missing_web_build_plan_prints_a_copyable_template() {
             "--allow-project-code",
         ])
         .assert()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "package.json has no versioned depgraph.build execution plan",
         ))
@@ -5356,7 +5356,7 @@ fn failed_attempt_keeps_partial_graph_without_replacing_latest_success() {
             "json",
         ])
         .assert()
-        .failure();
+        .code(2);
     for all in [false, true] {
         let mut command = Command::cargo_bin("depgraph").unwrap();
         command.args([
@@ -7252,7 +7252,6 @@ fn mcp_setup_rejects_an_old_node_before_downloading_or_scanning() {
     let fixture = McpSetupNodeFixture::new(true, "v22.23.2");
     fixture
         .setup()
-        .failure()
         .code(3)
         .stderr(predicate::str::contains(
             "MCP setup cannot create a safe snapshot",
@@ -7272,7 +7271,7 @@ fn mcp_setup_does_not_require_node_without_package_json() {
     let fixture = McpSetupNodeFixture::new(false, "v22.23.2");
     fixture
         .setup()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains("Node.js").not())
         .stderr(predicate::str::contains("curl"));
 }
@@ -7283,7 +7282,7 @@ fn mcp_setup_accepts_a_satisfying_node_and_continues() {
     let fixture = McpSetupNodeFixture::new(true, "v24.1.0");
     fixture
         .setup()
-        .failure()
+        .code(3)
         .stderr(predicate::str::contains(
             "TypeScript/JavaScript analysis will use Node.js v24.1.0",
         ))
@@ -8858,7 +8857,7 @@ fn issue_623_rollup_symbols_groups_the_semantic_edges_by_file() {
             "symbols",
         ])
         .assert()
-        .failure()
+        .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
 }
 
