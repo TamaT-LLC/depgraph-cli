@@ -37,7 +37,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.7.2";
+const STABLE_RELEASE_VERSION: &str = "0.7.3";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.7";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -191,7 +191,7 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.2";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.3";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
@@ -7618,7 +7618,7 @@ jobs:
     #[test]
     fn native_smoke_pins_match_recorded_native_observations() {
         let evidence: Value = serde_json::from_str(include_str!(
-            "../fixtures/native-smoke-v0.7.2-observations.json"
+            "../fixtures/native-smoke-v0.7.3-observations.json"
         ))
         .unwrap();
         assert_eq!(evidence["version"], VERSION);
