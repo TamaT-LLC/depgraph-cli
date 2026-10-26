@@ -274,8 +274,8 @@ jobs:
           fi
           deadline="$((SECONDS + 600))"
           while true; do
-            runs="$(gh run list --workflow dependabot-auto-merge.yml --commit "$EXPECTED_HEAD" --event pull_request_target --limit 20 --json databaseId,status,headSha)"
-            selection="$(jq -r --arg head "$EXPECTED_HEAD" '[.[] | select(.headSha == $head)] | sort_by(.databaseId) | reverse | .[0] // empty | [.databaseId, .status] | @tsv' <<<"$runs")"
+            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/dependabot-auto-merge.yml/runs?event=pull_request_target&per_page=100")"
+            selection="$(jq -r --arg head "$EXPECTED_HEAD" --argjson pr "$pr_number" '[.workflow_runs[] | select(.head_sha == $head and any(.pull_requests[]?; .number == $pr))] | sort_by(.id) | reverse | .[0] // empty | [.id, .status] | @tsv' <<<"$runs")"
             if [[ -n "$selection" ]]; then
               run_id="${selection%%$'\t'*}"
               status="${selection#*$'\t'}"

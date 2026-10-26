@@ -88,8 +88,8 @@ checks out the repository or runs a repository script. The classification job
 runs only when `github.actor` and the pull request author are both
 `dependabot[bot]`. The `eligible` job succeeds only for a semver patch or semver minor update.
 After the CI workflow succeeds for a same-repository pull
-request, the merge job waits until the classification run for that head is
-completed, then reads the eligible job conclusion. It squash-merges with
+request, the merge job waits until a classification run with that pull
+request number and head SHA is completed, then reads the eligible job conclusion. It squash-merges with
 `PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge` and an installation
 token for the TamaT-LLC installation only when the open pull
 request author is `dependabot[bot]`, every commit author login is
