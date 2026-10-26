@@ -12,7 +12,6 @@ use depgraph_core::{
     QueryDiagnostic, QueryFailureClass, RepositoryFileError, SelectorFailureKind,
     service::{CyclesResult, DependenciesResult, ImpactServiceResult, UnresolvedServiceResult},
 };
-use rmcp::model::CallToolResult;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -140,17 +139,36 @@ public_page_item!(
 impl<T: PublicPageItem> private::Sealed for Page<T> {}
 impl<T: PublicPageItem> PublicToolResult for Page<T> {}
 
-/// Canonical MCP result plus the exact byte count of its public JSON payload.
+/// Canonical tool result plus the exact byte count of its public JSON payload.
+///
+/// The value is transport-neutral: the MCP adapter turns it into a tool result
+/// whose structured content is `structured_content`, whose sole content block
+/// is the text `text`, and whose error flag is `is_error`.
 #[derive(Clone, Debug)]
 pub struct MappedToolResult {
-    result: CallToolResult,
+    structured_content: Value,
+    text: String,
+    is_error: bool,
     output_bytes: usize,
 }
 
 impl MappedToolResult {
+    /// Redacted public JSON value carried as the structured content.
     #[must_use]
-    pub const fn result(&self) -> &CallToolResult {
-        &self.result
+    pub const fn structured_content(&self) -> &Value {
+        &self.structured_content
+    }
+
+    /// Canonical JSON text of `structured_content`, carried as the sole text
+    /// content block.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        self.is_error
     }
 
     #[must_use]
@@ -158,9 +176,10 @@ impl MappedToolResult {
         self.output_bytes
     }
 
+    /// Splits the result into structured content, text, and the error flag.
     #[must_use]
-    pub fn into_result(self) -> CallToolResult {
-        self.result
+    pub fn into_parts(self) -> (Value, String, bool) {
+        (self.structured_content, self.text, self.is_error)
     }
 }
 
@@ -262,11 +281,10 @@ where
     }
     let text = String::from_utf8(canonical.clone())
         .expect("canonical JSON generated from a serde_json::Value is UTF-8");
-    let mut result = CallToolResult::structured(value);
-    result.content = vec![rmcp::model::ContentBlock::text(text)];
-    result.is_error = Some(is_error);
     Ok(MappedToolResult {
-        result,
+        structured_content: value,
+        text,
+        is_error,
         output_bytes: canonical.len(),
     })
 }
@@ -2525,7 +2543,7 @@ mod tests {
         ))
         .expect("accepted impact response maps");
         assert_eq!(exact_mapped.output_bytes(), exact_bytes as usize);
-        assert_eq!(exact_mapped.result().is_error, Some(false));
+        assert!(!exact_mapped.is_error());
 
         match wrapped_impact_response(&context, &items, exact_bytes - 1) {
             Ok(response) => {
@@ -2542,7 +2560,7 @@ mod tests {
                 ))
                 .expect("smaller impact response maps");
                 assert!(mapped.output_bytes() < exact_bytes as usize);
-                assert_eq!(mapped.result().is_error, Some(false));
+                assert!(!mapped.is_error());
             }
             Err(error) => assert_eq!(error.code(), AgentErrorCode::ResourceExhausted),
         }

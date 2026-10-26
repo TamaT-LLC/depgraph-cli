@@ -8,14 +8,14 @@ use std::{
 };
 
 use assert_cmd::Command as AssertCommand;
+use depgraph_agent_contract::{
+    AgentDaemonControlOutcome, AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation,
+    ErrorEnvelope, LogicalRepositoryId, SuccessEnvelope,
+};
 use depgraph_core::{
     CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement, DepgraphCapability,
     DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, build_compiler_pack,
     compiler_pack_host_target, read_compiler_pack_requirement, verify_compiler_pack,
-};
-use depgraph_mcp_tools::{
-    AgentDaemonControlOutcome, AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation,
-    ErrorEnvelope, LogicalRepositoryId, SuccessEnvelope,
 };
 use depgraph_operation::{
     CanonicalJson, JOURNAL_SCHEMA_VERSION, LeaseOwner, OperationJournal, OperationKind,
@@ -5344,7 +5344,7 @@ fn issue_312_scan_submit_is_quick_durable_recoverable_and_snapshot_naming_is_clo
     );
     let stored = stored.expect("completed operation must retain its result");
     let decoded = serde_json::from_str::<
-        depgraph_mcp_tools::SuccessEnvelope<depgraph_mcp_tools::AgentScanOutcomeV2>,
+        depgraph_agent_contract::SuccessEnvelope<depgraph_agent_contract::AgentScanOutcomeV2>,
     >(&stored);
     assert!(
         decoded.is_ok(),
@@ -6665,7 +6665,7 @@ fn issue_310_operation_baseline_recovers_across_processes_and_reauthorizes_cance
         .unwrap();
     drop(journal);
 
-    let operation_arguments = |operation_id: &depgraph_mcp_tools::OperationId| {
+    let operation_arguments = |operation_id: &depgraph_agent_contract::OperationId| {
         json!({
             "contract_version": "depgraph-mcp-tools-v1",
             "repository_id": "repository",
@@ -7452,7 +7452,7 @@ fn issue_306_protocol_revisions_share_catalog_and_schema_valid_typed_errors() {
                 let expected_condition =
                     depgraph_core::query::render_condition(&issue_306_long_condition());
                 assert!(
-                    expected_condition.len() > depgraph_mcp_tools::MAX_AGENT_LABEL_BYTES,
+                    expected_condition.len() > depgraph_agent_contract::MAX_AGENT_LABEL_BYTES,
                     "fixture must cover the former label boundary"
                 );
                 let projected_condition = match tool_name {
@@ -8498,7 +8498,7 @@ fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
     };
     let legacy_context_digest = format!(
         "interactive-query-context:sha256:{}",
-        depgraph_mcp_tools::canonical_json_sha256(&json!({
+        depgraph_agent_contract::canonical_json_sha256(&json!({
             "contract_version": depgraph_core::INTERACTIVE_QUERY_PAGE_CONTRACT_VERSION,
             "command": "hotspots",
             "scan_id": cli_all["scan_id"],
@@ -8514,7 +8514,7 @@ fn issue_543_health_hotspots_result_filters_match_cli_and_bind_cursors() {
     );
     let legacy_cli_cursor = format!(
         "depgraph-query-cursor-v1.1.{}",
-        depgraph_mcp_tools::canonical_json_sha256(
+        depgraph_agent_contract::canonical_json_sha256(
             &json!({"context_digest": legacy_context_digest, "offset": 1})
         )
         .unwrap()

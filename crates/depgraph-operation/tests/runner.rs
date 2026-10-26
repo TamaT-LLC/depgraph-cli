@@ -7,6 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use depgraph_agent_contract::{
+    AgentExportOutcome, LogicalRepositoryId, SnapshotId, SuccessEnvelope,
+};
 use depgraph_core::{
     CancellationToken, DepgraphCapability, DepgraphCapabilitySet, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceLimits, GraphQueryFilter, SnapshotLocator,
@@ -15,7 +18,6 @@ use depgraph_core::{
         RepositoryRelativePath,
     },
 };
-use depgraph_mcp_tools::{AgentExportOutcome, LogicalRepositoryId, SnapshotId, SuccessEnvelope};
 use depgraph_operation::{
     CanonicalJson, DispatchOutcome, EXECUTION_STATE_UNKNOWN_ERROR_JSON, ExecutionControl,
     JournalDigest, LeaseOwner, OperationDispatcher, OperationJournal, OperationKind,
@@ -274,12 +276,12 @@ fn deferred_empty_scan_preserves_v2_coverage_and_snapshot_identity() {
         panic!("empty scan must still have a completed snapshot");
     };
     let source = completion.outcome();
-    let result = depgraph_mcp_tools::AgentScanOutcomeV2::try_from(source)
+    let result = depgraph_agent_contract::AgentScanOutcomeV2::try_from(source)
         .unwrap_or_else(|error| panic!("v2 conversion failed: {error:?}; {:?}", source.outcome()));
     let snapshot = SnapshotId::parse(source.completed_snapshot_id().unwrap().as_str()).unwrap();
     let envelope = SuccessEnvelope::new(repository(&config), Some(snapshot), result);
     let wire = serde_json::to_value(&envelope).unwrap();
-    let decoded: SuccessEnvelope<depgraph_mcp_tools::AgentScanOutcomeV2> =
+    let decoded: SuccessEnvelope<depgraph_agent_contract::AgentScanOutcomeV2> =
         serde_json::from_value(wire).unwrap();
     assert_eq!(
         decoded.snapshot_id(),
