@@ -14,6 +14,10 @@
 // pre-#463 path: at the default memory limit it provides the canonical graph
 // the package path must reproduce, at the reduced limit it fails.
 //
+// `DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS` selects `fanout`, `bigpkg`, or `all`
+// (the default). The two fixtures share nothing, so CI runs them as separate
+// jobs; each selection keeps every assertion of its fixture.
+//
 // Run after `cargo xtask build`; no project code or package manager is run.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -28,6 +32,12 @@ import { assertValidCheckpointReuse, checkpointedUnitIds } from "./analysis-chec
 const workspace = path.resolve(import.meta.dirname, "..");
 const executableSuffix = process.platform === "win32" ? ".exe" : "";
 const cli = path.resolve(process.env.DEPGRAPH_BIN ?? path.join(workspace, `target/debug/depgraph${executableSuffix}`));
+const SCENARIO_SELECTIONS = { all: ["fanout", "bigpkg"], fanout: ["fanout"], bigpkg: ["bigpkg"] };
+const scenarioSelection = process.env.DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS || "all";
+if (!Object.hasOwn(SCENARIO_SELECTIONS, scenarioSelection)) {
+  throw new Error(`DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS must be one of ${Object.keys(SCENARIO_SELECTIONS).join(", ")}, got ${JSON.stringify(scenarioSelection)}`);
+}
+const selectedScenarios = SCENARIO_SELECTIONS[scenarioSelection];
 const parent = mkdtempSync(path.join(tmpdir(), "depgraph-go-loader-scope-e2e-"));
 const MIB = 1024 * 1024;
 // Reduced from the 6 GiB default; identical for the control and the package
@@ -598,6 +608,7 @@ function stageSummary(outcome) {
 const rows = [];
 const report = {
   contract_version: "depgraph-go-loader-scope-e2e-v1",
+  selected_scenarios: selectedScenarios,
   reduced_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES,
   fixtures: {
     fanout: {
@@ -653,10 +664,37 @@ function controlScenarios(name, root, control) {
 let passed = false;
 try {
   const control = makeControlWorker();
+  const summary = [];
+  if (selectedScenarios.includes("fanout")) summary.push(fanoutScenarios(control));
+  if (selectedScenarios.includes("bigpkg")) summary.push(bigPackageScenarios(control));
+  report.summary = `at ${mib(REDUCED_WORKER_MEMORY_BYTES)} MiB per unit the module-loader control fails; `
+    + `${summary.join("; ")}; `
+    + "nodes/sites/exact edges match the module-loader control; CHA may_call is a declared subset";
+  passed = true;
+} catch (error) {
+  report.failure = error instanceof Error ? error.message : String(error);
+  throw error;
+} finally {
+  // The table and the report are written on every path so a failed CI run
+  // keeps the per-unit evidence it was judged on.
+  report.passed = passed;
+  report.units = rows;
+  printUnitTable(rows);
+  if (report.summary) console.log(`go-loader-scope-e2e: ${report.summary}`);
+  if (process.env.DEPGRAPH_GO_LOADER_SCOPE_REPORT) {
+    writeFileSync(process.env.DEPGRAPH_GO_LOADER_SCOPE_REPORT, `${JSON.stringify(report, null, 2)}\n`);
+  }
+  console.log(JSON.stringify({ ...report, units: undefined }));
+  if (process.env.DEPGRAPH_GO_LOADER_SCOPE_KEEP_FIXTURE) {
+    console.error(`go loader scope fixture retained at ${parent}`);
+  } else {
+    rmSync(parent, { recursive: true, force: true });
+  }
+}
+
+function fanoutScenarios(control) {
   const fanoutRoot = path.join(parent, "fanout");
-  const bigRoot = path.join(parent, "bigpkg");
   writeFanoutFixture(fanoutRoot);
-  writeBigPackageFixture(bigRoot);
 
   // --- fan-out: module-loader control ------------------------------------
   // Even the small module exceeds the reduced limit whole: the module loader
@@ -709,6 +747,13 @@ try {
     assertSameCanonicalGraph(graph(fanoutStore), fanoutExpected, "fanout-stable-resume");
     record(stable, { canonical_graph_equal_to_control: true });
   }
+  return `fan-out ${FANOUT_PACKAGES} packages (whole-module peak ${mib(fanoutWholePeak)} MiB) `
+    + `in ${fanoutTypedBatches.length} typed batches peak at ${mib(fanoutPackagePeak)} MiB`;
+}
+
+function bigPackageScenarios(control) {
+  const bigRoot = path.join(parent, "bigpkg");
+  writeBigPackageFixture(bigRoot);
 
   // --- big package: module-loader control ---------------------------------
   const { expected: bigExpected, wholeModulePeak } = controlScenarios("bigpkg", bigRoot, control);
@@ -763,30 +808,6 @@ try {
     assertSameCanonicalGraph(graph(bigStore), bigExpected, "bigpkg-stable-resume");
     record(stable, { canonical_graph_equal_to_control: true });
   }
-
-  report.summary = `at ${mib(REDUCED_WORKER_MEMORY_BYTES)} MiB per unit the module-loader control fails `
-    + `(${BIG_PACKAGE_FILES}-file package whole-module peak ${mib(wholeModulePeak)} MiB, fan-out ${mib(fanoutWholePeak)} MiB); `
-    + `${typedBatches} typed + ${semanticBatches} semantic staged package batches peak at ${mib(packagePeak)} MiB and complete; `
-    + `fan-out ${FANOUT_PACKAGES} packages in ${fanoutTypedBatches.length} typed batches peak at ${mib(fanoutPackagePeak)} MiB; `
-    + "nodes/sites/exact edges match the module-loader control; CHA may_call is a declared subset";
-  passed = true;
-} catch (error) {
-  report.failure = error instanceof Error ? error.message : String(error);
-  throw error;
-} finally {
-  // The table and the report are written on every path so a failed CI run
-  // keeps the per-unit evidence it was judged on.
-  report.passed = passed;
-  report.units = rows;
-  printUnitTable(rows);
-  if (report.summary) console.log(`go-loader-scope-e2e: ${report.summary}`);
-  if (process.env.DEPGRAPH_GO_LOADER_SCOPE_REPORT) {
-    writeFileSync(process.env.DEPGRAPH_GO_LOADER_SCOPE_REPORT, `${JSON.stringify(report, null, 2)}\n`);
-  }
-  console.log(JSON.stringify({ ...report, units: undefined }));
-  if (process.env.DEPGRAPH_GO_LOADER_SCOPE_KEEP_FIXTURE) {
-    console.error(`go loader scope fixture retained at ${parent}`);
-  } else {
-    rmSync(parent, { recursive: true, force: true });
-  }
+  return `${BIG_PACKAGE_FILES}-file package (whole-module peak ${mib(wholeModulePeak)} MiB) in `
+    + `${typedBatches} typed + ${semanticBatches} semantic staged package batches peak at ${mib(packagePeak)} MiB and complete`;
 }
