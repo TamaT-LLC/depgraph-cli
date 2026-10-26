@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::{
+use super::{
     PublicReadinessDecision, PublicReadinessToolIdentity, canonical_public_readiness_digest,
 };
 

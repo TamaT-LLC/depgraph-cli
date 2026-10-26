@@ -3786,6 +3786,7 @@ name = "xtask"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "depgraph-agent-contract",
  "depgraph-core",
@@ -3794,6 +3795,7 @@ dependencies = [
  "depgraph-store",
  "flate2",
  "hex",
+ "jsonschema",
  "rusqlite",
  "same-file",
  "serde",

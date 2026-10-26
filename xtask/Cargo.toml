@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 depgraph-agent-contract = { path = "../crates/depgraph-agent-contract" }
 depgraph-core = { path = "../crates/depgraph-core" }
@@ -28,3 +29,6 @@ toml.workspace = true
 walkdir.workspace = true
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 workspace-hack = { version = "0.7", path = "../workspace-hack" }
+
+[dev-dependencies]
+jsonschema = { version = "0.47", default-features = false }
