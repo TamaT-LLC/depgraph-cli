@@ -16,7 +16,7 @@ fn run(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
         return Err("usage: generate-schema [OUTPUT]".to_owned());
     }
 
-    let bytes = depgraph_mcp_tools::canonical_schema_bytes();
+    let bytes = depgraph_agent_contract::canonical_schema_bytes();
     if let Some(output) = output {
         fs::write(&output, bytes)
             .map_err(|error| format!("failed to write {}: {error}", output.display()))

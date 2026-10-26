@@ -1,9 +1,9 @@
 use std::path::Path;
 
+use depgraph_agent_contract::LogicalRepositoryId;
 use depgraph_core::{
     DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits,
 };
-use depgraph_mcp_tools::LogicalRepositoryId;
 use depgraph_operation::{
     CancelOutcome, CanonicalJson, JournalError, LeaseOwner, OperationJournal, OperationKind,
     OperationManager, OperationOutcome, OperationStatus, SubmitRequest, operation_journal_path,

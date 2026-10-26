@@ -4,6 +4,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use depgraph_agent_contract::{
+    AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
+    AgentDaemonControlPhase, AgentError, AgentErrorCode, AgentExportOutcome,
+    AgentGraphExportFormat, AgentRemediation, AgentRuntimeOutcome, AgentRuntimeStatus,
+    AgentScanOutcome, AgentScanOutcomeV2, ErrorEnvelope, LogicalRepositoryId, OperationId,
+    SnapshotId, SuccessEnvelope,
+};
 use depgraph_core::{
     CancellationToken, CompilerPackRequirement, DepgraphCapability, DepgraphService,
     DepgraphServiceConfig, DepgraphServiceError, GraphQueryFilter, ScanCacheMode, StoreLockGuard,
@@ -15,13 +22,6 @@ use depgraph_core::{
         RepositoryRelativePath, ResolveBuildRequest, RuntimeValidateRequest, ScanRequest,
         ServiceSnapshotSelector, SnapshotLocator,
     },
-};
-use depgraph_mcp_tools::{
-    AgentBuildOutcome, AgentDaemonControlAction, AgentDaemonControlOutcome,
-    AgentDaemonControlPhase, AgentError, AgentErrorCode, AgentExportOutcome,
-    AgentGraphExportFormat, AgentRemediation, AgentRuntimeOutcome, AgentRuntimeStatus,
-    AgentScanOutcome, AgentScanOutcomeV2, ErrorEnvelope, LogicalRepositoryId, OperationId,
-    SnapshotId, SuccessEnvelope,
 };
 
 use crate::{

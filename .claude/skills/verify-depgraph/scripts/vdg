@@ -36,7 +36,7 @@ WEB_WORKER="$REPO_ROOT/workers/web/dist/worker.mjs"
 REAL_HOME="${VDG_REAL_HOME:-$HOME}"
 # Sources compiled into each binary doctor checks for staleness (path deps of the crate).
 CLI_SOURCES=(crates/depgraph-cli crates/depgraph-core crates/depgraph-store crates/depgraph-protocol
-  crates/depgraph-operation crates/depgraph-mcp-tools)
+  crates/depgraph-operation crates/depgraph-agent-contract)
 RUST_WORKER_SOURCES=(workers/rust crates/depgraph-protocol)
 # Both binaries belong to the root Cargo workspace (workers/rust is a member, no own
 # Cargo.lock), so the root manifest, lockfile and workspace-hack feed into each of them.
