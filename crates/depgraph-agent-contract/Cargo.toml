@@ -1,5 +1,5 @@
 [package]
-name = "depgraph-mcp-tools"
+name = "depgraph-agent-contract"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,6 @@ depgraph-core = { path = "../depgraph-core" }
 depgraph-protocol = { path = "../depgraph-protocol" }
 depgraph-store = { path = "../depgraph-store" }
 hex.workspace = true
-rmcp = { version = "=3.1.0", default-features = false }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

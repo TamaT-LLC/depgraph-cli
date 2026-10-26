@@ -10,14 +10,14 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use depgraph_core::{
-    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, compiler_pack_host_target,
-    read_compiler_pack_requirement, verify_compiler_pack,
-};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentContext, AgentHostCapabilityProfile, AgentHostFormat, MCP_PROTOCOL_REVISION, MCP_SDK_NAME,
     MCP_SDK_VERSION, MCP_TOOLS_CONTRACT_VERSION, SuccessEnvelope, ToolCatalog,
     agent_host_launch_arguments, render_agent_host_configuration,
+};
+use depgraph_core::{
+    DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, compiler_pack_host_target,
+    read_compiler_pack_requirement, verify_compiler_pack,
 };
 use depgraph_store::Store;
 use serde::Deserialize;

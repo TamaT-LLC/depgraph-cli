@@ -1,6 +1,6 @@
 use std::{path::Path, process::Command};
 
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentArtifactId, AgentContext, AgentError, AgentLocator, AgentNode, AgentNodeSummary,
     AgentOperation, AgentSourceSpan, MCP_TOOLS_SCHEMA_ID, Page, RepositoryRelativePath,
     STANDARD_JSON_SCHEMA_FORMATS, TaskAccepted, agent_scan_outcome_v2_schema, canonical_json_bytes,
@@ -310,7 +310,7 @@ fn issue_316_shared_schema_closes_build_outcome_and_host_risk() {
     }
     assert_eq!(
         definitions["AgentBuildOutcome"]["properties"]["mutation_diagnostics"]["maxItems"],
-        depgraph_mcp_tools::MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS
+        depgraph_agent_contract::MAX_AGENT_BUILD_MUTATION_DIAGNOSTICS
     );
     assert!(
         definitions["AgentBuildOutcome"]["properties"]["snapshot_id"]["anyOf"]
@@ -388,7 +388,7 @@ fn issue_305_schema_closes_artifact_enums_scalars_and_collection_bounds() {
         ("AgentPolicyText", 4_096_u64),
         (
             "AgentGraphExportContent",
-            u64::from(depgraph_mcp_tools::MAX_PAGE_BYTES),
+            u64::from(depgraph_agent_contract::MAX_PAGE_BYTES),
         ),
     ] {
         assert_eq!(
@@ -1006,7 +1006,7 @@ fn schema_bytes_digest_checked_in_file_and_generation_policy_are_exact() {
 
     let parsed: Value = serde_json::from_slice(CHECKED_IN_SCHEMA).expect("checked-in schema JSON");
     assert_eq!(
-        depgraph_mcp_tools::canonical_json_bytes(&parsed).expect("re-canonicalize schema"),
+        depgraph_agent_contract::canonical_json_bytes(&parsed).expect("re-canonicalize schema"),
         CHECKED_IN_SCHEMA
     );
 }
