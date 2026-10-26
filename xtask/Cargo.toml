@@ -10,6 +10,7 @@ publish = false
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+depgraph-contract-scan = { path = "../crates/depgraph-contract-scan" }
 depgraph-core = { path = "../crates/depgraph-core" }
 depgraph-mcp-tools = { path = "../crates/depgraph-mcp-tools" }
 depgraph-operation = { path = "../crates/depgraph-operation" }

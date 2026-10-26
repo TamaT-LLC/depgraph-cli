@@ -536,12 +536,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "depgraph-contract-scan"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "depgraph-protocol",
+ "hex",
+ "petgraph",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "walkdir",
+ "workspace-hack",
+]
+
+[[package]]
 name = "depgraph-core"
 version = "0.7.3"
 dependencies = [
  "anyhow",
  "caseless",
  "chrono",
+ "depgraph-contract-scan",
  "depgraph-protocol",
  "depgraph-store",
  "directories",
@@ -552,8 +571,6 @@ dependencies = [
  "libc",
  "notify",
  "petgraph",
- "prost",
- "prost-types",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3740,6 +3757,7 @@ dependencies = [
  "aho-corasick",
  "bitflags",
  "bstr",
+ "bytes",
  "chrono",
  "crossbeam-utils",
  "crypto-common",
@@ -3793,6 +3811,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "depgraph-contract-scan",
  "depgraph-core",
  "depgraph-mcp-tools",
  "depgraph-operation",
