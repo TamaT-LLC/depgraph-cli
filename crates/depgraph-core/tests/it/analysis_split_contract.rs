@@ -32,7 +32,7 @@ use depgraph_core::{
 use serde_json::{Value, json};
 
 const SPLIT_PLAN_SCHEMA: &str =
-    include_str!("../../../schemas/depgraph-analysis-split-plan-v1.schema.json");
+    include_str!("../../../../schemas/depgraph-analysis-split-plan-v1.schema.json");
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/analysis-split-plan-v1")

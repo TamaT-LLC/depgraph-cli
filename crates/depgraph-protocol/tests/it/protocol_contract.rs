@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
-const GOLDEN: &str = include_str!("fixtures/protocol-v1.golden.ndjson");
+const GOLDEN: &str = include_str!("../fixtures/protocol-v1.golden.ndjson");
 
 #[test]
 fn golden_stream_contains_and_validates_all_nine_event_types() {
@@ -48,9 +48,9 @@ fn golden_stream_contains_and_validates_all_nine_event_types() {
 fn graph_event_retention_opt_out_observes_the_same_canonical_stream() {
     for fixture in [
         GOLDEN,
-        include_str!("fixtures/protocol-v1.semantic.golden.ndjson"),
-        include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson"),
-        include_str!("fixtures/protocol-v1.cross-language.golden.ndjson"),
+        include_str!("../fixtures/protocol-v1.semantic.golden.ndjson"),
+        include_str!("../fixtures/protocol-v1.rust-semantic.golden.ndjson"),
+        include_str!("../fixtures/protocol-v1.cross-language.golden.ndjson"),
     ] {
         let retained = validate_ndjson(Cursor::new(fixture)).expect("fixture validates");
         let mut validator = ProtocolValidator::new().without_graph_event_retention();

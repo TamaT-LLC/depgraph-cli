@@ -11,9 +11,10 @@ use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const SOURCE_GOLDEN: &str = include_str!("fixtures/protocol-v1.golden.ndjson");
-const SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.semantic.golden.ndjson");
-const RUST_SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson");
+const SOURCE_GOLDEN: &str = include_str!("../fixtures/protocol-v1.golden.ndjson");
+const SEMANTIC_GOLDEN: &str = include_str!("../fixtures/protocol-v1.semantic.golden.ndjson");
+const RUST_SEMANTIC_GOLDEN: &str =
+    include_str!("../fixtures/protocol-v1.rust-semantic.golden.ndjson");
 
 /// The fixture's events, with every site-linked edge given its site's
 /// evidence, as the Rust worker emits them.

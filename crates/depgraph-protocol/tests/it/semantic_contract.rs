@@ -8,11 +8,12 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::io::Cursor;
 
-const SOURCE_GOLDEN: &str = include_str!("fixtures/protocol-v1.golden.ndjson");
-const SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.semantic.golden.ndjson");
-const RUST_SEMANTIC_GOLDEN: &str = include_str!("fixtures/protocol-v1.rust-semantic.golden.ndjson");
+const SOURCE_GOLDEN: &str = include_str!("../fixtures/protocol-v1.golden.ndjson");
+const SEMANTIC_GOLDEN: &str = include_str!("../fixtures/protocol-v1.semantic.golden.ndjson");
+const RUST_SEMANTIC_GOLDEN: &str =
+    include_str!("../fixtures/protocol-v1.rust-semantic.golden.ndjson");
 const FRAMEWORK_SEMANTIC_GOLDEN: &str =
-    include_str!("fixtures/protocol-v1.framework-semantic.golden.ndjson");
+    include_str!("../fixtures/protocol-v1.framework-semantic.golden.ndjson");
 
 #[test]
 fn source_and_semantic_fixtures_remain_protocol_v1_compatible() {

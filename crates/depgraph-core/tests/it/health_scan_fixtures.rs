@@ -18,9 +18,9 @@ use depgraph_store::{GraphSnapshot, Store};
 use serde_json::{Value, json};
 use std::io::Cursor;
 
-const RUST_FIXTURE: &str = include_str!("fixtures/health/issue437-rust.ndjson");
-const GO_FIXTURE: &str = include_str!("fixtures/health/issue437-go.ndjson");
-const WEB_FIXTURE: &str = include_str!("fixtures/health/issue437-web.ndjson");
+const RUST_FIXTURE: &str = include_str!("../fixtures/health/issue437-rust.ndjson");
+const GO_FIXTURE: &str = include_str!("../fixtures/health/issue437-go.ndjson");
+const WEB_FIXTURE: &str = include_str!("../fixtures/health/issue437-web.ndjson");
 
 #[test]
 fn incomplete_analysis_units_cannot_confirm_unused_files_in_otherwise_complete_profiles()
