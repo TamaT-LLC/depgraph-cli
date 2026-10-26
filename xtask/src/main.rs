@@ -16,6 +16,7 @@ use walkdir::WalkDir;
 mod compiler_pack_release;
 mod e2e_profile;
 mod go_semantic_e2e;
+mod governance;
 mod mcp_package_smoke;
 mod project_metadata;
 mod release_verify_packaged;
@@ -99,11 +100,11 @@ const CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID: &str = "release:polyglot";
 const CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const MCP_SERVER_NAME: &str = "depgraph-mcp";
-const MCP_SDK_NAME: &str = depgraph_mcp_tools::MCP_SDK_NAME;
-const MCP_SDK_VERSION: &str = depgraph_mcp_tools::MCP_SDK_VERSION;
+const MCP_SDK_NAME: &str = depgraph_agent_contract::MCP_SDK_NAME;
+const MCP_SDK_VERSION: &str = depgraph_agent_contract::MCP_SDK_VERSION;
 const MCP_MACROS_VERSION: &str = "3.1.2";
-const MCP_PROTOCOL_REVISION: &str = depgraph_mcp_tools::MCP_PROTOCOL_REVISION;
-const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
+const MCP_PROTOCOL_REVISION: &str = depgraph_agent_contract::MCP_PROTOCOL_REVISION;
+const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_agent_contract::MCP_TOOLS_CONTRACT_VERSION;
 const MCP_OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const MCP_TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
 const MCP_TOOL_SCHEMA_BYTES: &[u8] =
@@ -1053,8 +1054,8 @@ fn main() -> Result<()> {
             output,
         } => public_readiness_verify(
             &bundle,
-            depgraph_core::PublicReadinessExpectedState {
-                repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+            governance::PublicReadinessExpectedState {
+                repository: governance::PUBLIC_READINESS_REPOSITORY.into(),
                 candidate_commit,
                 audited_refs_digest,
                 github_settings_digest,
@@ -3307,16 +3308,15 @@ fn prefixed_lowercase_sha256(value: &str, prefix: &str) -> bool {
 
 fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
     let desired_path = workspace_root().join(".github/settings-desired-v1.json");
-    let desired = depgraph_core::parse_github_settings_desired(
-        &fs::read(&desired_path).with_context(|| {
+    let desired =
+        governance::parse_github_settings_desired(&fs::read(&desired_path).with_context(|| {
             format!(
                 "failed to read canonical GitHub settings manifest {}",
                 desired_path.display()
             )
-        })?,
-    )
-    .context("canonical GitHub settings manifest is invalid")?;
-    let snapshot: depgraph_core::GitHubSettingsApiSnapshot =
+        })?)
+        .context("canonical GitHub settings manifest is invalid")?;
+    let snapshot: governance::GitHubSettingsApiSnapshot =
         serde_json::from_slice(&fs::read(snapshot_path).with_context(|| {
             format!(
                 "failed to read redacted GitHub settings snapshot {}",
@@ -3324,7 +3324,7 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
             )
         })?)
         .context("redacted GitHub settings snapshot does not satisfy its closed schema")?;
-    let evaluation = depgraph_core::evaluate_github_settings(&desired, &snapshot)?;
+    let evaluation = governance::evaluate_github_settings(&desired, &snapshot)?;
     fs::write(
         output,
         format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
@@ -3336,7 +3336,7 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
         )
     })?;
 
-    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+    if evaluation.decision == governance::PublicReadinessDecision::Reject {
         bail!(
             "GitHub settings verification rejected; redacted evaluation={}",
             output.display()
@@ -3351,10 +3351,10 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
 
 fn public_readiness_verify(
     bundle_path: &Path,
-    expected: depgraph_core::PublicReadinessExpectedState,
+    expected: governance::PublicReadinessExpectedState,
     output: &Path,
 ) -> Result<()> {
-    let bundle: depgraph_core::PublicReadinessBundle =
+    let bundle: governance::PublicReadinessBundle =
         serde_json::from_slice(&fs::read(bundle_path).with_context(|| {
             format!(
                 "failed to read public readiness bundle {}",
@@ -3362,7 +3362,7 @@ fn public_readiness_verify(
             )
         })?)
         .context("public readiness bundle does not satisfy its closed schema")?;
-    let evaluation = depgraph_core::evaluate_public_readiness(&bundle, &expected)?;
+    let evaluation = governance::evaluate_public_readiness(&bundle, &expected)?;
     fs::write(
         output,
         format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
@@ -3374,7 +3374,7 @@ fn public_readiness_verify(
         )
     })?;
 
-    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+    if evaluation.decision == governance::PublicReadinessDecision::Reject {
         bail!(
             "public readiness verification rejected; redacted evaluation={}",
             output.display()
@@ -6852,51 +6852,48 @@ jobs:
             } if snapshot == snapshot_path && output == output_path
         ));
 
-        let desired = depgraph_core::parse_github_settings_desired(include_bytes!(
+        let desired = crate::governance::parse_github_settings_desired(include_bytes!(
             "../../.github/settings-desired-v1.json"
         ))?;
-        let allow_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
-            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+        let allow_snapshot = crate::governance::GitHubSettingsApiSnapshot {
+            collection_status: crate::governance::GitHubSettingsCollectionStatus::Complete,
             settings: Some(desired.clone()),
         };
         fs::write(&snapshot_path, serde_json::to_vec(&allow_snapshot)?)?;
         github_settings_verify(&snapshot_path, &output_path)?;
-        let allow: depgraph_core::GitHubSettingsEvaluation =
+        let allow: crate::governance::GitHubSettingsEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             allow.decision,
-            depgraph_core::PublicReadinessDecision::Allow
+            crate::governance::PublicReadinessDecision::Allow
         );
         assert!(allow.drift.is_empty());
 
         let mut drifted = desired;
-        drifted.rulesets[0].enforcement = depgraph_core::GitHubRulesetEnforcement::Disabled;
-        let reject_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
-            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+        drifted.rulesets[0].enforcement = crate::governance::GitHubRulesetEnforcement::Disabled;
+        let reject_snapshot = crate::governance::GitHubSettingsApiSnapshot {
+            collection_status: crate::governance::GitHubSettingsCollectionStatus::Complete,
             settings: Some(drifted),
         };
         fs::write(&snapshot_path, serde_json::to_vec(&reject_snapshot)?)?;
         let error = github_settings_verify(&snapshot_path, &output_path).unwrap_err();
         assert!(error.to_string().contains("verification rejected"));
-        let reject: depgraph_core::GitHubSettingsEvaluation =
+        let reject: crate::governance::GitHubSettingsEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             reject.decision,
-            depgraph_core::PublicReadinessDecision::Reject
+            crate::governance::PublicReadinessDecision::Reject
         );
         assert!(
-            reject
-                .drift
-                .iter()
-                .any(|drift| drift.reason
-                    == depgraph_core::GitHubSettingsDriftReason::RulesetDisabled)
+            reject.drift.iter().any(|drift| drift.reason
+                == crate::governance::GitHubSettingsDriftReason::RulesetDisabled)
         );
         Ok(())
     }
 
     fn public_readiness_fixture() -> (
-        depgraph_core::PublicReadinessBundle,
-        depgraph_core::PublicReadinessExpectedState,
+        crate::governance::PublicReadinessBundle,
+        crate::governance::PublicReadinessExpectedState,
     ) {
         const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
         const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -6904,9 +6901,9 @@ jobs:
         const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-        let mut manifest = depgraph_core::PublicReadinessEvidenceManifest {
-            schema_version: depgraph_core::PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION.into(),
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let mut manifest = crate::governance::PublicReadinessEvidenceManifest {
+            schema_version: crate::governance::PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION.into(),
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -6915,12 +6912,12 @@ jobs:
             generated_at: "2026-07-26T00:02:00Z".into(),
             evidence: Vec::new(),
         };
-        let input_digest = depgraph_core::public_readiness_evidence_input_digest(&manifest);
-        manifest.evidence = depgraph_core::PUBLIC_READINESS_GATE_IDS
+        let input_digest = crate::governance::public_readiness_evidence_input_digest(&manifest);
+        manifest.evidence = crate::governance::PUBLIC_READINESS_GATE_IDS
             .iter()
             .enumerate()
             .map(|(index, gate_id)| {
-                let mut evidence = depgraph_core::PublicReadinessEvidence {
+                let mut evidence = crate::governance::PublicReadinessEvidence {
                     gate_id: (*gate_id).into(),
                     evidence_digest: String::new(),
                     input_digest: input_digest.clone(),
@@ -6930,30 +6927,30 @@ jobs:
                     producer_identity: "team:readiness-producers".into(),
                     approver_role: "independent-code-reviewer".into(),
                     approver_identity: "team:readiness-gate-reviewers".into(),
-                    tool: depgraph_core::PublicReadinessToolIdentity {
+                    tool: crate::governance::PublicReadinessToolIdentity {
                         name: "readiness-auditor".into(),
                         version: "1.0.0".into(),
                         acquisition_digest: HASH_B.into(),
                         configuration_digest: HASH_C.into(),
                     },
-                    findings: depgraph_core::PublicReadinessFindingSummary {
+                    findings: crate::governance::PublicReadinessFindingSummary {
                         resolved: 0,
                         unresolved: 0,
                     },
                 };
                 evidence.evidence_digest =
-                    depgraph_core::public_readiness_evidence_digest(&evidence).unwrap();
+                    crate::governance::public_readiness_evidence_digest(&evidence).unwrap();
                 evidence
             })
             .collect();
         let evidence_manifest_digest =
-            depgraph_core::canonical_public_readiness_digest(&manifest).unwrap();
+            crate::governance::canonical_public_readiness_digest(&manifest).unwrap();
         let gates = manifest
             .evidence
             .iter()
-            .map(|evidence| depgraph_core::PublicReadinessGate {
+            .map(|evidence| crate::governance::PublicReadinessGate {
                 id: evidence.gate_id.clone(),
-                decision: depgraph_core::PublicReadinessDecision::Allow,
+                decision: crate::governance::PublicReadinessDecision::Allow,
                 evidence_digest: evidence.evidence_digest.clone(),
                 producer_role: evidence.producer_role.clone(),
                 producer_identity: evidence.producer_identity.clone(),
@@ -6961,9 +6958,9 @@ jobs:
                 approver_identity: evidence.approver_identity.clone(),
             })
             .collect();
-        let mut record = depgraph_core::PublicReadinessRecord {
-            schema_version: depgraph_core::PUBLIC_READINESS_SCHEMA_VERSION.into(),
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let mut record = crate::governance::PublicReadinessRecord {
+            schema_version: crate::governance::PUBLIC_READINESS_SCHEMA_VERSION.into(),
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -6971,12 +6968,12 @@ jobs:
             release_gate_digest: HASH_D.into(),
             evidence_manifest_digest,
             gates,
-            decision: depgraph_core::PublicReadinessDecision::Allow,
+            decision: crate::governance::PublicReadinessDecision::Allow,
             decided_at: "2026-07-26T00:04:00Z".into(),
             accountable_role: "tamat-llc-organization-owner".into(),
-            approvals: depgraph_core::PUBLIC_READINESS_FINAL_APPROVAL_ROLES
+            approvals: crate::governance::PUBLIC_READINESS_FINAL_APPROVAL_ROLES
                 .iter()
-                .map(|role| depgraph_core::PublicReadinessApproval {
+                .map(|role| crate::governance::PublicReadinessApproval {
                     role: (*role).into(),
                     identity: format!("team:{role}s"),
                     approved_at: "2026-07-26T00:03:00Z".into(),
@@ -6988,7 +6985,7 @@ jobs:
             .approvals
             .iter()
             .map(|approval| {
-                depgraph_core::public_readiness_approval_statement_digest(
+                crate::governance::public_readiness_approval_statement_digest(
                     &record,
                     &approval.role,
                     &approval.identity,
@@ -6998,8 +6995,8 @@ jobs:
         for (approval, statement_digest) in record.approvals.iter_mut().zip(statement_digests) {
             approval.statement_digest = statement_digest;
         }
-        let expected = depgraph_core::PublicReadinessExpectedState {
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let expected = crate::governance::PublicReadinessExpectedState {
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -7007,7 +7004,7 @@ jobs:
             release_gate_digest: HASH_D.into(),
         };
         (
-            depgraph_core::PublicReadinessBundle {
+            crate::governance::PublicReadinessBundle {
                 record,
                 evidence_manifest: manifest,
             },
@@ -7047,11 +7044,11 @@ jobs:
         ));
 
         public_readiness_verify(&bundle_path, expected.clone(), &output_path)?;
-        let allow: depgraph_core::PublicReadinessEvaluation =
+        let allow: crate::governance::PublicReadinessEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             allow.decision,
-            depgraph_core::PublicReadinessDecision::Allow
+            crate::governance::PublicReadinessDecision::Allow
         );
         assert!(allow.reasons.is_empty());
 
@@ -7060,16 +7057,16 @@ jobs:
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
         let error = public_readiness_verify(&bundle_path, stale, &output_path).unwrap_err();
         assert!(error.to_string().contains("verification rejected"));
-        let reject: depgraph_core::PublicReadinessEvaluation =
+        let reject: crate::governance::PublicReadinessEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             reject.decision,
-            depgraph_core::PublicReadinessDecision::Reject
+            crate::governance::PublicReadinessDecision::Reject
         );
         assert!(
             reject
                 .reasons
-                .contains(&depgraph_core::PublicReadinessRejectionReason::CandidateStateStale)
+                .contains(&crate::governance::PublicReadinessRejectionReason::CandidateStateStale)
         );
         Ok(())
     }

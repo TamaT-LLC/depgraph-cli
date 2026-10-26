@@ -11,16 +11,16 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use depgraph_core::{
-    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement, DepgraphCapability,
-    DepgraphCapabilitySet, FindingIdentity, FindingKind, build_compiler_pack,
-    compiler_pack_host_target, finding_id, verify_compiler_pack,
-};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AGENT_HOST_CONFIG_CONTRACT_VERSION, AgentContext, AgentDependenciesResponse,
     AgentHealthFindingsPage, AgentHostCapabilityProfile, AgentHostFormat, OperationId,
     PortableTerminalOutputContract, SuccessEnvelope, ToolCatalog, agent_host_launch_arguments,
     render_agent_host_configuration,
+};
+use depgraph_core::{
+    CompilerPackBuildComponent, CompilerPackBuildSpec, CompilerPackRequirement, DepgraphCapability,
+    DepgraphCapabilitySet, FindingIdentity, FindingKind, build_compiler_pack,
+    compiler_pack_host_target, finding_id, verify_compiler_pack,
 };
 use depgraph_store::Store;
 use serde::{Deserialize, Serialize};
@@ -35,7 +35,7 @@ pub const EOF_DEADLINE_MS: u64 = 5_000;
 const INITIALIZE_RESPONSE_DEADLINE: Duration = Duration::from_secs(30);
 const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
 const OPERATION_DEADLINE: Duration = Duration::from_secs(60);
-const TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
+const TOOL_CONTRACT_VERSION: &str = depgraph_agent_contract::MCP_TOOLS_CONTRACT_VERSION;
 const OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const RELEASE_EVIDENCE_CONTRACT_VERSION: &str = "release-post-publish-evidence-v1";
 const TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
@@ -53,7 +53,7 @@ const ONBOARDING_MARKER_PREFIX: &str = "<!-- depgraph-agent-config:";
 const DOCUMENTED_ROOT: &str = "/absolute/path/to/repository";
 const DOCUMENTED_STORE: &str = "/absolute/path/to/state/depgraph.sqlite";
 const DOCUMENTED_REQUIREMENT: &str = "/absolute/path/to/compiler-pack-requirement.json";
-const PROTOCOL_REVISIONS: &[&str] = &["2025-11-25", depgraph_mcp_tools::MCP_PROTOCOL_REVISION];
+const PROTOCOL_REVISIONS: &[&str] = &["2025-11-25", depgraph_agent_contract::MCP_PROTOCOL_REVISION];
 const READ_CAPABILITIES: &[DepgraphCapability] = &[DepgraphCapability::Read];
 const CAPABILITY_PROFILES: &[AgentHostCapabilityProfile] = &AgentHostCapabilityProfile::ALL;
 
@@ -1435,7 +1435,7 @@ fn verify_tools_list(tools: &[Value], capabilities: &[DepgraphCapability]) -> Re
     Ok(canonical_sha256(&Value::Array(tools.to_vec())))
 }
 
-fn expected_tool_value(tool: &depgraph_mcp_tools::ToolDefinition) -> Value {
+fn expected_tool_value(tool: &depgraph_agent_contract::ToolDefinition) -> Value {
     json!({
         "name":tool.name(),
         "description":tool.description(),
