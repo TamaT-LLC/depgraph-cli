@@ -3,13 +3,12 @@ use std::{
     path::{Component, Path},
 };
 
-use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result};
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, Condition, CrossLanguageMappingKind,
     CrossLanguageRelationKind, DependencySite, Evidence, EvidenceKind, GraphEdge, GraphNode, Phase,
     Precision, Properties, ResolutionStatus, build_cross_language_edge_id,
-    build_cross_language_site_id, stable_id_from_value,
+    build_cross_language_site_id, read_bounded_repository_file, stable_id_from_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -21,7 +20,7 @@ use super::{
     inventory_entry_allowed, is_federation_directive, repository_locator, sha256_prefixed,
 };
 
-pub const GRAPHQL_REPOSITORY_MAPPING_CAPABILITY: &str = "graphql-repository-mapping-v1";
+pub use depgraph_protocol::GRAPHQL_REPOSITORY_MAPPING_CAPABILITY;
 pub const GRAPHQL_REPOSITORY_MAPPING_SCHEMA_VERSION: &str =
     "depgraph-graphql-repository-mapping-v1";
 

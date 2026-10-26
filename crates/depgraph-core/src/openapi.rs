@@ -3,7 +3,6 @@ use std::{
     path::{Component, Path},
 };
 
-use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result, bail};
 use depgraph_protocol::{
     CROSS_LANGUAGE_COMPLETENESS_PROPERTY, CROSS_LANGUAGE_COMPLETENESS_VERSION,
@@ -14,8 +13,8 @@ use depgraph_protocol::{
     CrossLanguageNodeKind, CrossLanguageProfileIdentity, CrossLanguageRelationKind, DependencySite,
     Evidence, EvidenceKind, GraphEdge, GraphNode, Phase, Precision, Profile, Properties,
     ResolutionStatus, build_cross_language_edge_id, build_cross_language_site_id,
-    cross_language_node_id, cross_language_profile_id, stable_id_from_value,
-    validate_cross_language_adapter_delta,
+    cross_language_node_id, cross_language_profile_id, read_bounded_repository_file,
+    stable_id_from_value, validate_cross_language_adapter_delta,
 };
 use petgraph::{algo::kosaraju_scc, graphmap::DiGraphMap};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -27,7 +26,7 @@ mod generated;
 
 pub use generated::OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION;
 
-pub const OPENAPI_CAPABILITY: &str = "openapi-contract-v1";
+pub use depgraph_protocol::OPENAPI_CAPABILITY;
 pub const MAX_OPENAPI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_OPENAPI_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OPENAPI_DOCUMENTS: usize = 256;

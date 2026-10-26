@@ -640,12 +640,14 @@ name = "depgraph-protocol"
 version = "0.7.3"
 dependencies = [
  "jsonschema",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
  "workspace-hack",
 ]
 
