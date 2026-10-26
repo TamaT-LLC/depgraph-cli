@@ -233,10 +233,40 @@ jobs:
     if: ${{ github.event_name == 'pull_request_target' && (needs.classify.outputs.update_type == 'version-update:semver-patch' || needs.classify.outputs.update_type == 'version-update:semver-minor') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {}
+    permissions:
+      statuses: write
     steps:
-      - name: Mark the head eligible
-        run: echo eligible
+      - name: Record the eligible head on its SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=success \
+            -f context=dependabot-auto-merge \
+            -f description="pr=${PR_NUMBER} sha=${HEAD_SHA}"
+
+  ineligible:
+    needs: classify
+    if: ${{ github.event_name == 'pull_request_target' && needs.classify.outputs.update_type != '' && needs.classify.outputs.update_type != 'version-update:semver-patch' && needs.classify.outputs.update_type != 'version-update:semver-minor' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      statuses: write
+    steps:
+      - name: Record that the head is not eligible
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}" \
+            -f state=failure \
+            -f context=dependabot-auto-merge \
+            -f description="pr=${PR_NUMBER} sha=${HEAD_SHA}"
 
   merge:
     if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository }}
@@ -246,9 +276,9 @@ jobs:
       group: dependabot-merge-${{ github.event.workflow_run.head_sha }}
       cancel-in-progress: false
     permissions:
-      actions: read
       checks: read
       pull-requests: read
+      statuses: read
     steps:
       - name: Decide whether the head can merge
         id: gate
@@ -273,29 +303,26 @@ jobs:
             exit 1
           fi
           deadline="$((SECONDS + 600))"
+          record=""
           while true; do
-            runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/dependabot-auto-merge.yml/runs?event=pull_request_target&per_page=100")"
-            selection="$(jq -r --arg head "$EXPECTED_HEAD" --argjson pr "$pr_number" '[.workflow_runs[] | select(.head_sha == $head and any(.pull_requests[]?; .number == $pr))] | sort_by(.id) | reverse | .[0] // empty | [.id, .status] | @tsv' <<<"$runs")"
-            if [[ -n "$selection" ]]; then
-              run_id="${selection%%$'\t'*}"
-              status="${selection#*$'\t'}"
-              if [[ "$status" == "completed" ]]; then
-                break
-              fi
-              echo "classification run ${run_id} is ${status}" >&2
-            else
-              echo "classification run is missing for ${EXPECTED_HEAD}" >&2
+            statuses="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXPECTED_HEAD}/statuses")"
+            record="$(jq -c --arg ctx dependabot-auto-merge '[.[] | select(.context == $ctx)] | .[0] // empty' <<<"$statuses")"
+            if [[ -n "$record" ]]; then
+              break
             fi
             if (( SECONDS >= deadline )); then
-              echo "classification run did not complete for ${EXPECTED_HEAD}" >&2
-              exit 1
+              echo "merge=false" >> "$GITHUB_OUTPUT"
+              echo "classification status is missing for ${EXPECTED_HEAD}"
+              exit 0
             fi
             sleep 15
           done
-          eligible="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" --jq '.jobs[] | select(.name == "eligible") | .conclusion')"
-          if [[ "$eligible" != "success" ]]; then
+          state="$(jq -r '.state' <<<"$record")"
+          description="$(jq -r '.description' <<<"$record")"
+          creator="$(jq -r '.creator.login' <<<"$record")"
+          if [[ "$state" != "success" || "$description" != "pr=${pr_number} sha=${EXPECTED_HEAD}" || "$creator" != "github-actions[bot]" ]]; then
             echo "merge=false" >> "$GITHUB_OUTPUT"
-            echo "eligible job conclusion is '${eligible:-missing}'"
+            echo "classification status is ${state} by ${creator} for ${description}"
             exit 0
           fi
           required="$(gh pr checks "$pr_number" --required --json name,bucket)"

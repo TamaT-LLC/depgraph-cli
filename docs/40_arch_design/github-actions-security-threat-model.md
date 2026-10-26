@@ -87,16 +87,20 @@ GitHub runs that workflow from the latest commit on the default branch. No job
 checks out the repository or runs a repository script. The classification job
 runs only when `github.actor` and the pull request author are both
 `dependabot[bot]`. The `eligible` job succeeds only for a semver patch or semver minor update.
-After the CI workflow succeeds for a same-repository pull
-request, the merge job waits until a classification run with that pull
-request number and head SHA is completed, then reads the eligible job conclusion. It squash-merges with
+The eligible job writes a commit status on that pull request head SHA. The
+context is `dependabot-auto-merge` and the description carries the pull
+request number and head SHA. After the CI workflow succeeds for a
+same-repository pull request, the merge job reads that status on the CI head
+SHA. It does not search workflow runs. It squash-merges with
 `PUT /repos/{owner}/{repo}/pulls/{pull_number}/merge` and an installation
 token for the TamaT-LLC installation only when the open pull
 request author is `dependabot[bot]`, every commit author login is
 `dependabot[bot]`, the committer login is `web-flow` or `dependabot[bot]`, the
-head SHA is unchanged, and the required checks include passing `go`, `rust`,
-and `web` results. The workflow token has no write scope. A semver-major
-update does not mark the head eligible.
+head SHA is unchanged, the status names that same pull request and SHA, and
+the required checks include passing `go`, `rust`, and `web` results. The merge
+job token has no write scope. The classification jobs write only that status
+context, which is not one of the required checks. A semver-major update records
+a failure status and does not mark the head eligible.
 
 The v0.5.0 post-publish recovery workflow is an incident-specific read-only
 closure verifier, not a second publisher. It has no dispatch inputs and only

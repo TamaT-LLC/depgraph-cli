@@ -6149,8 +6149,8 @@ mod tests {
                 1,
             ),
             auto_merge.replacen(
-                "[[ \"$eligible\" != \"success\" ]]",
-                "[[ \"$eligible\" == \"missing\" ]]",
+                "-f context=dependabot-auto-merge",
+                "-f context=go",
                 1,
             ),
             auto_merge.replacen(
