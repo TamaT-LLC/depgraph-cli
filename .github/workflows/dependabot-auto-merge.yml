@@ -4,46 +4,127 @@ on:
   pull_request_target:
     types: [opened, synchronize, reopened]
     branches: [main]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions: {}
 
 jobs:
-  auto-merge:
-    if: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+  classify:
+    if: ${{ github.event_name == 'pull_request_target' && github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    concurrency:
-      group: dependabot-auto-merge-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      pull-requests: read
+    outputs:
+      update_type: ${{ steps.metadata.outputs.update-type }}
     steps:
       - name: Read the Dependabot update type
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
-      - name: Reconcile squash auto-merge with the update type
-        shell: bash
+
+  eligible:
+    needs: classify
+    if: ${{ github.event_name == 'pull_request_target' && (needs.classify.outputs.update_type == 'version-update:semver-patch' || needs.classify.outputs.update_type == 'version-update:semver-minor') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mark the head eligible
+        run: echo eligible
+
+  merge:
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: dependabot-merge-${{ github.event.workflow_run.head_sha }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      checks: read
+      pull-requests: read
+    steps:
+      - name: Decide whether the head can merge
+        id: gate
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_HEAD: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
-          case "$UPDATE_TYPE" in
-            version-update:semver-patch | version-update:semver-minor) want=SQUASH ;;
-            *) want=NONE ;;
-          esac
-          current="$(gh pr view "$PR_URL" --json state,autoMergeRequest --jq '.state + ":" + (.autoMergeRequest.mergeMethod // "NONE")')"
-          case "$want:$current" in
-            *:MERGED:* | *:CLOSED:*) echo "pull request is no longer open; nothing to reconcile" ;;
-            SQUASH:OPEN:NONE) gh pr merge "$PR_URL" --auto --squash --match-head-commit "$EXPECTED_HEAD" ;;
-            SQUASH:OPEN:SQUASH | NONE:OPEN:NONE) echo "auto-merge already matches update type '$UPDATE_TYPE'" ;;
-            NONE:OPEN:SQUASH) gh pr merge "$PR_URL" --disable-auto ;;
-            NONE:OPEN:MERGE | NONE:OPEN:REBASE) echo "leaving the existing auto-merge method in place" ;;
-            *)
-              echo "::error::auto-merge is already armed ($current); refusing to switch it to squash"
-              exit 1
-              ;;
-          esac
+          pulls="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXPECTED_HEAD}/pulls")"
+          match="$(jq -c --arg head "$EXPECTED_HEAD" '[.[] | select(.head.sha == $head and .base.ref == "main" and .user.login == "dependabot[bot]" and .state == "open")]' <<<"$pulls")"
+          count="$(jq 'length' <<<"$match")"
+          if [[ "$count" != 1 ]]; then
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "found ${count} open Dependabot pull requests for ${EXPECTED_HEAD}"
+            exit 0
+          fi
+          pr_number="$(jq -r '.[0].number' <<<"$match")"
+          bad="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}/commits" | jq '[.[][] | select(.author.login != "dependabot[bot]" or (.committer.login != "web-flow" and .committer.login != "dependabot[bot]"))] | length')"
+          if [[ "$bad" != 0 ]]; then
+            echo "pull request ${pr_number} has a commit Dependabot did not author" >&2
+            exit 1
+          fi
+          runs="$(gh run list --workflow dependabot-auto-merge.yml --commit "$EXPECTED_HEAD" --event pull_request_target --limit 20 --json databaseId,status,headSha)"
+          selection="$(jq -r --arg head "$EXPECTED_HEAD" '[.[] | select(.headSha == $head)] | sort_by(.databaseId) | reverse | .[0] // empty | [.databaseId, .status] | @tsv' <<<"$runs")"
+          if [[ -z "$selection" ]]; then
+            echo "classification run is missing for ${EXPECTED_HEAD}" >&2
+            exit 1
+          fi
+          run_id="${selection%%$'\t'*}"
+          status="${selection#*$'\t'}"
+          if [[ "$status" != "completed" ]]; then
+            echo "classification run ${run_id} is ${status}" >&2
+            exit 1
+          fi
+          eligible="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" --jq '.jobs[] | select(.name == "eligible") | .conclusion')"
+          if [[ "$eligible" != "success" ]]; then
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "eligible job conclusion is '${eligible:-missing}'"
+            exit 0
+          fi
+          required="$(gh pr checks "$pr_number" --required --json name,bucket)"
+          verdict="$(jq -r 'if any(.[]; .bucket != "pass") then "blocked" elif (["go","rust","web"] - map(.name)) != [] then "missing" else "pass" end' <<<"$required")"
+          if [[ "$verdict" != "pass" ]]; then
+            echo "merge=false" >> "$GITHUB_OUTPUT"
+            echo "required checks are ${verdict}"
+            exit 0
+          fi
+          {
+            echo "merge=true"
+            echo "pr_number=${pr_number}"
+            echo "head_sha=${EXPECTED_HEAD}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Issue a repository-scoped App token
+        id: app-token
+        if: ${{ steps.gate.outputs.merge == 'true' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          client-id: ${{ vars.DEPENDABOT_MERGE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.DEPENDABOT_MERGE_APP_PRIVATE_KEY }}
+          owner: TamaT-LLC
+          repositories: depgraph-cli
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Squash merge the eligible head
+        if: ${{ steps.gate.outputs.merge == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.gate.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ steps.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$EXPECTED_HEAD"; then
+            exit 0
+          fi
+          state="$(gh pr view "$PR_NUMBER" --json state --jq .state)"
+          if [[ "$state" == "MERGED" ]]; then
+            echo "pull request ${PR_NUMBER} is already merged"
+            exit 0
+          fi
+          exit 1
