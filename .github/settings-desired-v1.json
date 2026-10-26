@@ -49,6 +49,10 @@
       "allow_deletions": false,
       "bypass_actors": [
         {
+          "identity": "app:tamat-depgraph-dependabot-merge",
+          "permission": "pull_request"
+        },
+        {
           "identity": "user:TakehiroT",
           "permission": "pull_request"
         }
@@ -95,6 +99,10 @@
       {
         "identity": "app:github-actions",
         "permission": "read"
+      },
+      {
+        "identity": "app:tamat-depgraph-dependabot-merge",
+        "permission": "write"
       }
     ],
     "webhook_digests": [],
