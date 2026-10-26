@@ -77,3 +77,24 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# Optimized build for the CPU-bound evidence gates (`cargo xtask
+# go-loader-scope-e2e`, `resumable-analysis-e2e`, `health-range-e2e`). The dev
+# profile leaves the workspace crates at opt-level 0, which dominates their
+# runtime. It differs from release only where release would make the gates
+# slower to build or weaker as checks:
+# - no LTO and parallel codegen, so the workspace crates rebuild quickly on
+#   every CI run (rust-cache never keeps workspace crate artifacts);
+# - debug assertions and overflow checks stay on, so the gates still trip the
+#   same invariants the dev build does (the assertions in the scanned paths are
+#   O(1));
+# - symbols are kept so a panic backtrace still names its frames.
+# Debuginfo stays off (inherited) and incremental stays off: incremental state
+# is not reusable across CI runs and only grows the cached target directory.
+[profile.e2e]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
+overflow-checks = true
+strip = "none"

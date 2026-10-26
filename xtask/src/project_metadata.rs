@@ -299,6 +299,7 @@ pub(crate) fn verify_workflow_policy_text(
                 );
             }
             verify_ci_affected_scope_gates(workflow)?;
+            verify_e2e_build_alignment(workflow)?;
         }
         "release.yml" => {
             let stable_gate = workflow_job_block(workflow, "stable-gate")?;
@@ -628,6 +629,71 @@ const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 4] = [
     ("web", "web", "web", true),
     ("go-loader-scope", "web", "go-loader-scope", true),
 ];
+
+/// The jobs that run the e2e evidence gates from one shared rust-cache entry:
+/// `web` saves it and `go-loader-scope` only restores it.
+const E2E_CACHE_JOBS: [&str; 2] = ["web", "go-loader-scope"];
+
+/// The rust-cache key both [`E2E_CACHE_JOBS`] use. A shared key replaces the
+/// job-based key, and rust-cache does not hash the virtual root manifest (it
+/// is not a workspace member), so the `Cargo.toml` hash that carries the `e2e`
+/// profile has to be part of the key itself.
+const E2E_CACHE_SHARED_KEY: &str = "          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}";
+
+/// How CI invokes an e2e gate. xtask links depgraph-core, so running it under
+/// the same `e2e` profile as the CLI it builds lets both share one optimized
+/// build of the workspace crates instead of a dev build for xtask and an `e2e`
+/// build for the CLI.
+const E2E_XTASK_RUN: &str = "run: cargo run --locked --profile e2e -p xtask -- ";
+
+/// The xtask commands [`E2E_XTASK_RUN`] may run.
+const E2E_XTASK_TASKS: [&str; 3] = [
+    "resumable-analysis-e2e",
+    "health-range-e2e",
+    "go-loader-scope-e2e",
+];
+
+/// The e2e jobs must build the same units so the entry `web` saves restores
+/// in `go-loader-scope`: the same shared key, the same job-level env (every
+/// `CARGO*`/`RUST*` variable is hashed into rust-cache's key), every gate run
+/// through [`E2E_XTASK_RUN`], and no profile override.
+fn verify_e2e_build_alignment(workflow: &str) -> Result<()> {
+    let mut environments = Vec::new();
+    for job_name in E2E_CACHE_JOBS {
+        let job = workflow_job_block(workflow, job_name)?;
+        if job.matches("shared-key:").count() != 1
+            || !workflow_block_has_line(job, E2E_CACHE_SHARED_KEY)
+        {
+            bail!("CI {job_name} job must use the shared e2e rust-cache key");
+        }
+        if job.contains(crate::e2e_profile::E2E_PROFILE_ENV) {
+            bail!("CI {job_name} job must build the e2e gates under the default profile");
+        }
+        let mut gates = 0;
+        for line in job.lines() {
+            let line = line.trim_start();
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            if !line.starts_with("run:") || !line.contains("xtask") {
+                continue;
+            }
+            let pinned = line
+                .strip_prefix(E2E_XTASK_RUN)
+                .is_some_and(|task| E2E_XTASK_TASKS.contains(&task));
+            if !pinned {
+                bail!("CI {job_name} job must run its e2e gates through {E2E_XTASK_RUN:?}");
+            }
+            gates += 1;
+        }
+        if gates == 0 {
+            bail!("CI {job_name} job runs no e2e gate");
+        }
+        environments.push(job_env_entries(job)?);
+    }
+    if environments.windows(2).any(|pair| pair[0] != pair[1]) {
+        bail!("CI e2e jobs must declare the same job-level env to share one rust-cache entry");
+    }
+    Ok(())
+}
 
 /// The script and the CI step text that invokes it.
 const CI_AFFECTED_SCOPE_SCRIPT: &str = "scripts/ci-affected-scope.sh";
@@ -3424,8 +3490,8 @@ mod tests {
         affected_scope_decide_step, extra_native_package_is_manual_and_bounded,
         integration_job_pins_resource_policy, job_pins_intermediate_state_bound,
         verify_ci_affected_scope_gates, verify_ci_affected_scope_script_text,
-        verify_compiler_precise_hostile_ci_gate, verify_workflow_policy_text, workflow_job_block,
-        workflow_step_block,
+        verify_compiler_precise_hostile_ci_gate, verify_e2e_build_alignment,
+        verify_workflow_policy_text, workflow_job_block, workflow_step_block,
     };
 
     /// The three jobs that build twice on one runner without reclaiming
@@ -4018,6 +4084,67 @@ mod tests {
             assert_ne!(drift, ci, "{label}: drift mutation must change the workflow");
             assert!(
                 verify_ci_affected_scope_gates(&drift).is_err(),
+                "{label}: drifted workflow must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_build_alignment_rejects_workflow_drift() {
+        let ci = checked_in_ci_workflow();
+        verify_e2e_build_alignment(&ci).unwrap();
+        let loader_job = "  go-loader-scope:\n    runs-on: ubuntu-24.04\n";
+        let loader_restore = "          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}\n          save-if: false\n";
+        let loader_gate =
+            "        run: cargo run --locked --profile e2e -p xtask -- go-loader-scope-e2e\n";
+        for (label, drift) in [
+            (
+                "go-loader-scope gains a job-level env",
+                ci.replacen(
+                    loader_job,
+                    &format!("{loader_job}    env:\n      CARGO_PROFILE_DEV_DEBUG: \"0\"\n"),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope restores a different key",
+                ci.replacen(
+                    loader_restore,
+                    &loader_restore.replacen("web-e2e-", "go-loader-", 1),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope key drops the manifest hash",
+                ci.replacen(
+                    loader_restore,
+                    &loader_restore.replacen("-${{ hashFiles('Cargo.toml') }}", "", 1),
+                    1,
+                ),
+            ),
+            (
+                "web runs a gate through the dev-profile alias",
+                ci.replacen(
+                    "        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e\n",
+                    "        run: cargo xtask health-range-e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope overrides the CLI profile",
+                ci.replacen(
+                    loader_gate,
+                    &format!("          DEPGRAPH_E2E_PROFILE: dev\n{loader_gate}"),
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(
+                drift, ci,
+                "{label}: drift mutation must change the workflow"
+            );
+            assert!(
+                verify_e2e_build_alignment(&drift).is_err(),
                 "{label}: drifted workflow must be rejected"
             );
         }

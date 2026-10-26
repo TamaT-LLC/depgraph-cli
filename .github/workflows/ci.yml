@@ -194,16 +194,12 @@ jobs:
 
   web:
     runs-on: ubuntu-24.04
-    env:
-      # The resumable-analysis step builds depgraph-cli and the health-range
-      # step then runs a depgraph-core example. In the CLI build strsim is a
-      # runtime dependency (clap), so it is compiled with the dev profile's
-      # debuginfo; in the example build it is only a proc-macro dependency
-      # (darling), so the build-override profile drops that debuginfo. The
-      # different strsim unit cascaded through darling, rmcp, and workspace-hack
-      # into a second depgraph-core build. With dev debuginfo off both builds
-      # resolve to the same units and the example reuses the CLI's artifacts.
-      CARGO_PROFILE_DEV_DEBUG: "0"
+    # No job-level env: go-loader-scope restores this job's rust-cache entry,
+    # and every CARGO*/RUST* variable is part of that key, so the two jobs
+    # must declare the same (empty) set. The dev-profile debuginfo override
+    # this job used to carry is gone with the dev builds: every Rust build
+    # here uses the e2e profile, whose debuginfo is already off, and the
+    # health-range example reuses the CLI's depgraph-core build.
     defaults:
       run:
         working-directory: workers/web
@@ -260,6 +256,8 @@ jobs:
           # Shared with go-loader-scope, which builds a subset of these
           # artifacts and only restores this entry. A shared key replaces the
           # job-based key (and ignores `key`), so the Cargo.toml hash lives here.
+          # The hash also covers the e2e profile, which rust-cache would miss:
+          # the virtual root manifest is not a workspace member it hashes.
           shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -267,12 +265,16 @@ jobs:
         with:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
+      # xtask links depgraph-core, so it runs under the e2e profile too: one
+      # optimized build of the workspace crates serves xtask, the CLI it
+      # builds (xtask defaults to the e2e profile), and the health-range
+      # example, instead of an extra dev build just for xtask.
       - name: Verify real-worker batching, reuse, and cross-unit queries
         if: steps.decide.outputs.run == 'true'
         working-directory: .
         env:
           DEPGRAPH_RESUMABLE_REPORT: ${{ runner.temp }}/depgraph-resumable-report.json
-        run: cargo xtask resumable-analysis-e2e
+        run: cargo run --locked --profile e2e -p xtask -- resumable-analysis-e2e
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.decide.outputs.run == 'true'
         with:
@@ -288,7 +290,7 @@ jobs:
         working-directory: .
         env:
           DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
-        run: cargo xtask health-range-e2e
+        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e
       # The xtask writes the report before it raises a failed comparison, so
       # the evidence is uploaded whenever the step ran (not when an earlier
       # step already failed and skipped it).
@@ -1521,9 +1523,7 @@ jobs:
       fail-fast: false
       matrix:
         scenarios: [bigpkg, fanout]
-    env:
-      # Must match the web job so the shared rust-cache entry restores here.
-      CARGO_PROFILE_DEV_DEBUG: "0"
+    # No job-level env, like web, so the shared rust-cache key matches.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1575,7 +1575,7 @@ jobs:
         env:
           DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS: ${{ matrix.scenarios }}
           DEPGRAPH_GO_LOADER_SCOPE_REPORT: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
-        run: cargo xtask go-loader-scope-e2e
+        run: cargo run --locked --profile e2e -p xtask -- go-loader-scope-e2e
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: "!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'"
         with:
