@@ -3789,6 +3789,7 @@ name = "xtask"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "depgraph-core",
  "depgraph-mcp-tools",
@@ -3797,6 +3798,7 @@ dependencies = [
  "depgraph-store",
  "flate2",
  "hex",
+ "jsonschema",
  "rusqlite",
  "same-file",
  "serde",

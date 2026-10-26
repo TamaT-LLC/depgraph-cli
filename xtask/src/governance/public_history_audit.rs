@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{
+use super::{
     PublicReadinessFindingSummary, PublicReadinessToolIdentity, canonical_public_readiness_digest,
 };
 
