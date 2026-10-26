@@ -4,12 +4,11 @@ use std::{
     sync::Arc,
 };
 
-use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result};
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, Condition, CrossLanguageMappingKind,
     CrossLanguageRelationKind, Evidence, EvidenceKind, GraphNode, Precision, Properties,
-    ResolutionStatus, stable_id_from_value,
+    ResolutionStatus, read_bounded_repository_file, stable_id_from_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,7 +21,7 @@ use super::{
     repository_locator, sha256_prefixed, source_end_position,
 };
 
-pub const OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION: &str = "depgraph-openapi-generated-mapping-v1";
+pub use depgraph_protocol::OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION;
 
 const GENERATED_EXTRACTOR: &str = "depgraph-openapi-generated-adapter";
 const GENERATED_MANIFEST_SUFFIX: &str = ".depgraph-openapi-generated.json";

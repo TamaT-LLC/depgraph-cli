@@ -23,17 +23,14 @@ pub mod daemon;
 mod doctor;
 pub mod edge_kind_selection;
 pub mod export;
-pub mod ffi;
 pub mod ffi_link;
 pub(crate) mod go_dependency_witness;
 mod graphml;
-pub mod graphql;
 pub mod health;
 pub mod http_operation_correlation;
 pub mod impact;
 pub mod import_evidence;
 pub mod incremental;
-pub mod openapi;
 pub mod policy;
 mod policy_engine;
 pub mod profile_selection;
@@ -44,7 +41,6 @@ pub mod profile_selection_preview;
 pub mod profile_selection_rank;
 pub mod profile_selection_rust;
 pub mod profile_selection_web;
-pub mod protobuf;
 pub mod query;
 mod release_compatibility;
 mod release_health;
@@ -179,9 +175,10 @@ pub use build_evidence::{
     web_build_protocol_ndjson,
 };
 pub use cross_language::validate_cross_language_worker_protocol;
-pub use ffi::{
-    FFI_CAPABILITY, FFI_FORMAT_VERSION, MAX_FFI_DECLARATIONS, MAX_FFI_FILE_BYTES, MAX_FFI_FILES,
-    MAX_FFI_TOTAL_BYTES, scan_ffi_repository,
+pub use depgraph_protocol::{
+    FFI_CAPABILITY, FFI_FORMAT_VERSION, GRAPHQL_CAPABILITY, GRAPHQL_REPOSITORY_MAPPING_CAPABILITY,
+    OPENAPI_CAPABILITY, OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION, PROTOBUF_CAPABILITY,
+    PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION,
 };
 pub use ffi_link::{
     FFI_LINK_CAPABILITY, FFI_LINK_OBSERVATION_SCHEMA, FFI_LINK_OBSERVATION_SCHEMA_PATH,
@@ -294,12 +291,6 @@ pub use export::{
     ExportFormat, export, export_filtered, export_graphml_filtered_to_writer, filter_snapshot,
 };
 pub use graphml::GRAPHML_SCHEMA_VERSION;
-pub use graphql::{
-    GRAPHQL_CAPABILITY, GRAPHQL_FORMAT_VERSION, GRAPHQL_REPOSITORY_MAPPING_CAPABILITY,
-    GRAPHQL_REPOSITORY_MAPPING_SCHEMA_VERSION, MAX_GRAPHQL_DEFINITIONS, MAX_GRAPHQL_DEPTH,
-    MAX_GRAPHQL_FILE_BYTES, MAX_GRAPHQL_FILES, MAX_GRAPHQL_SELECTIONS, MAX_GRAPHQL_TOKENS,
-    MAX_GRAPHQL_TOTAL_BYTES, scan_graphql_repository,
-};
 pub use health::{
     BaselineFindingRecord, BaselineTransition, BlockerKind, CollectionIdentity, Confidence,
     DEFAULT_HOTSPOT_WEIGHTS, FindingBlocker, FindingEvidenceRef, FindingIdentity, FindingKind,
@@ -324,12 +315,6 @@ pub use incremental::{
     INCREMENTAL_PLAN_SCHEMA_VERSION, IncrementalChangeKind, IncrementalFileChange,
     IncrementalInvalidationMode, IncrementalInvalidationPlan, IncrementalInvalidationReason,
     plan_incremental_invalidation, snapshot_profile_plan_id,
-};
-pub use openapi::{
-    MAX_OPENAPI_DEPTH, MAX_OPENAPI_DOCUMENT_BYTES, MAX_OPENAPI_DOCUMENTS,
-    MAX_OPENAPI_REFERENCE_DEPTH, MAX_OPENAPI_REFERENCES, MAX_OPENAPI_SCALAR_BYTES,
-    MAX_OPENAPI_TOTAL_BYTES, MAX_OPENAPI_VALUES, OPENAPI_CAPABILITY,
-    OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION, scan_openapi_repository,
 };
 pub use policy::{
     AppliedPolicySuppression, POLICY_RESULT_SCHEMA_VERSION, POLICY_SCHEMA, POLICY_SCHEMA_VERSION,
@@ -398,12 +383,6 @@ pub use profile_selection_rust::{
     RustProfileAvailability, RustProfileCandidateGenerationResult, RustProfilePlanningInput,
     RustRejectedProfileDeclaration, RustRootFeatureDeclaration, RustStaticProfileEvidence,
     RustTargetDeclaration, generate_rust_profile_candidates,
-};
-pub use protobuf::{
-    MAX_PROTOBUF_DEPTH, MAX_PROTOBUF_DESCRIPTOR_BYTES, MAX_PROTOBUF_DESCRIPTOR_FILES,
-    MAX_PROTOBUF_FILE_BYTES, MAX_PROTOBUF_FILES, MAX_PROTOBUF_TOKENS, MAX_PROTOBUF_TOTAL_BYTES,
-    PROTOBUF_CAPABILITY, PROTOBUF_DESCRIPTOR_SUFFIX, PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION,
-    scan_protobuf_repository,
 };
 pub use query::{
     BoundedTraversalResult, CycleLevel, CycleResult, DEFAULT_INTERACTIVE_QUERY_MAX_BYTES,

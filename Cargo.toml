@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/depgraph-agent-contract",
   "crates/depgraph-cli",
+  "crates/depgraph-contract-scan",
   "crates/depgraph-core",
   "crates/depgraph-mcp",
   "crates/depgraph-operation",

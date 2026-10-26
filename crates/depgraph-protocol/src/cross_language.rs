@@ -19,6 +19,19 @@ pub const CROSS_LANGUAGE_CONTRACT_PROPERTY: &str = "cross_language_contract_vers
 pub const CROSS_LANGUAGE_PROFILE_IDENTITY_PROPERTY: &str = "cross_language_profile_identity";
 pub const CROSS_LANGUAGE_COMPLETENESS_PROPERTY: &str = "cross_language_completeness";
 
+// Contract-extractor surface identifiers. The extractors live in
+// `depgraph-contract-scan`; the core pins these in its release compatibility
+// contract and FFI link correlation without depending on the extractors.
+pub const FFI_CAPABILITY: &str = "ffi-contract-v1";
+pub const FFI_FORMAT_VERSION: &str = "ffi-static-inventory-v1";
+pub const GRAPHQL_CAPABILITY: &str = "graphql-contract-v1";
+pub const GRAPHQL_REPOSITORY_MAPPING_CAPABILITY: &str = "graphql-repository-mapping-v1";
+pub const OPENAPI_CAPABILITY: &str = "openapi-contract-v1";
+pub const OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION: &str = "depgraph-openapi-generated-mapping-v1";
+pub const PROTOBUF_CAPABILITY: &str = "protobuf-contract-v1";
+pub const PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION: &str =
+    "depgraph-protobuf-generated-mapping-v1";
+
 const MAX_IDENTITY_CHARS: usize = 4_096;
 const MAX_REASON_CHARS: usize = 256;
 const MAX_LEDGER_ENTRIES: usize = 4;

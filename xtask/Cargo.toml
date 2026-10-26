@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 depgraph-agent-contract = { path = "../crates/depgraph-agent-contract" }
+depgraph-contract-scan = { path = "../crates/depgraph-contract-scan" }
 depgraph-core = { path = "../crates/depgraph-core" }
 depgraph-operation = { path = "../crates/depgraph-operation" }
 depgraph-protocol = { path = "../crates/depgraph-protocol" }

@@ -4,13 +4,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::bounded_query::read_bounded_repository_file;
 use anyhow::{Context, Result};
 use depgraph_protocol::{
     CROSS_LANGUAGE_CONTRACT_VERSION, Condition, CrossLanguageMappingKind,
     CrossLanguageRelationKind, DependencySite, Evidence, EvidenceKind, GraphEdge, GraphNode, Phase,
     Precision, Properties, ResolutionStatus, build_cross_language_edge_id,
-    build_cross_language_site_id, stable_id_from_value,
+    build_cross_language_site_id, read_bounded_repository_file, stable_id_from_value,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,8 +21,7 @@ use super::{
     inventory_entry_allowed, repository_locator, sha256_prefixed, valid_proto_locator,
 };
 
-pub const PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION: &str =
-    "depgraph-protobuf-generated-mapping-v1";
+pub use depgraph_protocol::PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION;
 
 const GENERATED_EXTRACTOR: &str = "depgraph-protobuf-generated-adapter";
 const GENERATED_MANIFEST_SUFFIX: &str = ".depgraph-protobuf-generated.json";
