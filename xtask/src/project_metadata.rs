@@ -272,18 +272,26 @@ jobs:
             echo "pull request ${pr_number} has a commit Dependabot did not author" >&2
             exit 1
           fi
-          runs="$(gh run list --workflow dependabot-auto-merge.yml --commit "$EXPECTED_HEAD" --event pull_request_target --limit 20 --json databaseId,status,headSha)"
-          selection="$(jq -r --arg head "$EXPECTED_HEAD" '[.[] | select(.headSha == $head)] | sort_by(.databaseId) | reverse | .[0] // empty | [.databaseId, .status] | @tsv' <<<"$runs")"
-          if [[ -z "$selection" ]]; then
-            echo "classification run is missing for ${EXPECTED_HEAD}" >&2
-            exit 1
-          fi
-          run_id="${selection%%$'\t'*}"
-          status="${selection#*$'\t'}"
-          if [[ "$status" != "completed" ]]; then
-            echo "classification run ${run_id} is ${status}" >&2
-            exit 1
-          fi
+          deadline="$((SECONDS + 600))"
+          while true; do
+            runs="$(gh run list --workflow dependabot-auto-merge.yml --commit "$EXPECTED_HEAD" --event pull_request_target --limit 20 --json databaseId,status,headSha)"
+            selection="$(jq -r --arg head "$EXPECTED_HEAD" '[.[] | select(.headSha == $head)] | sort_by(.databaseId) | reverse | .[0] // empty | [.databaseId, .status] | @tsv' <<<"$runs")"
+            if [[ -n "$selection" ]]; then
+              run_id="${selection%%$'\t'*}"
+              status="${selection#*$'\t'}"
+              if [[ "$status" == "completed" ]]; then
+                break
+              fi
+              echo "classification run ${run_id} is ${status}" >&2
+            else
+              echo "classification run is missing for ${EXPECTED_HEAD}" >&2
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "classification run did not complete for ${EXPECTED_HEAD}" >&2
+              exit 1
+            fi
+            sleep 15
+          done
           eligible="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs" --jq '.jobs[] | select(.name == "eligible") | .conclusion')"
           if [[ "$eligible" != "success" ]]; then
             echo "merge=false" >> "$GITHUB_OUTPUT"
@@ -322,7 +330,8 @@ jobs:
           EXPECTED_HEAD: ${{ steps.gate.outputs.head_sha }}
         run: |
           set -euo pipefail
-          if gh pr merge "$PR_NUMBER" --squash --match-head-commit "$EXPECTED_HEAD"; then
+          if response="$(gh api --method PUT "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/merge" -f merge_method=squash -f sha="$EXPECTED_HEAD")" \
+            && [[ "$(jq -r '.merged' <<<"$response")" == "true" ]]; then
             exit 0
           fi
           state="$(gh pr view "$PR_NUMBER" --json state --jq .state)"

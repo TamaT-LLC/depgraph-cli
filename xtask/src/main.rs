@@ -6154,8 +6154,8 @@ mod tests {
                 1,
             ),
             auto_merge.replacen(
-                " --squash --match-head-commit",
-                " --admin --squash --match-head-commit",
+                "-f merge_method=squash",
+                "-f merge_method=squash --admin",
                 1,
             ),
             auto_merge.replacen(
