@@ -30,6 +30,11 @@ use crate::{
     worker::{AdapterKind, WorkerSpec, resolve_safe_executable, sanitized_path},
 };
 
+mod tool_fingerprint;
+
+pub(crate) use tool_fingerprint::{ToolFingerprintMemo, ToolOutputCheck};
+use tool_fingerprint::{ToolKey, ToolProbe};
+
 pub const COMPILER_PRECISE_CACHE_CONTRACT_VERSION: &str =
     "rust-compiler-precise-validated-cache-v1";
 pub const COMPILER_PRECISE_CACHE_ENTRY_SCHEMA_VERSION: &str =
@@ -826,6 +831,15 @@ fn validate_symlink_proof(root: &Path, proof: &SymlinkProof) -> Result<(), Cache
 }
 
 pub(crate) fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Result<String, ()> {
+    fingerprint_adapters_with(&ToolFingerprintMemo::disabled(), workers)
+}
+
+/// [`fingerprint_adapters`] reusing the artifact digests `memo` observed for
+/// unchanged worker artifacts.
+pub(crate) fn fingerprint_adapters_with(
+    memo: &ToolFingerprintMemo,
+    workers: &[(AdapterKind, WorkerSpec)],
+) -> Result<String, ()> {
     let mut hasher = Sha256::new();
     hasher.update(b"depgraph-cache-adapters-v1\0");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -834,8 +848,7 @@ pub(crate) fn fingerprint_adapters(workers: &[(AdapterKind, WorkerSpec)]) -> Res
         hasher.update(adapter.name().as_bytes());
         hasher.update(b"\0");
         let artifact = spec.artifact_path.canonicalize().map_err(|_| ())?;
-        let bytes = fs::read(artifact).map_err(|_| ())?;
-        hasher.update(Sha256::digest(bytes));
+        hasher.update(memo.artifact_digest(&artifact)?.digest);
         hasher.update(b"\0");
         hasher.update(
             spec.expected_version
@@ -860,40 +873,83 @@ pub(crate) fn fingerprint_toolchains(
     root: &Path,
     workers: &[(AdapterKind, WorkerSpec)],
 ) -> Result<String, ()> {
+    fingerprint_toolchains_with(
+        &ToolFingerprintMemo::disabled(),
+        root,
+        workers,
+        ToolOutputCheck::Rerun,
+    )
+}
+
+/// [`fingerprint_toolchains`] reusing the tool artifact digests `memo`
+/// observed and, under [`ToolOutputCheck::Memoized`], the version probe
+/// outputs of unchanged tool artifacts.
+pub(crate) fn fingerprint_toolchains_with(
+    memo: &ToolFingerprintMemo,
+    root: &Path,
+    workers: &[(AdapterKind, WorkerSpec)],
+    check: ToolOutputCheck,
+) -> Result<String, ()> {
     let mut identities = BTreeMap::new();
     for (adapter, _) in workers {
         match adapter {
             AdapterKind::Rust => {
-                let (selection, rustc, cargo) = verified_rust_toolchain_identities(root)?;
+                let (selection, rustc, cargo) =
+                    verified_rust_toolchain_identities(memo, root, check)?;
                 identities.insert("rust-toolchain-selection", selection);
                 identities.insert("rustc", rustc);
                 identities.insert("cargo", cargo);
             }
             AdapterKind::Go => {
-                identities.insert("go", tool_identity(root, "go", &["version"])?);
+                identities.insert("go", tool_identity(memo, root, "go", &["version"], check)?);
             }
             AdapterKind::Web => {
-                identities.insert("node", tool_identity(root, "node", &["--version"])?);
+                identities.insert(
+                    "node",
+                    tool_identity(memo, root, "node", &["--version"], check)?,
+                );
             }
         }
     }
     Ok(digest_serialized("toolchain-framework-v1", &identities))
 }
 
-fn tool_identity(root: &Path, name: &str, arguments: &[&str]) -> Result<String, ()> {
+fn tool_identity(
+    memo: &ToolFingerprintMemo,
+    root: &Path,
+    name: &str,
+    arguments: &[&str],
+    check: ToolOutputCheck,
+) -> Result<String, ()> {
     let program = resolve_safe_executable(name, root).map_err(|_| ())?;
-    tool_identity_at(root, name, &program, arguments).map(|(identity, _)| identity)
+    tool_identity_at(memo, root, name, &program, arguments, check).map(|(identity, _)| identity)
 }
 
 fn tool_identity_at(
+    memo: &ToolFingerprintMemo,
     root: &Path,
     name: &str,
     program: &Path,
     arguments: &[&str],
+    check: ToolOutputCheck,
 ) -> Result<(String, Vec<u8>), ()> {
     let artifact = program.canonicalize().map_err(|_| ())?;
-    let artifact_bytes = fs::read(&artifact).map_err(|_| ())?;
-    let artifact_digest = Sha256::digest(&artifact_bytes);
+    let key = ToolKey {
+        artifact,
+        program: program.to_owned(),
+        name: name.to_owned(),
+        arguments: arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect(),
+    };
+    if check == ToolOutputCheck::Memoized
+        && let Some(probe) = memo.tool_probe(&key)
+    {
+        return Ok(probe);
+    }
+    let observation = memo.artifact_digest(&key.artifact)?;
+    memo.record_tool_run();
     let mut command = Command::new(program);
     command.args(arguments).env_clear();
     copy_safe_tool_environment(&mut command, root)?;
@@ -904,25 +960,42 @@ fn tool_identity_at(
     {
         return Err(());
     }
-    if fs::read(&artifact).map_err(|_| ())? != artifact_bytes {
+    // The artifact must still hold the bytes that were hashed after the
+    // probe ran; otherwise the output may describe a different tool.
+    if !memo.artifact_unchanged(&key.artifact, &observation) {
         return Err(());
     }
     let mut hasher = Sha256::new();
     hasher.update(b"depgraph-cache-tool-v1\0");
     hasher.update(name.as_bytes());
     hasher.update(b"\0");
-    hasher.update(artifact_digest);
+    hasher.update(observation.digest);
     hasher.update(b"\0");
     hasher.update(&output.stdout);
     hasher.update(b"\0");
     hasher.update(&output.stderr);
-    Ok((finish_digest(hasher), output.stdout))
+    let identity = finish_digest(hasher);
+    if let Some(stamp) = observation.stamp {
+        memo.remember_tool_probe(
+            key,
+            ToolProbe {
+                stamp,
+                identity: identity.clone(),
+                stdout: output.stdout.clone(),
+            },
+        );
+    }
+    Ok((identity, output.stdout))
 }
 
-fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, String), ()> {
+fn verified_rust_toolchain_identities(
+    memo: &ToolFingerprintMemo,
+    root: &Path,
+    check: ToolOutputCheck,
+) -> Result<(String, String, String), ()> {
     if let Ok((rustc, cargo)) = rustup_baseline_pair(root)
         && let Ok((rustc_identity, rustc_output, cargo_identity, cargo_output)) =
-            paired_rust_tool_identities(root, &rustc, &cargo)
+            paired_rust_tool_identities(memo, root, &rustc, &cargo, check)
         && verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
         && verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
         && version_field(&rustc_output, "host") == version_field(&cargo_output, "host")
@@ -938,7 +1011,7 @@ fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, St
     let rustc = resolve_safe_executable("rustc", root).map_err(|_| ())?;
     let cargo = resolve_safe_executable("cargo", root).map_err(|_| ())?;
     let (rustc_identity, rustc_output, cargo_identity, cargo_output) =
-        paired_rust_tool_identities(root, &rustc, &cargo)?;
+        paired_rust_tool_identities(memo, root, &rustc, &cargo, check)?;
     if !verified_rust_version(&rustc_output, RUSTC_BASELINE_COMMIT)
         || !verified_rust_version(&cargo_output, CARGO_BASELINE_COMMIT)
         || version_field(&rustc_output, "host") != version_field(&cargo_output, "host")
@@ -949,14 +1022,17 @@ fn verified_rust_toolchain_identities(root: &Path) -> Result<(String, String, St
 }
 
 fn paired_rust_tool_identities(
+    memo: &ToolFingerprintMemo,
     root: &Path,
     rustc: &Path,
     cargo: &Path,
+    check: ToolOutputCheck,
 ) -> Result<(String, Vec<u8>, String, Vec<u8>), ()> {
+    let arguments = ["--version", "--verbose"];
     thread::scope(|scope| {
         let rustc_task =
-            scope.spawn(|| tool_identity_at(root, "rustc", rustc, &["--version", "--verbose"]));
-        let cargo_result = tool_identity_at(root, "cargo", cargo, &["--version", "--verbose"])?;
+            scope.spawn(|| tool_identity_at(memo, root, "rustc", rustc, &arguments, check));
+        let cargo_result = tool_identity_at(memo, root, "cargo", cargo, &arguments, check)?;
         let rustc_result = rustc_task.join().map_err(|_| ())??;
         Ok((
             rustc_result.0,
@@ -1551,8 +1627,12 @@ mod tests {
     #[test]
     fn semantic_cache_fingerprints_the_effective_verified_rust_pair() {
         let root = tempfile::tempdir().unwrap();
-        let (selection, rustc, cargo) =
-            verified_rust_toolchain_identities(root.path()).expect("verified Rust baseline");
+        let (selection, rustc, cargo) = verified_rust_toolchain_identities(
+            &ToolFingerprintMemo::disabled(),
+            root.path(),
+            ToolOutputCheck::Rerun,
+        )
+        .expect("verified Rust baseline");
         assert!(matches!(
             selection.as_str(),
             "installed-verified-baseline" | "host-default"
@@ -1576,6 +1656,84 @@ mod tests {
         let started = Instant::now();
         assert!(bounded_cache_tool_output(noisy, Duration::from_secs(3), 1024).is_err());
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    fn write_probe(path: &Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// One scan hashes a tool artifact and runs its probe once; later
+    /// memoized lookups re-stat it only, a re-run probe reuses the digest, a
+    /// replaced artifact is read again, and another scan starts over.
+    #[cfg(unix)]
+    #[test]
+    fn tool_fingerprint_memo_reuses_unchanged_artifacts_within_one_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let probe = tools.path().join("probe");
+        write_probe(&probe, "probe-v1");
+        let identity = |memo: &ToolFingerprintMemo, check| {
+            tool_identity_at(memo, root.path(), "probe", &probe, &["--version"], check).unwrap()
+        };
+
+        let memo = ToolFingerprintMemo::without_racy_window();
+        let (first, stdout) = identity(&memo, ToolOutputCheck::Memoized);
+        assert_eq!(stdout, b"probe-v1\n");
+        assert_eq!((memo.full_reads(), memo.tool_runs()), (1, 1));
+        assert_eq!(identity(&memo, ToolOutputCheck::Memoized).0, first);
+        assert_eq!(
+            (memo.full_reads(), memo.tool_runs()),
+            (1, 1),
+            "a memoized lookup of an unchanged tool must neither hash nor run it"
+        );
+        assert_eq!(identity(&memo, ToolOutputCheck::Rerun).0, first);
+        assert_eq!(
+            (memo.full_reads(), memo.tool_runs()),
+            (1, 2),
+            "a re-run probe reuses the digest of an unchanged artifact"
+        );
+
+        // Same-length replacement through a rename: a new inode.
+        let staged = tools.path().join("probe.next");
+        write_probe(&staged, "probe-v2");
+        fs::rename(&staged, &probe).unwrap();
+        let (replaced, stdout) = identity(&memo, ToolOutputCheck::Memoized);
+        assert_eq!(stdout, b"probe-v2\n");
+        assert_ne!(replaced, first);
+        assert_eq!((memo.full_reads(), memo.tool_runs()), (2, 3));
+
+        // In-place rewrite. The length differs so the test does not depend
+        // on the file system's timestamp granularity.
+        write_probe(&probe, "probe-v3-rewritten");
+        assert_ne!(identity(&memo, ToolOutputCheck::Rerun).0, replaced);
+        assert_eq!((memo.full_reads(), memo.tool_runs()), (3, 4));
+
+        let next_scan = ToolFingerprintMemo::without_racy_window();
+        identity(&next_scan, ToolOutputCheck::Memoized);
+        assert_eq!(
+            (next_scan.full_reads(), next_scan.tool_runs()),
+            (1, 1),
+            "a new scan must not inherit another scan's observations"
+        );
+
+        let disabled = ToolFingerprintMemo::disabled();
+        identity(&disabled, ToolOutputCheck::Memoized);
+        identity(&disabled, ToolOutputCheck::Memoized);
+        assert_eq!(
+            (disabled.full_reads(), disabled.tool_runs()),
+            (4, 2),
+            "without a memo every probe reads the artifact before and after it runs"
+        );
+
+        // A file changed within the racy window is never trusted by stamp.
+        let recent = ToolFingerprintMemo::default();
+        identity(&recent, ToolOutputCheck::Memoized);
+        identity(&recent, ToolOutputCheck::Memoized);
+        assert_eq!((recent.full_reads(), recent.tool_runs()), (4, 2));
     }
 
     #[cfg(unix)]

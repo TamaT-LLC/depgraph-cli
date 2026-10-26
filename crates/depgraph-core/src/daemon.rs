@@ -3220,6 +3220,7 @@ mod tests {
                             config: &config,
                             cache_mode: ScanCacheMode::Disabled,
                             cancellation: &cancellation,
+                            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
                         },
                         work,
                         |_, _, output| Ok(output.error.is_none()),
