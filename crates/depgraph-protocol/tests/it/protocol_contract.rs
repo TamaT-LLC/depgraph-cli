@@ -1,0 +1,1298 @@
+use depgraph_protocol::{
+    DependencySite, GraphEdge, MAX_EVENT_LINE_BYTES, PROTOCOL_SCHEMA, ProtocolError, ProtocolEvent,
+    ProtocolValidator, build_edge_stable_id, build_site_stable_id, validate_build_ndjson,
+    validate_ndjson, validate_safe_ndjson,
+};
+use pretty_assertions::assert_eq;
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use std::io::Cursor;
+
+const GOLDEN: &str = include_str!("../fixtures/protocol-v1.golden.ndjson");
+
+#[test]
+fn golden_stream_contains_and_validates_all_nine_event_types() {
+    let validated = validate_ndjson(Cursor::new(GOLDEN)).expect("golden stream must validate");
+    let names: BTreeSet<_> = validated
+        .events
+        .iter()
+        .map(ProtocolEvent::event_name)
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "scan_started",
+            "profile_declared",
+            "node_upsert",
+            "edge_upsert",
+            "dependency_site",
+            "diagnostic",
+            "file_completed",
+            "profile_completed",
+            "scan_completed",
+        ])
+    );
+    assert_eq!(validated.nodes.len(), 2);
+    assert_eq!(validated.edges.len(), 1);
+    assert_eq!(validated.sites.len(), 1);
+    assert_eq!(
+        validated.edges["edge:sha256:import"].condition.render(),
+        "(mode == \"production\" && runtime == \"server\")"
+    );
+}
+
+/// A validator that does not retain graph events still accepts the same
+/// stream, observes every accepted event in stream order, and keeps the same
+/// upsert maps; it only drops the graph events from its retained prefix (#598).
+#[test]
+fn graph_event_retention_opt_out_observes_the_same_canonical_stream() {
+    for fixture in [
+        GOLDEN,
+        include_str!("../fixtures/protocol-v1.semantic.golden.ndjson"),
+        include_str!("../fixtures/protocol-v1.rust-semantic.golden.ndjson"),
+        include_str!("../fixtures/protocol-v1.cross-language.golden.ndjson"),
+    ] {
+        let retained = validate_ndjson(Cursor::new(fixture)).expect("fixture validates");
+        let mut validator = ProtocolValidator::new().without_graph_event_retention();
+        let mut observed = Vec::new();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            let event: ProtocolEvent = serde_json::from_str(line).expect("fixture event");
+            validator
+                .push_observed(event, |event| observed.push(event.clone()))
+                .expect("fixture event validates");
+        }
+        let detached = validator.finish().expect("fixture completes");
+        assert_eq!(observed, retained.events);
+        assert_eq!(
+            detached.events,
+            retained
+                .events
+                .iter()
+                .filter(|event| !matches!(
+                    event,
+                    ProtocolEvent::NodeUpsert(_)
+                        | ProtocolEvent::EdgeUpsert(_)
+                        | ProtocolEvent::DependencySite(_)
+                        | ProtocolEvent::Diagnostic(_)
+                ))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(detached.profiles, retained.profiles);
+        assert_eq!(detached.nodes, retained.nodes);
+        assert_eq!(detached.edges, retained.edges);
+        assert_eq!(detached.sites, retained.sites);
+        assert_eq!(detached.diagnostics, retained.diagnostics);
+    }
+}
+
+#[test]
+fn graph_event_retention_opt_out_does_not_observe_a_rejected_event() {
+    let mut validator = ProtocolValidator::new().without_graph_event_retention();
+    let mut lines = GOLDEN.lines();
+    let started: ProtocolEvent =
+        serde_json::from_str(lines.next().expect("golden has scan_started")).expect("event");
+    let mut observed = 0;
+    validator
+        .push_observed(started.clone(), |_| observed += 1)
+        .expect("scan_started validates");
+    assert!(validator.push_observed(started, |_| observed += 1).is_err());
+    assert_eq!(observed, 1);
+}
+
+#[test]
+fn json_schema_is_draft_2020_12_and_lists_full_and_delta_events() {
+    let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).expect("schema must be valid JSON");
+    assert_eq!(
+        schema["$schema"],
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(schema["oneOf"].as_array().unwrap().len(), 21);
+    assert!(jsonschema::draft202012::meta::is_valid(&schema));
+    let validator = jsonschema::draft202012::new(&schema).expect("schema must compile");
+    for line in GOLDEN.lines() {
+        let event: Value = serde_json::from_str(line).unwrap();
+        assert!(validator.is_valid(&event), "schema rejected {event}");
+    }
+}
+
+#[test]
+fn strict_safe_scan_api_rejects_non_safe_execution_without_changing_compatible_mode() {
+    validate_safe_ndjson(Cursor::new(GOLDEN)).expect("golden stream is a safe scan");
+
+    let mut coverage = empty_coverage();
+    coverage["project_code_executed"] = true.into();
+    let input = minimal_stream(
+        json!({
+            "event": "scan_started",
+            "root": "/fixture",
+            "project_code_executed": true,
+            "safe_mode": false
+        }),
+        json!({"event": "scan_completed", "coverage": coverage}),
+    );
+    validate_ndjson(Cursor::new(&input)).expect("compatible mode accepts explicit execution");
+    let error = validate_safe_ndjson(Cursor::new(input)).unwrap_err();
+    assert!(matches!(error, ProtocolError::UnsafeScanMode { .. }));
+}
+
+#[test]
+fn unknown_optional_fields_are_accepted() {
+    let input = minimal_stream(
+        json!({
+            "event": "scan_started",
+            "root": "/fixture",
+            "project_code_executed": false,
+            "safe_mode": true,
+            "future_optional": {"nested": true}
+        }),
+        json!({
+            "event": "scan_completed",
+            "coverage": empty_coverage(),
+            "future_summary": "accepted"
+        }),
+    );
+    validate_ndjson(Cursor::new(input)).expect("unknown optional fields must be ignored");
+}
+
+#[test]
+fn nullable_optional_profile_collections_are_backward_compatible() {
+    let mut events = golden_values();
+    events[1]["profile"]["features"] = Value::Null;
+    events[1]["profile"]["environment"] = Value::Null;
+    events[1]["profile"]["properties"] = Value::Null;
+    let input = values_to_ndjson(events);
+    assert!(schema_accepts_stream(&input));
+    let validated = validate_ndjson(Cursor::new(input)).unwrap();
+    let profile = &validated.profiles["web:production:server"];
+    assert!(profile.features.is_empty());
+    assert!(profile.environment.is_empty());
+    assert!(profile.properties.is_empty());
+}
+
+#[test]
+fn unknown_event_is_rejected() {
+    let line = with_common(json!({"event": "future_event"}), 1);
+    let error = validate_ndjson(Cursor::new(format!("{line}\n"))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Json { line: 1, .. }));
+}
+
+#[test]
+fn missing_required_common_field_is_rejected() {
+    let line = json!({
+        "event": "scan_started",
+        "protocol_version": "1.0",
+        "scan_id": "scan-test",
+        "adapter": "test",
+        "seq": 1,
+        "root": "/fixture",
+        "project_code_executed": false,
+        "safe_mode": true
+    });
+    let error = validate_ndjson(Cursor::new(format!("{line}\n"))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Json { line: 1, .. }));
+}
+
+#[test]
+fn event_before_scan_started_is_rejected() {
+    let line = with_common(
+        json!({"event": "scan_completed", "coverage": empty_coverage()}),
+        1,
+    );
+    let error = validate_ndjson(Cursor::new(format!("{line}\n"))).unwrap_err();
+    assert!(matches!(error, ProtocolError::MissingScanStarted { .. }));
+}
+
+#[test]
+fn non_monotonic_sequence_is_rejected() {
+    let first = with_common(
+        json!({
+            "event": "scan_started",
+            "root": "/fixture",
+            "project_code_executed": false,
+            "safe_mode": true
+        }),
+        2,
+    );
+    let second = with_common(
+        json!({"event": "scan_completed", "coverage": empty_coverage()}),
+        2,
+    );
+    let error = validate_ndjson(Cursor::new(format!("{first}\n{second}\n"))).unwrap_err();
+    assert!(matches!(
+        error,
+        ProtocolError::NonMonotonicSequence {
+            previous: 2,
+            found: 2
+        }
+    ));
+}
+
+#[test]
+fn conflicting_upsert_is_rejected_but_identical_upsert_is_allowed() {
+    let events: Vec<ProtocolEvent> = GOLDEN
+        .lines()
+        .take(3)
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let mut validator = ProtocolValidator::new();
+    for event in events {
+        validator.push(event).unwrap();
+    }
+
+    let original: Value = serde_json::from_str(GOLDEN.lines().nth(2).unwrap()).unwrap();
+    let mut identical = original.clone();
+    identical["seq"] = 4.into();
+    validator
+        .push(serde_json::from_value(identical).unwrap())
+        .expect("identical upsert is idempotent");
+
+    let mut conflicting = original;
+    conflicting["seq"] = 5.into();
+    conflicting["node"]["locator"] = "src/other.ts".into();
+    let error = validator
+        .push(serde_json::from_value(conflicting).unwrap())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProtocolError::ConflictingUpsert { entity: "node", .. }
+    ));
+}
+
+#[test]
+fn site_and_edge_status_mismatch_is_rejected() {
+    let mut lines: Vec<Value> = GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[4]["edge"]["resolution_status"] = "external".into();
+    let input = lines
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let error = validate_ndjson(Cursor::new(input)).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(_)));
+}
+
+#[test]
+fn resolved_site_must_not_target_external_or_unknown_sentinels() {
+    for kind in ["external_system", "unknown_target"] {
+        let mut events = golden_values();
+        events[3]["node"]["kind"] = json!(kind);
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(_)),
+            "resolved target kind {kind} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn scan_coverage_completeness_must_equal_the_profile_intersection() {
+    let mut events = golden_values();
+    events[8]["coverage"]["completeness"] = json!([]);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("profile intersection"))
+    );
+}
+
+#[test]
+fn semantic_completeness_requires_syntax_completeness() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["semantic-complete"]);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("must also report syntax-complete"))
+    );
+}
+
+#[test]
+fn other_adapter_semantic_completeness_remains_independent_from_syntax_completeness() {
+    let mut events = golden_values();
+    events[1]["profile"]["language"] = json!("go");
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["semantic-complete"]);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("protocol 1.0 profiles without a semantic-completeness contract may report it independently");
+}
+
+#[test]
+fn scan_coverage_must_preserve_rust_hir_backend_failure_reason() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] = json!(["syntax-complete"]);
+    }
+    events[8]["coverage"]["reasons"] = json!(["rust-hir-backend-failure"]);
+    events[9]["coverage"]["reasons"] = json!([]);
+
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("omits blocking profile reason rust-hir-backend-failure"))
+    );
+}
+
+#[test]
+fn rust_hir_backend_failure_cannot_claim_semantic_completeness() {
+    let mut events = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["reasons"] = json!(["rust-hir-backend-failure"]);
+    }
+
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("cannot report rust-hir-backend-failure"))
+    );
+}
+
+#[test]
+fn rust_semantic_completeness_rejects_candidate_and_external_sites() {
+    validate_ndjson(Cursor::new(values_to_ndjson(
+        rust_semantic_complete_values(),
+    )))
+    .expect("eligible Rust coverage may report semantic completeness");
+
+    let mut candidate = rust_semantic_complete_values();
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut candidate[event_index][key];
+        payload["resolution_status"] = json!("candidates");
+        payload["precision"] = json!("overapprox");
+    }
+    for coverage_index in [8, 9] {
+        candidate[coverage_index]["coverage"]["resolved"] = json!(0);
+        candidate[coverage_index]["coverage"]["candidates"] = json!(1);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(candidate))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("candidates")),
+        "Rust semantic completeness accepted candidate coverage"
+    );
+
+    let mut external = rust_semantic_complete_values();
+    external[3]["node"]["kind"] = json!("external_system");
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut external[event_index][key];
+        payload["resolution_status"] = json!("external");
+        payload["precision"] = json!("heuristic");
+    }
+    for coverage_index in [8, 9] {
+        external[coverage_index]["coverage"]["resolved"] = json!(0);
+        external[coverage_index]["coverage"]["external"] = json!(1);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(external))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("external")),
+        "Rust semantic completeness accepted external coverage"
+    );
+}
+
+#[test]
+fn rust_semantic_completeness_requires_zero_incomplete_coverage_counts() {
+    for (field, value) in [
+        ("files_skipped", 1),
+        ("unsupported_syntax", 1),
+        ("project_code_executed", 1),
+    ] {
+        let mut events = rust_semantic_complete_values();
+        if field == "files_skipped" {
+            events[8]["coverage"]["files_analyzed"] = json!(0);
+        }
+        events[8]["coverage"][field] = if field == "project_code_executed" {
+            json!(true)
+        } else {
+            json!(value)
+        };
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(field)),
+            "Rust semantic completeness accepted {field}"
+        );
+    }
+
+    let mut unresolved = rust_semantic_complete_values();
+    unresolved[3]["node"]["kind"] = json!("unknown_target");
+    unresolved[5]["site"]["resolution_status"] = json!("unresolved");
+    unresolved[5]["site"]["precision"] = json!("heuristic");
+    unresolved[5]["site"]["reason"] = json!("target is unknown");
+    unresolved[4]["edge"]["resolution_status"] = json!("unresolved");
+    unresolved[4]["edge"]["precision"] = json!("heuristic");
+    unresolved[8]["coverage"]["resolved"] = json!(0);
+    unresolved[8]["coverage"]["unresolved"] = json!(1);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unresolved))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("unresolved")));
+
+    let mut reason = rust_semantic_complete_values();
+    for coverage_index in [8, 9] {
+        reason[coverage_index]["coverage"]["reasons"] = json!(["rust-hir-sysroot-unavailable"]);
+    }
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(reason))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("coverage reasons"))
+    );
+}
+
+#[test]
+fn rust_semantic_completeness_requires_exact_backend_properties() {
+    let cases = [
+        ("analysis", json!("syntax")),
+        ("analysis_backend", json!("static-syntax")),
+        ("rust_hir_backend", json!("disabled")),
+        ("rust_hir_status", json!("import-type-call-graph-partial")),
+        ("rust_hir_project_model", json!("unavailable")),
+        ("rust_hir_sysroot_status", json!("unavailable")),
+        ("rust_hir_sysroot_file_count", json!(0)),
+        ("rust_hir_sysroot_crate_count", json!(0)),
+        ("rust_hir_project_external_count", json!(1)),
+        (
+            "rust_hir_sysroot_contract_version",
+            json!("rust-src-data-tree-v0"),
+        ),
+        (
+            "rust_hir_sysroot_component_version",
+            json!("1.93.1+rustc.mismatch"),
+        ),
+        ("rust_hir_sysroot_source_layout", json!("unknown-layout")),
+        (
+            "rust_hir_enable_gate",
+            json!("fallback-and-release-gates-pending"),
+        ),
+        ("crate_graph_source", json!("static-manifest-fallback")),
+        ("cargo_metadata_input", json!("project-cargo")),
+        ("rust_hir_toolchain_status", json!("unsupported")),
+        ("proc_macro_expansion", json!("enabled")),
+        ("build_script_policy", json!("enabled")),
+        ("proc_macro_policy", json!("enabled")),
+        ("rust_hir_semantic_issue_count", json!(1)),
+        ("project_code_executed", json!(true)),
+        ("project_toolchain_executed", json!(true)),
+        ("build_scripts_executed", json!(true)),
+        ("proc_macros_executed", json!(true)),
+    ];
+    for (property, replacement) in cases {
+        let mut events = rust_semantic_complete_values();
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(property)),
+            "Rust semantic completeness accepted invalid {property}"
+        );
+    }
+}
+
+#[test]
+fn rust_semantic_completeness_requires_exact_effective_toolchain_attestation() {
+    let cases: Vec<(Vec<&str>, Value)> = vec![
+        (
+            vec!["contract"],
+            json!("installed-verified-rust-toolchain-v0"),
+        ),
+        (vec!["status"], json!("unsupported")),
+        (vec!["rustc", "release"], json!("1.97.1")),
+        (vec!["rustc", "commit_hash"], json!("mismatch")),
+        (vec!["cargo", "commit_hash"], json!("mismatch")),
+        (vec!["cargo", "host"], json!("other-host")),
+        (vec!["rustc", "sha256"], json!("sha256:short")),
+    ];
+    for (path, replacement) in cases {
+        let mut events = rust_semantic_complete_values();
+        let mut value = &mut events[1]["profile"]["properties"]["rust_hir_toolchain_attestation"];
+        for component in &path[..path.len() - 1] {
+            value = &mut value[*component];
+        }
+        value[path[path.len() - 1]] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("toolchain attestation") || message.contains("rustc/Cargo attestation"))
+        );
+    }
+}
+
+#[test]
+fn rust_semantic_completeness_requires_the_verified_release_gate() {
+    validate_ndjson(Cursor::new(values_to_ndjson(
+        rust_semantic_complete_values(),
+    )))
+    .expect("the verified Rust semantic completeness gate must be accepted");
+
+    let mut pending = rust_semantic_complete_values();
+    pending[1]["profile"]["properties"]["rust_hir_enable_gate"] = json!("release-gate-pending");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(pending))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("rust_hir_enable_gate")),
+        "Rust semantic completeness accepted a development release gate"
+    );
+}
+
+#[test]
+fn web_semantic_completeness_accepts_candidate_and_external_sites() {
+    validate_ndjson(Cursor::new(
+        values_to_ndjson(web_semantic_complete_values()),
+    ))
+    .expect("eligible pure Web coverage may report semantic completeness");
+
+    let mut candidate = web_semantic_complete_values();
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut candidate[event_index][key];
+        payload["resolution_status"] = json!("candidates");
+        payload["precision"] = json!("overapprox");
+    }
+    for coverage_index in [8, 9] {
+        candidate[coverage_index]["coverage"]["resolved"] = json!(0);
+        candidate[coverage_index]["coverage"]["candidates"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(candidate)))
+        .expect("candidate sites do not make an otherwise complete Web profile incomplete");
+
+    let mut external = web_semantic_complete_values();
+    external[3]["node"]["kind"] = json!("external_system");
+    for (event_index, key) in [(4, "edge"), (5, "site")] {
+        let payload = &mut external[event_index][key];
+        payload["resolution_status"] = json!("external");
+        payload["precision"] = json!("heuristic");
+    }
+    for coverage_index in [8, 9] {
+        external[coverage_index]["coverage"]["resolved"] = json!(0);
+        external[coverage_index]["coverage"]["external"] = json!(1);
+    }
+    validate_ndjson(Cursor::new(values_to_ndjson(external)))
+        .expect("external sites do not make an otherwise complete Web profile incomplete");
+}
+
+#[test]
+fn web_semantic_completeness_requires_framework_ledger_and_zero_coverage_gaps() {
+    let mut framework = web_semantic_complete_values();
+    framework[1]["profile"]["features"] = json!(["next"]);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(framework))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("omitted its framework completeness ledger"))
+    );
+
+    let mut complete_framework = web_semantic_complete_values();
+    promote_web_framework_semantic_complete(&mut complete_framework, "next");
+    validate_ndjson(Cursor::new(values_to_ndjson(complete_framework)))
+        .expect("a framework profile with a complete capability ledger may be semantic-complete");
+
+    for (property, replacement) in [
+        ("web_framework_completeness_status", json!("incomplete")),
+        ("web_framework_completeness_issue_count", json!("1")),
+    ] {
+        let mut events = web_semantic_complete_values();
+        promote_web_framework_semantic_complete(&mut events, "next");
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("complete with zero issues")),
+            "Web semantic completeness accepted invalid {property}"
+        );
+    }
+
+    let mut unsorted = web_semantic_complete_values();
+    promote_web_framework_semantic_complete(&mut unsorted, "next");
+    unsorted[1]["profile"]["properties"]["web_framework_completeness_ledger"] = json!(
+        json!([{
+            "framework": "next",
+            "required_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "emitted_capabilities": [
+                "typescript-definition-import-type-call-graph-v2",
+                "next-route-component-boundary-v1",
+                "framework-semantic-graph-v1"
+            ],
+            "status": "complete",
+            "reasons": []
+        }])
+        .to_string()
+    );
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unsorted))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("did not emit every required capability"))
+    );
+
+    for (field, value) in [
+        ("files_skipped", json!(1)),
+        ("unsupported_syntax", json!(1)),
+        ("project_code_executed", json!(true)),
+    ] {
+        let mut events = web_semantic_complete_values();
+        if field == "files_skipped" {
+            events[8]["coverage"]["files_analyzed"] = json!(0);
+        }
+        events[8]["coverage"][field] = value;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(field)),
+            "Web semantic completeness accepted {field}"
+        );
+    }
+
+    let mut unresolved = web_semantic_complete_values();
+    unresolved[3]["node"]["kind"] = json!("unknown_target");
+    unresolved[5]["site"]["resolution_status"] = json!("unresolved");
+    unresolved[5]["site"]["precision"] = json!("heuristic");
+    unresolved[5]["site"]["reason"] = json!("target is unknown");
+    unresolved[4]["edge"]["resolution_status"] = json!("unresolved");
+    unresolved[4]["edge"]["precision"] = json!("heuristic");
+    unresolved[8]["coverage"]["resolved"] = json!(0);
+    unresolved[8]["coverage"]["unresolved"] = json!(1);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(unresolved))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("unresolved")));
+
+    let mut reason = web_semantic_complete_values();
+    reason[8]["coverage"]["reasons"] = json!(["typescript_project_model_failure"]);
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(reason))).unwrap_err();
+    assert!(
+        matches!(error, ProtocolError::Invariant(message) if message.contains("coverage reasons"))
+    );
+}
+
+#[test]
+fn web_semantic_completeness_requires_exact_safe_compiler_properties() {
+    let cases = [
+        ("bundled_typescript", json!("false")),
+        ("typescript_syntax_compiler", json!("native-7.0.3")),
+        ("typescript_compiler_source", json!("project-local")),
+        ("typescript_compiler_version", json!("7.0.3")),
+        ("typescript_compiler_selection", json!("best-effort")),
+        ("typescript_compiler_fallback", json!("syntax-only")),
+        ("typescript_analysis_mode", json!("syntax")),
+        ("typescript_project_local_policy", json!("load")),
+        ("typescript_project_local_loaded", json!("true")),
+        (
+            "typescript_typechecker_status",
+            json!("definition-import-type-call-graph-discarded"),
+        ),
+        ("typescript_project_model_status", json!("failed")),
+        (
+            "typescript_project_model_failure_reason",
+            json!("compiler_timeout"),
+        ),
+        ("typescript_project_config", json!("project-tsconfig")),
+        ("typescript_module_resolution", json!("host-filesystem")),
+        ("typescript_standard_library_source", json!("project")),
+        (
+            "typescript_semantic_graph_emission",
+            json!("definition-import-type-call-graph-v1"),
+        ),
+        ("typescript_compiler_processes", json!("2")),
+        ("typescript_project_filesystem", json!("host")),
+        ("typescript_definition_graph_status", json!("failed")),
+        ("typescript_semantic_diagnostics", json!("1")),
+        ("typescript_emitted_semantic_diagnostics", json!("1")),
+        ("typescript_semantic_issue_count", json!("1")),
+        ("project_code_executed", json!("true")),
+    ];
+    for (property, replacement) in cases {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["properties"][property] = replacement;
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains(property)),
+            "Web semantic completeness accepted invalid {property}"
+        );
+    }
+
+    let mut mismatched_integrity = web_semantic_complete_values();
+    mismatched_integrity[1]["profile"]["properties"]["typescript_standard_library_integrity"] =
+        json!("core-attested-whole-tree");
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(mismatched_integrity))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(message) if message.contains("release gate")));
+}
+
+#[test]
+fn web_semantic_completeness_accepts_confined_declaration_resolution() {
+    let mut events = web_semantic_complete_values();
+    events[1]["profile"]["properties"]["typescript_module_resolution"] =
+        json!("inventory-and-confined-declarations");
+    validate_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("confined declaration resolution must be accepted");
+}
+
+#[test]
+fn web_semantic_completeness_accepts_pending_and_verified_release_gates() {
+    for (gate, integrity) in [
+        (
+            "release-gate-pending",
+            "build-produced-pending-core-attestation",
+        ),
+        ("release-gate-verified", "core-attested-whole-tree"),
+    ] {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["properties"]["typescript_release_gate"] = json!(gate);
+        events[1]["profile"]["properties"]["typescript_standard_library_integrity"] =
+            json!(integrity);
+        validate_ndjson(Cursor::new(values_to_ndjson(events)))
+            .unwrap_or_else(|error| panic!("Web semantic completeness rejected {gate}: {error}"));
+    }
+}
+
+#[test]
+fn typescript_and_javascript_semantic_completeness_use_the_web_contract() {
+    for language in ["typescript", "javascript"] {
+        let mut events = web_semantic_complete_values();
+        events[1]["profile"]["language"] = json!(language);
+        validate_ndjson(Cursor::new(values_to_ndjson(events.clone())))
+            .unwrap_or_else(|error| panic!("{language} semantic completeness rejected: {error}"));
+
+        events[1]["profile"]["properties"]["typescript_semantic_diagnostics"] = json!("1");
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("typescript_semantic_diagnostics")),
+            "{language} semantic completeness bypassed the Web property contract"
+        );
+    }
+}
+
+#[test]
+fn safe_profile_cannot_hide_project_code_execution() {
+    for mut events in [golden_values(), rust_semantic_complete_values()] {
+        events[8]["coverage"]["project_code_executed"] = json!(true);
+        let error = validate_safe_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(message) if message.contains("safe-mode profile"))
+        );
+    }
+}
+
+#[test]
+fn edge_condition_may_narrow_a_multi_environment_site() {
+    let mut events = golden_values();
+    events[4]["edge"]["condition"] = json!({
+        "op":"all",
+        "conditions":[
+            {"op":"eq", "key":"mode", "value":"production"},
+            {"op":"eq", "key":"environment", "value":"browser"}
+        ]
+    });
+    validate_ndjson(Cursor::new(values_to_ndjson(events)))
+        .expect("an edge may select one conditioned target of a broader site");
+}
+
+#[test]
+fn schema_and_typed_validator_reject_the_same_field_shape_violations() {
+    let cases = [
+        (1, vec!["profile", "toolchain"], json!([])),
+        (2, vec!["node", "id"], json!("")),
+        (
+            4,
+            vec!["edge", "condition"],
+            json!({"op":"eq", "key":"mode", "value":{"nested":true}}),
+        ),
+        (
+            4,
+            vec!["edge", "condition"],
+            json!({"op":"in", "key":"mode", "values":[["production"]]}),
+        ),
+        (4, vec!["edge", "condition"], json!({"op":"true"})),
+        (4, vec!["edge", "evidence", "0", "start_line"], json!(0)),
+        (4, vec!["edge", "evidence", "0", "path"], json!("")),
+        (
+            8,
+            vec!["coverage", "completeness"],
+            json!(["syntax-complete", "syntax-complete"]),
+        ),
+        (7, vec!["skipped"], json!(true)),
+    ];
+    for (line, path, replacement) in cases {
+        let mut events = golden_values();
+        set_json_path(&mut events[line], &path, replacement);
+        let input = values_to_ndjson(events);
+        assert!(
+            !schema_accepts_stream(&input),
+            "schema unexpectedly accepted {path:?}"
+        );
+        assert!(
+            validate_ndjson(Cursor::new(input)).is_err(),
+            "typed validator unexpectedly accepted {path:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_validator_rejects_reversed_spans() {
+    let mut events = golden_values();
+    events[4]["edge"]["evidence"][0]["start_line"] = 2.into();
+    events[4]["edge"]["evidence"][0]["end_line"] = 1.into();
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(_)));
+}
+
+#[test]
+fn dependency_sites_and_edges_require_explainable_evidence() {
+    let cases = [
+        (4, vec!["edge", "evidence"], json!([])),
+        (5, vec!["site", "evidence"], json!([])),
+        (
+            4,
+            vec!["edge", "evidence"],
+            json!([{
+                "kind": "source",
+                "extractor": "typescript-static",
+                "extractor_version": "0.1.0",
+                "properties": {}
+            }]),
+        ),
+        (
+            5,
+            vec!["site", "evidence"],
+            json!([{
+                "kind": "source",
+                "extractor": "typescript-static",
+                "extractor_version": "0.1.0",
+                "properties": {}
+            }]),
+        ),
+    ];
+
+    for (line, path, replacement) in cases {
+        let mut events = golden_values();
+        set_json_path(&mut events[line], &path, replacement);
+        let input = values_to_ndjson(events);
+        assert!(
+            !schema_accepts_stream(&input),
+            "schema unexpectedly accepted missing evidence/span at {path:?}"
+        );
+        assert!(
+            validate_ndjson(Cursor::new(input)).is_err(),
+            "typed validator unexpectedly accepted missing evidence/span at {path:?}"
+        );
+    }
+}
+
+#[test]
+fn build_and_runtime_edges_may_use_non_source_evidence_without_a_span() {
+    let input = values_to_ndjson(build_values());
+    assert!(schema_accepts_stream(&input));
+    validate_build_ndjson(Cursor::new(input)).expect("build evidence may use an artifact anchor");
+
+    let mut runtime = golden_values();
+    runtime[4]["edge"]["phase"] = json!("runtime");
+    runtime[4]["edge"]["evidence"] = json!([{
+        "kind": "runtime",
+        "extractor": "runtime-import",
+        "extractor_version": "0.1.0",
+        "properties": {}
+    }]);
+    validate_ndjson(Cursor::new(values_to_ndjson(runtime)))
+        .expect("runtime evidence remains protocol-compatible");
+}
+
+#[test]
+fn safe_scan_may_use_spanned_build_evidence_for_existing_generated_artifacts() {
+    let mut events = golden_values();
+    let generated_artifact = json!({
+        "kind": "build",
+        "extractor": "generated-artifact-reader",
+        "extractor_version": "0.1.0",
+        "path": "generated/routes.ts",
+        "start_line": 1,
+        "start_column": 1,
+        "end_line": 1,
+        "end_column": 12,
+        "properties": {}
+    });
+    events[4]["edge"]["evidence"] = json!([generated_artifact.clone()]);
+    events[5]["site"]["evidence"] = json!([generated_artifact]);
+    let input = values_to_ndjson(events);
+
+    assert!(schema_accepts_stream(&input));
+    validate_safe_ndjson(Cursor::new(input))
+        .expect("pre-existing generated artifacts are not supervised build observations");
+}
+
+#[test]
+fn strict_build_contract_accepts_observed_union_and_rejects_unauthorized_or_malformed_delta() {
+    let events = build_values();
+    let input = values_to_ndjson(events.clone());
+    assert!(schema_accepts_stream(&input));
+    validate_build_ndjson(Cursor::new(&input)).expect("valid build delta");
+
+    let mut unauthorized = events.clone();
+    unauthorized[0]["safe_mode"] = json!(true);
+    assert!(validate_build_ndjson(Cursor::new(values_to_ndjson(unauthorized))).is_err());
+
+    let mut wrong_phase = events.clone();
+    wrong_phase[4]["edge"]["phase"] = json!("semantic");
+    assert!(validate_ndjson(Cursor::new(values_to_ndjson(wrong_phase))).is_err());
+
+    let mut missing_digest = events.clone();
+    missing_digest[5]["site"]["evidence"][0]["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("validated_output_digest");
+    let malformed = values_to_ndjson(missing_digest);
+    assert!(!schema_accepts_stream(&malformed));
+    assert!(validate_ndjson(Cursor::new(malformed)).is_err());
+
+    let mut secret = events;
+    secret[4]["edge"]["evidence"][0]["properties"]["api_token"] = json!("forbidden");
+    assert!(validate_ndjson(Cursor::new(values_to_ndjson(secret))).is_err());
+
+    let mut diagnostic_secret = build_values();
+    diagnostic_secret[6]["diagnostic"]["properties"]["session_cookie"] = json!("forbidden");
+    assert!(
+        validate_build_ndjson(Cursor::new(values_to_ndjson(diagnostic_secret))).is_err(),
+        "secret-like keys anywhere in observer output must be rejected"
+    );
+}
+
+fn build_values() -> Vec<Value> {
+    let mut events = golden_values();
+    events[0]["safe_mode"] = json!(false);
+    events[0]["project_code_executed"] = json!(true);
+    events[4]["edge"]["phase"] = json!("build");
+    events[4]["edge"]["precision"] = json!("observed");
+    events[4]["edge"]["evidence"] = json!([{
+        "kind": "build",
+        "extractor": "build-observer",
+        "extractor_version": "0.1.0",
+        "properties": build_provenance()
+    }]);
+    events[5]["site"]["precision"] = json!("observed");
+    events[5]["site"]["evidence"] = json!([{
+        "kind": "build",
+        "extractor": "build-observer",
+        "extractor_version": "0.1.0",
+        "properties": build_provenance()
+    }]);
+    for index in [8, 9] {
+        events[index]["coverage"]["project_code_executed"] = json!(true);
+        events[index]["coverage"]["completeness"] = json!(["build-observed"]);
+    }
+    let site: DependencySite = serde_json::from_value(events[5]["site"].clone()).unwrap();
+    let site_id = build_site_stable_id(&site).unwrap();
+    events[5]["site"]["id"] = json!(site_id);
+    events[4]["edge"]["site_id"] = events[5]["site"]["id"].clone();
+    let edge: GraphEdge = serde_json::from_value(events[4]["edge"].clone()).unwrap();
+    events[4]["edge"]["id"] = json!(build_edge_stable_id(&edge).unwrap());
+    events
+}
+
+fn build_provenance() -> Value {
+    json!({
+        "build_run_id": "build-run-1",
+        "profile_id": "web:production:server",
+        "command_plan_digest": "a".repeat(64),
+        "toolchain_executable_digest": "b".repeat(64),
+        "environment_key_set_digest": "c".repeat(64),
+        "validated_output_digest": "d".repeat(64),
+        "logical_artifact_path": "dist/manifest.json",
+        "artifact_digest": "e".repeat(64)
+    })
+}
+
+#[test]
+fn skipped_sites_is_backward_compatible_and_conserves_the_file_ledger() {
+    let validated = validate_ndjson(Cursor::new(GOLDEN)).unwrap();
+    let file = validated
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEvent::FileCompleted(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(file.skipped_sites, 0, "missing v1 field defaults to zero");
+
+    let mut events = golden_values();
+    events[7]["discovered_sites"] = 2.into();
+    events[7]["skipped_sites"] = 1.into();
+    events[7]["skipped"] = true.into();
+    events[7]["reason"] = "one site could not be emitted".into();
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["files_analyzed"] = 0.into();
+        events[coverage_index]["coverage"]["files_skipped"] = 1.into();
+    }
+    let input = values_to_ndjson(events);
+    assert!(schema_accepts_stream(&input));
+    validate_ndjson(Cursor::new(input)).expect("expected=produced+skipped ledger must validate");
+
+    let mut invalid = golden_values();
+    invalid[7]["discovered_sites"] = 2.into();
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(invalid))).unwrap_err();
+    assert!(matches!(error, ProtocolError::Invariant(_)));
+}
+
+#[test]
+fn coverage_conservation_applies_to_profile_and_scan_summaries() {
+    for event_index in [8, 9] {
+        let mut events = golden_values();
+        events[event_index]["coverage"]["files_discovered"] = 2.into();
+        let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Invariant(_)),
+            "coverage event at index {event_index} must conserve analyzed + skipped"
+        );
+    }
+}
+
+#[test]
+fn payload_after_profile_completion_is_rejected() {
+    let mut validator = ProtocolValidator::new();
+    for line in GOLDEN.lines().take(9) {
+        validator
+            .push(serde_json::from_str(line).unwrap())
+            .expect("golden prefix must validate");
+    }
+    let mut node: Value = serde_json::from_str(GOLDEN.lines().nth(2).unwrap()).unwrap();
+    node["seq"] = 10.into();
+    let error = validator
+        .push(serde_json::from_value(node).unwrap())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProtocolError::PayloadAfterProfileCompletion {
+            found: "node_upsert"
+        }
+    ));
+}
+
+#[test]
+fn evidence_path_must_stay_within_the_scan_root() {
+    let mut lines: Vec<Value> = GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    lines[4]["edge"]["evidence"][0]["path"] = "../secret.txt".into();
+    let input = lines
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let error = validate_ndjson(Cursor::new(input)).unwrap_err();
+    assert!(matches!(error, ProtocolError::UnsafePath { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn evidence_symlink_must_not_escape_the_scan_root() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), root.path().join("escape")).unwrap();
+
+    let mut events = golden_values();
+    events[0]["root"] = root.path().to_string_lossy().into_owned().into();
+    // The leaf need not exist: resolving the longest existing ancestor still
+    // exposes that the symlinked directory leaves the repository.
+    events[4]["edge"]["evidence"][0]["path"] = "escape/missing.ts".into();
+    let error = validate_ndjson(Cursor::new(values_to_ndjson(events))).unwrap_err();
+    assert!(matches!(error, ProtocolError::UnsafePath { .. }));
+}
+
+#[test]
+fn oversized_line_is_rejected_before_deserialization() {
+    let input = vec![b'x'; MAX_EVENT_LINE_BYTES + 1];
+    let error = validate_ndjson(Cursor::new(input)).unwrap_err();
+    assert!(matches!(error, ProtocolError::LineTooLong { line: 1, .. }));
+}
+
+fn minimal_stream(first: Value, second: Value) -> String {
+    format!("{}\n{}\n", with_common(first, 1), with_common(second, 2))
+}
+
+fn with_common(mut value: Value, seq: u64) -> Value {
+    let object = value.as_object_mut().unwrap();
+    object.insert("protocol_version".into(), "1.0".into());
+    object.insert("scan_id".into(), "scan-test".into());
+    object.insert("adapter".into(), "test".into());
+    object.insert("adapter_version".into(), "0.1.0".into());
+    object.insert("seq".into(), seq.into());
+    value
+}
+
+fn empty_coverage() -> Value {
+    json!({
+        "profiles": 0,
+        "files_discovered": 0,
+        "files_analyzed": 0,
+        "files_skipped": 0,
+        "dependency_sites": 0,
+        "resolved": 0,
+        "candidates": 0,
+        "external": 0,
+        "unresolved": 0,
+        "unsupported_syntax": 0,
+        "project_code_executed": false,
+        "completeness": [],
+        "reasons": []
+    })
+}
+
+fn golden_values() -> Vec<Value> {
+    GOLDEN
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn rust_semantic_complete_values() -> Vec<Value> {
+    let mut events = golden_values();
+    for event in &mut events {
+        event["adapter"] = json!("rust");
+    }
+    events[1]["profile"]["id"] = json!("rust:test");
+    events[1]["profile"]["language"] = json!("rust");
+    events[1]["profile"]["properties"] = json!({
+        "analysis": "syntax+hir-imports-types-calls",
+        "analysis_backend": "static-syntax+rust-analyzer-hir",
+        "rust_hir_backend": "rust-analyzer-hir",
+        "rust_hir_status": "import-type-call-graph-emitted",
+        "rust_hir_project_model": "ready",
+        "rust_hir_enable_gate": "release-gate-verified",
+        "rust_hir_sysroot_status": "attested",
+        "rust_hir_sysroot_file_count": 3,
+        "rust_hir_sysroot_crate_count": 3,
+        "rust_hir_project_external_count": 0,
+        "rust_hir_sysroot_contract_version": "rust-src-data-tree-v1",
+        "rust_hir_sysroot_component_version": "1.93.1+rustc.01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+        "rust_hir_sysroot_source_layout": "rustup-rust-src-library-v1",
+        "crate_graph_source": "confined-cargo-metadata",
+        "cargo_metadata_input": "confined-mirror",
+        "rust_toolchain_probe_status": "unsupported",
+        "rust_hir_toolchain_status": "compatible",
+        "rust_hir_toolchain_selection": "installed-verified-baseline",
+        "rust_hir_toolchain_attestation": {
+            "contract": "installed-verified-rust-toolchain-v1",
+            "selection": "installed-verified-baseline",
+            "status": "compatible",
+            "rustc": {
+                "command": "rustc 1.93.1",
+                "release": "1.93.1",
+                "commit_hash": "01f6ddf7588f42ae2d7eb0a2f21d44e8e96674cf",
+                "host": "test-host",
+                "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "cargo": {
+                "command": "cargo 1.93.1",
+                "release": "1.93.1",
+                "commit_hash": "083ac5135f967fd9dc906ab057a2315861c7a80d",
+                "host": "test-host",
+                "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        },
+        "proc_macro_expansion": "disabled",
+        "build_script_policy": "disabled",
+        "proc_macro_policy": "disabled",
+        "rust_hir_semantic_issue_count": 0,
+        "project_code_executed": false,
+        "project_toolchain_executed": false,
+        "build_scripts_executed": false,
+        "proc_macros_executed": false
+    });
+    events[4]["edge"]["profile_id"] = json!("rust:test");
+    events[5]["site"]["profile_id"] = json!("rust:test");
+    events[6]["diagnostic"]["profile_id"] = json!("rust:test");
+    events[8]["profile_id"] = json!("rust:test");
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] =
+            json!(["syntax-complete", "semantic-complete"]);
+    }
+    events
+}
+
+fn web_semantic_complete_values() -> Vec<Value> {
+    let mut events = golden_values();
+    events[1]["profile"]["language"] = json!("web");
+    events[1]["profile"]["properties"] = json!({
+        "bundled_typescript": "true",
+        "typescript_syntax_compiler": "native-7.0.2",
+        "typescript_compiler_source": "bundled",
+        "typescript_compiler_version": "7.0.2",
+        "typescript_compiler_selection": "bundled-only",
+        "typescript_compiler_fallback": "fail-closed",
+        "typescript_analysis_mode": "semantic-import-type-call-graph",
+        "typescript_project_local_policy": "metadata-only",
+        "typescript_project_local_loaded": "false",
+        "typescript_typechecker_status": "definition-import-type-call-graph-emitted",
+        "typescript_project_model_status": "ready",
+        "typescript_project_model_failure_reason": "none",
+        "typescript_project_config": "worker-neutral-allowlist",
+        "typescript_module_resolution": "inventory-only",
+        "typescript_standard_library_source": "bundled",
+        "typescript_standard_library_integrity": "build-produced-pending-core-attestation",
+        "typescript_release_gate": "release-gate-pending",
+        "typescript_semantic_graph_emission": "definition-import-type-call-graph-v2",
+        "typescript_compiler_processes": "1",
+        "typescript_project_filesystem": "isolated-virtual",
+        "typescript_definition_graph_status": "ready",
+        "typescript_semantic_diagnostics": "0",
+        "typescript_emitted_semantic_diagnostics": "0",
+        "typescript_semantic_issue_count": "0",
+        "project_code_executed": "false"
+    });
+    for coverage_index in [8, 9] {
+        events[coverage_index]["coverage"]["completeness"] =
+            json!(["syntax-complete", "semantic-complete"]);
+    }
+    events
+}
+
+fn promote_web_framework_semantic_complete(events: &mut [Value], framework: &str) {
+    let framework_capability = match framework {
+        "next" => "next-route-component-boundary-v1",
+        "astro" => "astro-component-render-hydration-v1",
+        "tanstack-router" => "tanstack-router-typed-route-v1",
+        "tanstack-start" => "tanstack-start-rpc-middleware-v1",
+        _ => panic!("unsupported framework test fixture: {framework}"),
+    };
+    let required_capabilities = json!([
+        "framework-semantic-graph-v1",
+        framework_capability,
+        "typescript-definition-import-type-call-graph-v2"
+    ]);
+    events[1]["profile"]["features"] = json!([framework]);
+    events[1]["profile"]["properties"]["web_framework_completeness_capability"] =
+        json!("framework-semantic-completeness-v1");
+    events[1]["profile"]["properties"]["web_framework_completeness_status"] = json!("complete");
+    events[1]["profile"]["properties"]["web_framework_completeness_issue_count"] = json!("0");
+    events[1]["profile"]["properties"]["web_framework_completeness_ledger"] = json!(
+        json!([{
+            "framework": framework,
+            "required_capabilities": required_capabilities,
+            "emitted_capabilities": required_capabilities,
+            "status": "complete",
+            "reasons": []
+        }])
+        .to_string()
+    );
+}
+
+fn values_to_ndjson(values: Vec<Value>) -> String {
+    values
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn schema_accepts_stream(input: &str) -> bool {
+    let schema: Value = serde_json::from_str(PROTOCOL_SCHEMA).unwrap();
+    let validator = jsonschema::draft202012::new(&schema).unwrap();
+    input.lines().all(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|event| validator.is_valid(&event))
+    })
+}
+
+fn set_json_path(value: &mut Value, path: &[&str], replacement: Value) {
+    if let Some((head, tail)) = path.split_first() {
+        if tail.is_empty() {
+            if let Ok(index) = head.parse::<usize>() {
+                value[index] = replacement;
+            } else {
+                value[*head] = replacement;
+            }
+        } else if let Ok(index) = head.parse::<usize>() {
+            set_json_path(&mut value[index], tail, replacement);
+        } else {
+            set_json_path(&mut value[*head], tail, replacement);
+        }
+    }
+}

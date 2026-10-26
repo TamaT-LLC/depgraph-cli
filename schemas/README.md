@@ -25,7 +25,7 @@ The request-level projection a worker receives is the `split` object of a
 `depgraph-analysis-unit-v2` request (`$defs/splitBinding`). The core planner in
 `crates/depgraph-core/src/analysis_split.rs` is the semantic authority; the
 public fixture under `fixtures/analysis-split-plan-v1` and
-`crates/depgraph-core/tests/analysis_split_contract.rs` are its evidence. See
+`crates/depgraph-core/tests/it/analysis_split_contract.rs` are its evidence. See
 `docs/40_arch_design/adr-presplit-analysis-planning.md`. The shipped Go worker
 advertises `analysis-loader-scope-v1` and `analysis-go-package-loader-v1`;
 the request `split` object is the closed `$defs/splitBinding` and the worker
@@ -47,7 +47,7 @@ trace-derived project-execution observation; report verification recomputes
 the safety verdicts from that digest-bound raw artifact.
 
 `depgraph-mcp-tools-v1.schema.json` is the checked-in JSON Schema 2020-12 catalog
-for the closed Agent-facing contracts implemented by `depgraph-mcp-tools`. It covers
+for the closed Agent-facing contracts implemented by `depgraph-agent-contract`. It covers
 the common request and versioned envelopes, snapshot selector, bounded page/cursor,
 typed errors, summarized graph DTOs, closed bounded-query row/runtime-validation
 DTOs, portable `OperationAccepted`, and the Q-002 Option A additive Tasks result.
@@ -59,8 +59,8 @@ absolute, traversing, backslash, Windows drive/UNC/ADS, and reserved-device form
 Arbitrary metadata/properties, raw evidence detail, and absolute root/store paths
 are not fields in these DTOs.
 
-The source of truth is `crates/depgraph-mcp-tools`; regenerate the catalog with
-`cargo run -p depgraph-mcp-tools --bin generate-schema --
+The source of truth is `crates/depgraph-agent-contract`; regenerate the catalog with
+`cargo run -p depgraph-agent-contract --bin generate-schema --
 schemas/depgraph-mcp-tools-v1.schema.json`. The output is canonical JSON with no
 trailing newline. Integration tests require byte-for-byte equality with the
 checked-in catalog, its SHA-256 fixture, and the canonical contract-sample golden;
@@ -70,7 +70,7 @@ contract, including the Issue #304 query/runtime additions; they are not an MCP
 transport/server implementation.
 
 The catalog is a structural preflight contract, not the complete semantic validator.
-Consumers **MUST** deserialize with `depgraph-mcp-tools` (or enforce equivalent
+Consumers **MUST** deserialize with `depgraph-agent-contract` (or enforce equivalent
 semantic checks) after schema validation. JSON Schema 2020-12 cannot express the
 cross-value arithmetic used by this contract: `returned_items == items.len()`,
 `total_items >= returned_items`, query path depth/topology, runtime match status and

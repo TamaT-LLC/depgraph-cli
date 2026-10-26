@@ -506,14 +506,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "depgraph-agent-contract"
+version = "0.7.3"
+dependencies = [
+ "chacha20poly1305",
+ "depgraph-core",
+ "depgraph-protocol",
+ "depgraph-store",
+ "hex",
+ "jsonschema",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "workspace-hack",
+ "zeroize",
+]
+
+[[package]]
 name = "depgraph-cli"
 version = "0.7.3"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "depgraph-agent-contract",
  "depgraph-core",
- "depgraph-mcp-tools",
  "depgraph-operation",
  "depgraph-protocol",
  "depgraph-store",
@@ -536,12 +555,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "depgraph-contract-scan"
+version = "0.7.3"
+dependencies = [
+ "anyhow",
+ "depgraph-protocol",
+ "hex",
+ "petgraph",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "walkdir",
+ "workspace-hack",
+]
+
+[[package]]
 name = "depgraph-core"
 version = "0.7.3"
 dependencies = [
  "anyhow",
  "caseless",
  "chrono",
+ "depgraph-contract-scan",
  "depgraph-protocol",
  "depgraph-store",
  "directories",
@@ -552,8 +590,6 @@ dependencies = [
  "libc",
  "notify",
  "petgraph",
- "prost",
- "prost-types",
  "rusqlite",
  "serde",
  "serde_json",
@@ -577,8 +613,8 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "depgraph-agent-contract",
  "depgraph-core",
- "depgraph-mcp-tools",
  "depgraph-operation",
  "depgraph-store",
  "jsonschema",
@@ -596,32 +632,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "depgraph-mcp-tools"
-version = "0.7.3"
-dependencies = [
- "chacha20poly1305",
- "depgraph-core",
- "depgraph-protocol",
- "depgraph-store",
- "hex",
- "jsonschema",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "workspace-hack",
- "zeroize",
-]
-
-[[package]]
 name = "depgraph-operation"
 version = "0.7.3"
 dependencies = [
  "clap",
+ "depgraph-agent-contract",
  "depgraph-core",
- "depgraph-mcp-tools",
  "getrandom 0.3.4",
  "libc",
  "rusqlite",
@@ -640,12 +656,14 @@ name = "depgraph-protocol"
 version = "0.7.3"
 dependencies = [
  "jsonschema",
+ "libc",
  "pretty_assertions",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "windows-sys 0.61.2",
  "workspace-hack",
 ]
 
@@ -3738,6 +3756,7 @@ dependencies = [
  "aho-corasick",
  "bitflags",
  "bstr",
+ "bytes",
  "chrono",
  "crossbeam-utils",
  "crypto-common",
@@ -3758,7 +3777,6 @@ dependencies = [
  "quote",
  "regex-automata",
  "regex-syntax",
- "rmcp",
  "schemars",
  "serde",
  "serde_core",
@@ -3767,12 +3785,11 @@ dependencies = [
  "syn 2.0.119",
  "syn 3.0.3",
  "tokio",
- "tokio-util",
  "toml_parser",
  "toml_writer",
+ "tracing",
  "tracing-core",
  "tracing-subscriber",
- "uuid",
  "windows-sys 0.60.2",
  "windows-sys 0.61.2",
  "winnow 1.0.4",
@@ -3789,14 +3806,17 @@ name = "xtask"
 version = "0.7.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
+ "depgraph-agent-contract",
+ "depgraph-contract-scan",
  "depgraph-core",
- "depgraph-mcp-tools",
  "depgraph-operation",
  "depgraph-protocol",
  "depgraph-store",
  "flate2",
  "hex",
+ "jsonschema",
  "rusqlite",
  "same-file",
  "serde",

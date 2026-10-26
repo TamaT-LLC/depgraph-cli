@@ -20,8 +20,6 @@ ignore.workspace = true
 libc.workspace = true
 notify.workspace = true
 petgraph.workspace = true
-prost.workspace = true
-prost-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -54,6 +52,7 @@ windows-sys = { version = "0.61", features = [
 caseless.workspace = true
 
 [dev-dependencies]
+depgraph-contract-scan = { path = "../depgraph-contract-scan" }
 jsonschema = { version = "0.47", default-features = false }
 rusqlite.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
