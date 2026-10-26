@@ -328,7 +328,7 @@ jobs:
             exit 0
           fi
           changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
-          if grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)' <<<"$changed"; then
+          if grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|crates/depgraph-mcp/|crates/depgraph-agent-contract/|crates/depgraph-operation/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)' <<<"$changed"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -1025,7 +1025,7 @@ jobs:
         run: cargo test -p depgraph-core --lib --locked daemon::tests
       - name: Repository path confinement and snapshot pinning
         run: |
-          cargo test -p depgraph-core --test service --locked
+          cargo test -p depgraph-core --test it --locked service::
           cargo test -p depgraph-core --lib --locked service_repository::tests
       - run: cargo test -p depgraph-rust-worker --lib --locked
       - run: cargo test -p depgraph-core --lib --locked web_worker_timeout_reaps_its_descendant_cross_platform
