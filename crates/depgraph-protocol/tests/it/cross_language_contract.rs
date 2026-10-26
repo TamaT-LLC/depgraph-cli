@@ -8,7 +8,7 @@ use depgraph_protocol::{
 };
 use serde_json::{Value, json};
 
-const GOLDEN: &str = include_str!("fixtures/protocol-v1.cross-language.golden.ndjson");
+const GOLDEN: &str = include_str!("../fixtures/protocol-v1.cross-language.golden.ndjson");
 
 fn golden_values() -> Vec<Value> {
     GOLDEN

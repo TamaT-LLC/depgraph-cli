@@ -33,7 +33,7 @@ const NEW_SITE_ID: &str =
 const NEW_EDGE_ID: &str =
     "edge:sha256:0000000000000000000000000000000000000000000000000000000000000000";
 const PROFILE_ID: &str = "web:production:server";
-const DELTA_GOLDEN: &str = include_str!("fixtures/protocol-v1.delta.golden.ndjson");
+const DELTA_GOLDEN: &str = include_str!("../fixtures/protocol-v1.delta.golden.ndjson");
 
 #[test]
 fn valid_delta_is_canonical_and_byte_equivalent_across_repeated_generation() {
@@ -409,7 +409,7 @@ fn capability_negotiation_preserves_legacy_full_snapshot_fallback() {
         WorkerProtocolMode::FullSnapshot
     );
     validate_ndjson(Cursor::new(include_str!(
-        "fixtures/protocol-v1.golden.ndjson"
+        "../fixtures/protocol-v1.golden.ndjson"
     )))
     .expect("legacy full snapshot fixture remains compatible");
 
