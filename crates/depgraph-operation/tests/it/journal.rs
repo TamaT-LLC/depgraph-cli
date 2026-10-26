@@ -10,12 +10,12 @@ use std::{
     time::Duration,
 };
 
-use depgraph_core::{
-    DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits,
-};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentCapability, LogicalRepositoryId, MAX_TASK_TTL_MS, OperationBehavior, OperationId,
     ToolCatalog,
+};
+use depgraph_core::{
+    DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits,
 };
 use depgraph_operation::{
     CancelOutcome, CanonicalJson, CapabilitySet, DEADLINE_EXCEEDED_ERROR_JSON,
@@ -36,7 +36,7 @@ const DEADLINE: i64 = NOW + 60_000;
 #[test]
 fn unbounded_scan_survives_the_old_deadline_and_starts_retention_at_completion() {
     let (_root, _store, config, mut journal) = journal();
-    let deadline = depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64;
+    let deadline = depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64;
     let submitted = journal
         .submit(
             &request(&config, json!({"strict":false}), b"unbounded", deadline),
@@ -111,7 +111,7 @@ fn only_scan_operations_can_omit_their_execution_deadline() {
             OperationKind::DaemonStop,
             &json!({}),
             b"unbounded-stop",
-            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64
+            depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64
         ),
         Err(JournalError::InvalidArgument)
     ));
@@ -648,7 +648,7 @@ fn submit_request_retains_bounded_canonical_normalized_input() {
 
     let maximum = json!("x".repeat(MAX_OPERATION_INPUT_BYTES - 2));
     assert_eq!(
-        depgraph_mcp_tools::canonical_json_bytes(&maximum)
+        depgraph_agent_contract::canonical_json_bytes(&maximum)
             .unwrap()
             .len(),
         MAX_OPERATION_INPUT_BYTES
@@ -656,7 +656,7 @@ fn submit_request_retains_bounded_canonical_normalized_input() {
     assert!(SubmitRequest::new(&config, kind(), &maximum, b"maximum-input", DEADLINE,).is_ok());
     let oversized = json!("x".repeat(MAX_OPERATION_INPUT_BYTES - 1));
     assert_eq!(
-        depgraph_mcp_tools::canonical_json_bytes(&oversized)
+        depgraph_agent_contract::canonical_json_bytes(&oversized)
             .unwrap()
             .len(),
         MAX_OPERATION_INPUT_BYTES + 1

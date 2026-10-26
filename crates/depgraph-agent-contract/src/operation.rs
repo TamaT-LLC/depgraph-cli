@@ -14,7 +14,7 @@ use crate::{
 /// Closed terminal output contracts registered for durable submit tools.
 ///
 /// This enum is intentionally separate from the journal's operation kind so
-/// `depgraph-mcp-tools` remains the owner of public tool shapes. Callers must
+/// `depgraph-agent-contract` remains the owner of public tool shapes. Callers must
 /// derive it from the validated journal kind's stable tool name. Kinds whose
 /// future domain outcome DTO is not frozen are deliberately absent and fail
 /// closed until that originating tool registers its exact output contract.

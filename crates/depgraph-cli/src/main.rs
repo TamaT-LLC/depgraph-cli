@@ -8,6 +8,7 @@ use std::io::Write;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use depgraph_agent_contract::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
 use depgraph_core::service::{
     BoundedQueryMode, BoundedQueryRequest, CompletedSnapshotView, CyclesRequest,
     DependenciesRequest, DependencyDirection, DepgraphCapability, DepgraphCapabilitySet,
@@ -35,7 +36,6 @@ use depgraph_core::{
     render_condition, render_github_annotations, service::AnalysisDegradation, traversal_summary,
     unresolved_summary, validate_interactive_query_bounds,
 };
-use depgraph_mcp_tools::{AgentDaemonStatus, AgentDoctor, AgentRuntimeOutcome, CliAction};
 use depgraph_protocol::canonical_json;
 use depgraph_store::CoverageRecord;
 use serde::Serialize;
@@ -869,7 +869,7 @@ enum AgentHostFormatArg {
     VsCode,
 }
 
-impl From<AgentHostFormatArg> for depgraph_mcp_tools::AgentHostFormat {
+impl From<AgentHostFormatArg> for depgraph_agent_contract::AgentHostFormat {
     fn from(value: AgentHostFormatArg) -> Self {
         match value {
             AgentHostFormatArg::Codex => Self::Codex,
@@ -889,7 +889,7 @@ enum AgentHostProfileArg {
     Full,
 }
 
-impl From<AgentHostProfileArg> for depgraph_mcp_tools::AgentHostCapabilityProfile {
+impl From<AgentHostProfileArg> for depgraph_agent_contract::AgentHostCapabilityProfile {
     fn from(value: AgentHostProfileArg) -> Self {
         match value {
             AgentHostProfileArg::Read => Self::Read,
@@ -1277,12 +1277,12 @@ async fn run(cli: Cli) -> Result<u8> {
             let store = cli
                 .store
                 .context("agent-config requires an explicit global --store PATH")?;
-            let profile = depgraph_mcp_tools::AgentHostCapabilityProfile::from(profile);
+            let profile = depgraph_agent_contract::AgentHostCapabilityProfile::from(profile);
             eprintln!("agent-config profile: {}", profile.as_str());
             let capability_names = profile
                 .capabilities()
                 .iter()
-                .map(|capability| depgraph_mcp_tools::agent_host_capability_name(*capability))
+                .map(|capability| depgraph_agent_contract::agent_host_capability_name(*capability))
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!("agent-config capabilities: {capability_names}");
@@ -1292,7 +1292,7 @@ async fn run(cli: Cli) -> Result<u8> {
                     "agent-config responsibility: the host must obtain an independent human decision for every project-code execution request"
                 );
             }
-            let host = depgraph_mcp_tools::AgentHostFormat::from(host);
+            let host = depgraph_agent_contract::AgentHostFormat::from(host);
             let output = generate_agent_config(&AgentConfigRequest {
                 root: &root,
                 store: &store,
@@ -2172,8 +2172,8 @@ async fn run(cli: Cli) -> Result<u8> {
                     println!(
                         "status: {}",
                         match result.status() {
-                            depgraph_mcp_tools::AgentRuntimeStatus::Completed => "completed",
-                            depgraph_mcp_tools::AgentRuntimeStatus::Partial => "partial",
+                            depgraph_agent_contract::AgentRuntimeStatus::Completed => "completed",
+                            depgraph_agent_contract::AgentRuntimeStatus::Partial => "partial",
                         }
                     );
                     println!("deduplicated: {}", result.deduplicated());
@@ -4389,8 +4389,8 @@ mod tests {
         require_build_consent, require_compiler_precise_consent, requires_build_attempt,
         runtime_trace_metadata_error, write_file_atomically,
     };
+    use depgraph_agent_contract::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
     use depgraph_core::{BuildOutcomeKind, DepgraphCapability, DepgraphCapabilitySet};
-    use depgraph_mcp_tools::{ALL_CLI_ACTIONS, CliAction, ToolCatalog};
 
     #[test]
     fn error_hints_name_the_option_that_widens_a_bound_or_the_alternative() {

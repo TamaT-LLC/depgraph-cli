@@ -16,8 +16,8 @@ fn run(mut arguments: impl Iterator<Item = OsString>) -> Result<(), String> {
         return Err("usage: generate-scan-outcome-v2-schema [OUTPUT]".to_owned());
     }
 
-    let bytes = depgraph_mcp_tools::canonical_json_bytes(
-        &depgraph_mcp_tools::agent_scan_outcome_v2_schema(),
+    let bytes = depgraph_agent_contract::canonical_json_bytes(
+        &depgraph_agent_contract::agent_scan_outcome_v2_schema(),
     )
     .map_err(|error| format!("failed to serialize scan outcome schema: {error}"))?;
     if let Some(output) = output {
