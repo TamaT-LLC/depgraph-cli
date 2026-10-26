@@ -375,6 +375,8 @@ depgraph export --format json --output graph.json
 depgraph export --format dot > graph.dot
 depgraph export --format mermaid > graph.mmd
 depgraph export --format graphml --output graph.graphml
+# Raise the default bounds (50,000 nodes, 100,000 edges) for a larger graph and write it to a file.
+depgraph export --format json --max-nodes 300000 --max-edges 500000 --output graph.json
 ```
 
 ## More detail

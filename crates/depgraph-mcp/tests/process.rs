@@ -11913,7 +11913,10 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
     drop(store);
     let unresolved_count = shape.files * shape.unresolved_per_file;
     let cycle_count = shape.files / shape.ring;
-    let ring_edge_visits = shape.files * 3;
+    // Only choosing the representative cycles counts toward max_traversal:
+    // each ring edge once. The component search visits are bounded by the
+    // snapshot-wide budget.
+    let ring_edge_visits = shape.files;
 
     let cli = |arguments: &[&str]| {
         let binary = AssertCommand::cargo_bin("depgraph").unwrap();
@@ -11952,6 +11955,16 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
         .map(|cycle| cycle["node_ids"].clone())
         .collect::<Vec<_>>();
     assert_eq!(cli_cycle_ids.len(), cycle_count);
+    // The text lines name each file's path next to its ID.
+    let cli_cycles_text = cli(&["cycles"]);
+    assert!(cli_cycles_text.status.success());
+    let cli_cycles_text = String::from_utf8(cli_cycles_text.stdout).unwrap();
+    assert!(
+        cli_cycles_text.starts_with(
+            "file:0000 (src/m0000.ts) -> file:0001 (src/m0001.ts) -> file:0002 (src/m0002.ts)"
+        ),
+        "{cli_cycles_text}"
+    );
 
     // MCP with the default max_traversal.
     let mut mcp = InteractiveMcp::start(&root, &store_path);
@@ -12016,14 +12029,23 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
         ));
     }
 
-    // A max_traversal below the matching unresolved sites names the bound and
-    // how many sites matched.
+    // Only the sites of one page count against max_traversal, so a page of 5
+    // passes a max_traversal of 5 although 6,750 sites match.
+    let paged = success_of(&interactive_tool_call(
+        &mut mcp,
+        5,
+        "graph_unresolved_list",
+        arguments(json!({"limit": 5, "max_traversal": 5})),
+    ));
+    assert_eq!(paged["items"], unresolved["items"]);
+    assert_eq!(paged["total_items"], unresolved_count as u64);
+    // A page larger than max_traversal names the bound and the page size.
     assert_eq!(
         error_of(&interactive_tool_call(
             &mut mcp,
             5,
             "graph_unresolved_list",
-            arguments(json!({"max_traversal": unresolved_count - 1})),
+            arguments(json!({"limit": 5, "max_traversal": 4})),
         )),
         json!({
             "code": "RESOURCE_EXHAUSTED",
@@ -12033,8 +12055,8 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
             "details": {
                 "kind": "resource_limit",
                 "limit": "traversal_items",
-                "maximum": unresolved_count - 1,
-                "observed": unresolved_count,
+                "maximum": 4,
+                "observed": 5,
                 "argument": "max_traversal"
             }
         })
@@ -12055,6 +12077,7 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
                 "kind": "resource_limit",
                 "limit": "traversal_items",
                 "maximum": ring_edge_visits - 1,
+                "observed": ring_edge_visits,
                 "argument": "max_traversal"
             }
         })
@@ -12084,34 +12107,71 @@ fn issue_617_618_cli_and_mcp_list_unresolved_and_cycles_of_a_mid_sized_snapshot_
         );
     }
 
-    // The CLI names the same bounds, with the resource exit code 3 and the
-    // invalid input exit code 2.
+    // The CLI pages the same way: a page of 5 passes --max-traversal 5.
+    let cli_paged = cli_json(&[
+        "unresolved",
+        "--max-items",
+        "5",
+        "--max-traversal",
+        "5",
+        "--json",
+    ]);
+    assert_eq!(cli_paged["items"], cli_unresolved["items"]);
+    assert_eq!(cli_paged["total_items"], unresolved_count as u64);
+
+    // The CLI names the same bounds and the option that widens them, with
+    // the resource exit code 3 and the invalid input exit code 2.
     let unresolved_short = (unresolved_count - 1).to_string();
     let cycles_short = (ring_edge_visits - 1).to_string();
-    for (arguments, code, message) in [
+    for (arguments, code, message, hint) in [
         (
-            vec!["unresolved", "--max-traversal", unresolved_short.as_str()],
+            vec!["unresolved", "--max-items", "5", "--max-traversal", "4"],
+            3,
+            "request exhausted a service resource limit: max_traversal=4 (observed 5)".to_owned(),
+            Some("hint: rerun with --max-traversal 5 or more (accepted 1..=1000000)".to_owned()),
+        ),
+        (
+            vec![
+                "unresolved",
+                "--all",
+                "--max-traversal",
+                unresolved_short.as_str(),
+            ],
             3,
             format!(
                 "request exhausted a service resource limit: max_traversal={unresolved_short} \
                  (observed {unresolved_count})"
             ),
+            Some(format!(
+                "hint: rerun with --max-traversal {unresolved_count} or more (accepted 1..=1000000)"
+            )),
         ),
         (
             vec!["cycles", "--max-traversal", cycles_short.as_str()],
             3,
-            format!("request exhausted a service resource limit: max_traversal={cycles_short}"),
+            format!(
+                "request exhausted a service resource limit: max_traversal={cycles_short} \
+                 (observed {ring_edge_visits})"
+            ),
+            Some(format!(
+                "hint: rerun with --max-traversal {ring_edge_visits} or more (accepted 1..=1000000)"
+            )),
         ),
         (
             vec!["unresolved", "--max-traversal", "10000000"],
             2,
             "invalid service input: max_traversal must be in 1..=1000000".to_owned(),
+            None,
         ),
     ] {
         let output = cli(&arguments);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(code), "{arguments:?}: {stderr}");
         assert!(stderr.contains(&message), "{arguments:?}: {stderr}");
+        match hint {
+            Some(hint) => assert!(stderr.contains(&hint), "{arguments:?}: {stderr}"),
+            None => assert!(!stderr.contains("hint:"), "{arguments:?}: {stderr}"),
+        }
     }
 }
 

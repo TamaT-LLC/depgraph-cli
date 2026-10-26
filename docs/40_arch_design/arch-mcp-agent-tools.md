@@ -973,12 +973,25 @@ Issue #565が対象外にしたdetailsのない`INVALID_ARGUMENT` / `RESOURCE_EX
 | Area | Evidence |
 | --- | --- |
 | Snapshot scan | 索引、cycle探索のnodeごとの手順、結果の組み立てを、固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000、hotspotの作業量上限と同じ値）で数える。超えたら`preprocessing_work_items`（`argument`なし、`narrow_query`） |
-| Cycles | `max_traversal`はcycle探索が訪れる隣接edgeの数（Kosarajuの順方向・逆方向、代表cycleのBFS）。超えたら`traversal_items`、`argument: "max_traversal"`。必要な総数は分からないので`observed`は返さない |
-| Unresolved | `max_traversal`は`kinds`に一致したunresolved siteの数。組み立てる前に数え、超えたら`traversal_items`と`observed`（一致した数）を返す。`limit` / `cursor`はページングだけで、上限には効かない |
+| Cycles | `max_traversal`は代表cycleを組み立てるBFSが訪れる隣接edgeの数。Kosarajuの順方向・逆方向の探索はsnapshot全体の上限で数える（下の「大きなStoreでのcycles / unresolved / exportの上限」）。超えたら`traversal_items`、`argument: "max_traversal"`、`observed`（必要だった訪問数） |
+| Unresolved | `max_traversal`は返すunresolved siteの数（1ページ分。CLIの`--all`では一致したすべて）。組み立てる前に数え、超えたら`traversal_items`と`observed`（返す数）を返す。`total_items`は従来どおり一致したすべてを数える |
 | Remediation | `increase_limit`は、上限値が引数の最大値（1,000,000）未満で、かつ`observed`があればそれも最大値以下のとき。`observed`が最大値を超えるunresolvedは`narrow_query` |
 | Out of range | 範囲外の`max_traversal`は、core が`DepgraphServiceError::ArgumentOutOfRange { argument, minimum, maximum }`（`invalid service input: max_traversal must be in 1..=1000000`）、MCPが`argument` variantに任意field `minimum` / `maximum`を付けた`INVALID_ARGUMENT`を返す。範囲を持たない`argument`は変更前とbyte単位で同一 |
 | Health audit | health の cycle 検出は従来どおり自前の分析予算を cancellation callback で数え、cycle の上限超過（`ResourceLimitExceeded`を含む）を分析の`ResourceExhausted`へ写す |
 | Deterministic artifacts | shared schema（`argument`の`minimum` / `maximum`）、catalog JSON（`max_traversal`の説明）、各SHA-256 fixtureを再生成する |
+
+## 大きなStoreでのcycles / unresolved / exportの上限
+
+Issue #617 / #618の後も、Rust HIRを通したdepgraph-cli自身のStore（v0.7.2で計測。resolved 156,650、unresolved 100,440、evidence約100万）では、`graph_unresolved_list` / CLI `unresolved`が`limit` / `--max-items`や`kinds` / `--kind`に関係なく既定の`max_traversal`（50,000）で失敗し、`cycles --level symbol`も`observed`のない`max_traversal=50000`で失敗した。CLIの`export`は`max_nodes`を広げる手段がなかった。
+
+| Area | Evidence |
+| --- | --- |
+| Unresolved | `max_traversal`を「一致したsiteの総数」から「返すsiteの数」に変える。ページングする一覧なので、requestが返す分（`limit` / `--max-items`、`--all`では一致したすべて）だけを数える。`UnresolvedRequest::with_page_items`でページの大きさを渡し、渡さなければ従来どおり一致したすべてを数える。一致したsiteの選択・並べ替え・組み立ては、total・summary・安定したcursorのために従来どおり全件行い、固定上限`MAX_GRAPH_SNAPSHOT_SCAN_WORK_ITEMS`（16,000,000）で数える。MCPのcursorは全件の公開結果のdigestに結び付くので、ページだけを組み立てる形にはしない |
+| Cycles | Kosarajuの順方向・逆方向の探索は、levelの全edgeを結果に関係なく各1回訪ねるsnapshot全体の作業なので、16,000,000の上限へ移す。代表cycleを組み立てるBFSの訪問は、返す強連結成分の大きさに比例するので`max_traversal`で数える。上限で止めずに16,000,000の範囲で数え切り、超えていれば`observed`に必要な訪問数を入れて失敗する。強連結成分の探索は線形（訪問はedge数の2倍）で、`max_traversal`の上限（1,000,000）よりedgeの多いlevelでは引数をどう上げても通らなかったため、既定値の調整ではなく数え方を直した |
+| Export | CLI `export`に`--max-nodes`（既定50,000）/ `--max-edges`（既定100,000）を足す。範囲は`impact --max-nodes`と同じ1..=1,000,000（`MAX_LOCAL_GRAPH_EXPORT_NODES` / `_EDGES`、`GraphExportRequest::try_new_local`）。MCPの`graph_export`はinlineで返すので、従来の50,000 / 100,000のまま。出力はbyteで上限を持つ（標準出力はserviceの16 MiB、`--output`は512 MiB） |
+| CLI hints | CLIは`ResourceLimitExceeded`の後に`hint:`の行を出す。`max_traversal`は`--max-traversal`、`impact_nodes` / `export_nodes`は`--max-nodes`、`impact_edges` / `export_edges`は`--max-edges`を、`observed`があればその値と一緒に案内する。`observed`が1,000,000を超えるときはrequestを狭めるよう案内する。標準出力のexportが16 MiBを超えたら`--output`を、`output_bytes`（512 MiB）を超えたら`--phase` / `--profile`かより小さい`--format`を案内する。MCPの`increase_limit`のdetailsは変えない |
+| Text output | CLIのテキストのedge行（`deps` / `dependents` / `why` / `impact` / `cycles`）は、IDの後ろにfileならrepository-relativeなpath、それ以外はdisplay nameと定義元のfileを括弧で出す。結果が持たないnodeはIDだけ。`--rollup`などでJSONに加わるmetadataの分も、テキストの`output_bytes`がJSONの`serialized_output_bytes`と同じ値になるように数える。JSONは変えない |
+| Measured | dev buildでscanしたdepgraph-cli自身のStore（node 242,187、site 315,434のうちunresolved 126,128、edge 414,093、evidence 1,038,255）で、`unresolved`は既定値・`--max-items 10`・`--kind call`のいずれも通る（修正前はobserved 126,128 / 65,802で失敗）。`cycles --level symbol`は137件を返し、代表cycleのBFSの訪問は999。`export --format json`は`export_nodes=50000 (observed 242187)`で`--max-nodes`を案内し、`--max-nodes 300000 --max-edges 500000`では標準出力が16 MiB、`--output`のJSONが512 MiB（約2.1 GB）を超える。`--format dot`（約170 MB）と`--phase source`のJSON（約250 MB）は`--output`で書ける |
 
 ## Issue #620 path-step scan bounds
 

@@ -29,13 +29,14 @@ pub use crate::service_artifacts::{
     ClosedChangedRecord, ClosedRecordDiff, DEFAULT_GRAPH_EXPORT_MAX_EDGES,
     DEFAULT_GRAPH_EXPORT_MAX_NODES, GRAPH_EXPORT_SERVICE_SCHEMA_VERSION, GraphExportFormat,
     GraphExportRequest, GraphExportResult, MAX_GRAPH_EXPORT_EDGES, MAX_GRAPH_EXPORT_NODES,
-    MAX_SHARED_ARTIFACT_ITEMS, MAX_SHARED_ARTIFACT_WORK_ITEMS,
-    POLICY_EVALUATION_SERVICE_SCHEMA_VERSION, PolicyEvaluateRequest, PolicyEvaluationResult,
-    RecordChangeSummary, RenameSummary, SNAPSHOT_DIFF_SERVICE_SCHEMA_VERSION,
-    ServicePolicyAnnotation, ServicePolicyApiChange, ServicePolicyResult, ServicePolicySuppression,
-    ServicePolicyViolation, SnapshotDiffCoverage, SnapshotDiffEdge, SnapshotDiffEvidence,
-    SnapshotDiffFilters, SnapshotDiffNode, SnapshotDiffProfile, SnapshotDiffRename,
-    SnapshotDiffRequest, SnapshotDiffResult, SnapshotDiffSite, SnapshotDiffSummary,
+    MAX_LOCAL_GRAPH_EXPORT_EDGES, MAX_LOCAL_GRAPH_EXPORT_NODES, MAX_SHARED_ARTIFACT_ITEMS,
+    MAX_SHARED_ARTIFACT_WORK_ITEMS, POLICY_EVALUATION_SERVICE_SCHEMA_VERSION,
+    PolicyEvaluateRequest, PolicyEvaluationResult, RecordChangeSummary, RenameSummary,
+    SNAPSHOT_DIFF_SERVICE_SCHEMA_VERSION, ServicePolicyAnnotation, ServicePolicyApiChange,
+    ServicePolicyResult, ServicePolicySuppression, ServicePolicyViolation, SnapshotDiffCoverage,
+    SnapshotDiffEdge, SnapshotDiffEvidence, SnapshotDiffFilters, SnapshotDiffNode,
+    SnapshotDiffProfile, SnapshotDiffRename, SnapshotDiffRequest, SnapshotDiffResult,
+    SnapshotDiffSite, SnapshotDiffSummary,
 };
 pub use crate::service_bounded::{
     BoundedQueryMode, BoundedQueryRequest, BoundedQueryServiceResult,
@@ -926,9 +927,10 @@ impl DepgraphServiceError {
 /// Service bounds that `DepgraphServiceError::ResourceLimitExceeded` names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DepgraphResourceLimit {
-    /// Edge visits of one graph traversal or cycle search, or the unresolved
-    /// sites one unresolved listing returns, set by the request's
-    /// `max_traversal` (CLI `--max-traversal`).
+    /// Edge visits of one graph traversal or of building the returned
+    /// representative cycles, or the unresolved sites one page of an
+    /// unresolved listing returns, set by the request's `max_traversal` (CLI
+    /// `--max-traversal`).
     MaxTraversal,
     /// Snapshot edges dependency traversal inspects while building its
     /// adjacency, bounded by the fixed interactive traversal ceiling.

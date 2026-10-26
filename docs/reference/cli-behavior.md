@@ -97,18 +97,39 @@ example Rust in syntax-only mode as `analysis_degradations` reports), or
 snapshot against the same fixed 16,000,000 work items, and the work that grows
 with the grouped edges against 1,000,000. On a page it is part of the fixed
 bytes, so a rollup larger than `--max-bytes` exits with
-`symbol rollup exceeds the output budget`. Without `--rollup` the output is
-byte-identical to earlier releases.
+`symbol rollup exceeds the output budget`. Without `--rollup` the JSON output
+is byte-identical to earlier releases. The text header's `output_bytes` is the
+`serialized_output_bytes` of the JSON document the same options print, so it
+counts the rollup, partial metadata, and `analysis_degradations` too.
+
+Text output names each node of an edge line next to its ID: a file node by
+its repository-relative path, and any other node by its display name and the
+file that defines it, for example
+`file:sha256:… (crates/depgraph-core/src/config.rs) --imports [...]--> …` or
+`symbol:sha256:… (load in crates/depgraph-core/src/config.rs) --calls [...]--> …`.
+`deps`, `dependents`, `why`, `impact`, and `cycles` do this; a node the
+result does not carry is printed by its ID alone. JSON output is unchanged.
 
 For `cycles`, `--max-traversal` (default 50,000) bounds the dependency edges
-the cycle search visits. For `unresolved`, it bounds the unresolved sites that
-match `--kind`; `--max-items` only pages those matches. Both commands also
-index the whole snapshot, which is bounded separately by a fixed 16,000,000
-work items rather than by `--max-traversal`. A request that hits a bound exits
-with code 3 and names it, for example
-`request exhausted a service resource limit: max_traversal=50000 (observed 61234)`,
-where `observed` is the number of matching unresolved sites. A
-`--max-traversal` outside `1..=1000000` exits with code 2 and
+visited to build the returned representative cycles. Finding the strongly
+connected components visits every edge of the level whatever the result is,
+so it counts against the fixed 16,000,000 work items below instead. For
+`unresolved`, `--max-traversal` bounds the unresolved sites one page returns
+(`--max-items`), or every site that matches `--kind` with `--all`;
+`total_items` still counts every match. Both commands also index the whole
+snapshot, and `unresolved` orders and materializes every match for the total,
+the summary, and stable cursors; that work is bounded separately by a fixed
+16,000,000 work items rather than by `--max-traversal`. A request that hits a
+bound exits with code 3, names it, and prints the option to raise, for example
+
+```text
+error: request exhausted a service resource limit: max_traversal=50000 (observed 61234)
+hint: rerun with --max-traversal 61234 or more (accepted 1..=1000000)
+```
+
+where `observed` is the number of edge visits the cycles needed or the number
+of unresolved sites the request returns. A `--max-traversal` outside
+`1..=1000000` exits with code 2 and
 `invalid service input: max_traversal must be in 1..=1000000`.
 
 ## Profile planning
@@ -120,6 +141,29 @@ diagnostic. `--profile-budget` accepts `1..=32` while reserving every detected
 language baseline. `--profiles-file` instead reads a confined, non-symlink,
 UTF-8 JSON file of at most 64 KiB; it is all-or-error and cannot be combined
 with `--profile-budget`.
+
+## Graph export bounds
+
+`export` fails rather than writing a partial graph when the selected graph has
+more than `--max-nodes` nodes (default 50,000) or `--max-edges` edges (default
+100,000). Both accept `1..=1000000`, the range of the other CLI result bounds
+such as `impact --max-nodes`; the MCP `graph_export` keeps its inline ceilings
+of 50,000 nodes and 100,000 edges. A graph over a bound exits with code 3, for
+example
+
+```text
+error: request exhausted a service resource limit: export_nodes=50000 (observed 217340)
+hint: rerun with --max-nodes 217340 or more (accepted 1..=1000000)
+```
+
+The output stays bounded by bytes: standard output by the 16 MiB service
+output limit, and `--output <PATH>` by 512 MiB. An export over the standard
+output limit exits with code 3 and
+`inline graph export exceeds the configured service output limit`, and the hint
+names `--output`. A file export over 512 MiB exits with code 3 and
+`output_bytes=536870912 (observed …)`, and the hint suggests narrowing the
+export with `--phase` or `--profile` or a more compact `--format` such as
+`dot`.
 
 ## GraphML export
 

@@ -6479,13 +6479,14 @@ fn semantic_selectors_cycles_and_query_evidence_are_exposed() {
         if arguments[0] == "why" {
             assert!(stdout.starts_with("go://example.test/fixture.Alpha\n"));
             assert!(stdout.contains(&format!(
-                "  --calls [semantic; resolved; exact; go:test]--> {}",
+                "  --calls [semantic; resolved; exact; go:test]--> {} (Shared)\n",
                 fixture.beta_id
             )));
             assert!(stdout.contains("      condition: true"));
         } else {
+            // Edge lines name each symbol by its display name next to its ID.
             assert!(stdout.contains(&format!(
-                "{} --calls [semantic; resolved; exact; go:test]--> {}",
+                "{} (Shared) --calls [semantic; resolved; exact; go:test]--> {} (Shared)\n",
                 fixture.alpha_id, fixture.beta_id
             )));
             assert!(stdout.contains("    condition: true"));
@@ -8692,9 +8693,11 @@ fn run_issue_623(store: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-/// Without `--rollup` the JSON and text output of `deps` / `dependents` is
+/// Without `--rollup` the JSON output of `deps` / `dependents` is
 /// byte-identical to the release before Issue #623. The digests were recorded
-/// with the binary built from origin/main `70958ce` on this snapshot.
+/// with the binary built from origin/main `70958ce` on this snapshot. The text
+/// digests were recorded again when the edge lines started to name the node
+/// paths next to their IDs.
 #[test]
 fn issue_623_dependency_lists_without_a_rollup_keep_their_bytes() {
     use sha2::{Digest, Sha256};
@@ -8725,13 +8728,13 @@ fn issue_623_dependency_lists_without_a_rollup_keep_their_bytes() {
 }
 
 const ISSUE_623_DEFAULT_OUTPUT_DIGESTS: [&str; 8] = [
-    "dependents id:file:model 5e4904fbdb2f0575f26df2cf2040d20316f9ad96b4865fb9ff1ecce3c37fc382",
+    "dependents id:file:model dd73569057fbf9e1ad018a45034fafd091fd574612b43c1e224590398d32ed97",
     "dependents id:file:model --json cc4e6dece8da33e95942dd81ca8407b6603742b647230ae8afceed20de7b33d3",
-    "dependents id:file:model --all 7cc25a71ec67890238205a6957cc3781c83457a34868a8df6bbe23f69dd52b62",
+    "dependents id:file:model --all 5bfdb14621ece533e3db025a8847bd782eba37a93717513fa8fc6e93ae150ad5",
     "dependents id:file:model --all --json 0250d7f87d8c27b733a6a8ba1fb95cafe180ffc3cdb80bbd7163fcd6195229b0",
-    "deps id:file:user 0e5d1b4c76cdf96dc3071753159a4add5d9802a5e4d0daa0c1f7fa56055862aa",
+    "deps id:file:user 30fd22ae755c4f437adf891c9c7944dcaec15c8b6bfd5d40ef3fb02d226cc67a",
     "deps id:file:user --json bacdc5a9cf1237ba8ad7c1845a2e6c7c4759302a469aac5a8ab0b75f5b0241e8",
-    "deps id:file:user --all 7cc25a71ec67890238205a6957cc3781c83457a34868a8df6bbe23f69dd52b62",
+    "deps id:file:user --all 5bfdb14621ece533e3db025a8847bd782eba37a93717513fa8fc6e93ae150ad5",
     "deps id:file:user --all --json 54795af2319b78e5d6fbf2189a3de026ce5c0beec804e28ba56212fb67c8becf",
 ];
 
@@ -8859,6 +8862,143 @@ fn issue_623_rollup_symbols_groups_the_semantic_edges_by_file() {
         .assert()
         .code(2)
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// Text edge lines name the repository path of a file node and the display
+/// name of any other node next to its ID, and the text `output_bytes` counts
+/// the symbol rollup as the JSON `serialized_output_bytes` does.
+#[test]
+fn text_edge_lines_show_node_paths_and_count_the_rollup_bytes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("store.sqlite");
+    seed_issue_623_snapshot(&store, &root);
+    let edge_line = "file:user (src/user.rs) --imports [source; resolved; exact; profile:rust]--> \
+                     file:model (src/model.rs)\n";
+    for arguments in [
+        &["dependents", "id:file:model"][..],
+        &["dependents", "id:file:model", "--all"][..],
+        &["deps", "id:file:user"][..],
+        &["deps", "id:file:user", "--all"][..],
+        &["dependents", "id:file:model", "--rollup", "symbols"][..],
+    ] {
+        let text = run_issue_623(&store, arguments);
+        assert!(text.contains(edge_line), "{arguments:?}: {text}");
+    }
+    let calls = run_issue_623(&store, &["deps", "id:symbol:run"]);
+    assert!(
+        calls.contains(
+            "symbol:run (symbol:run in src/user.rs) --calls [semantic; resolved; exact; \
+             profile:rust]--> symbol:make (symbol:make in src/model.rs)\n"
+        ),
+        "{calls}"
+    );
+    let why = run_issue_623(&store, &["why", "id:file:user", "id:file:model"]);
+    assert!(why.contains("]--> file:model (src/model.rs)\n"), "{why}");
+
+    for (command, selector) in [("dependents", "id:file:model"), ("deps", "id:file:user")] {
+        let json: serde_json::Value = serde_json::from_str(&run_issue_623(
+            &store,
+            &[command, selector, "--json", "--rollup", "symbols"],
+        ))
+        .unwrap();
+        let text = run_issue_623(&store, &[command, selector, "--rollup", "symbols"]);
+        let header = text.lines().next().unwrap();
+        assert!(
+            header.ends_with(&format!(
+                "; output_bytes={}",
+                json["serialized_output_bytes"]
+            )),
+            "{command}: {header}"
+        );
+    }
+}
+
+/// `export --max-nodes` / `--max-edges` widen the export bounds up to
+/// 1,000,000, and an export over a bound names the option to raise.
+#[test]
+fn export_max_nodes_and_max_edges_bound_the_exported_graph() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("repository");
+    fs::create_dir(&root).unwrap();
+    let store = temporary.path().join("store.sqlite");
+    seed_issue_623_snapshot(&store, &root);
+    let export = |extra: &[&str]| {
+        Command::cargo_bin("depgraph")
+            .unwrap()
+            .current_dir(&root)
+            .arg("--store")
+            .arg(&store)
+            .args(["export", "--format", "json"])
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let default = export(&[]);
+    assert!(default.status.success());
+    let exact = export(&["--max-nodes", "8", "--max-edges", "6"]);
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+    assert_eq!(exact.stdout, default.stdout);
+    for (extra, code, message, hint) in [
+        (
+            &["--max-nodes", "7"][..],
+            3,
+            "request exhausted a service resource limit: export_nodes=7 (observed 8)",
+            Some("hint: rerun with --max-nodes 8 or more (accepted 1..=1000000)"),
+        ),
+        (
+            &["--max-edges", "5"][..],
+            3,
+            "request exhausted a service resource limit: export_edges=5 (observed 6)",
+            Some("hint: rerun with --max-edges 6 or more (accepted 1..=1000000)"),
+        ),
+        (
+            &["--max-nodes", "1000001"][..],
+            2,
+            "invalid service input: max_nodes must be in 1..=1000000",
+            None,
+        ),
+        (
+            &["--max-edges", "0"][..],
+            2,
+            "invalid service input: max_edges must be in 1..=1000000",
+            None,
+        ),
+    ] {
+        let output = export(extra);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(code), "{extra:?}: {stderr}");
+        assert!(stderr.contains(message), "{extra:?}: {stderr}");
+        match hint {
+            Some(hint) => assert!(stderr.contains(hint), "{extra:?}: {stderr}"),
+            None => assert!(!stderr.contains("hint:"), "{extra:?}: {stderr}"),
+        }
+    }
+    // The file export accepts the same bounds.
+    let to_file = Command::cargo_bin("depgraph")
+        .unwrap()
+        .current_dir(&root)
+        .arg("--store")
+        .arg(&store)
+        .args([
+            "export",
+            "--format",
+            "json",
+            "--max-nodes",
+            "7",
+            "--output",
+            "graph.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(to_file.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&to_file.stderr).contains("hint: rerun with --max-nodes 8"));
+    assert!(!root.join("graph.json").exists());
 }
 
 /// A Store without semantic edges, such as Rust in syntax-only mode, reports

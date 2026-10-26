@@ -1337,10 +1337,11 @@ fn issue_303_service_methods_are_canonical_bounded_and_cancellable() -> Result<(
             &CyclesRequest::try_new(CycleLevel::File, 1)?,
             &cancellation,
         ),
+        // Building the representative cycle a -> b -> a visits two edges.
         Err(DepgraphServiceError::ResourceLimitExceeded {
             limit: DepgraphResourceLimit::MaxTraversal,
             maximum: 1,
-            observed: None,
+            observed: Some(2),
         })
     ));
     // max_traversal bounds the matching unresolved sites (Issue #617): the
@@ -1927,9 +1928,32 @@ fn issue_617_618_default_max_traversal_lists_unresolved_and_cycles_of_a_mid_size
         unresolved_count
     );
 
-    // The cycle search counts the ring edges it visits: forward, backward,
-    // and while choosing each representative cycle.
-    let ring_edge_visits = shape.files * 3;
+    // A paged listing counts only the sites of one page against
+    // max_traversal, so a page of 100 passes a max_traversal of 100 although
+    // 6,750 sites match, and still reports every match.
+    let paged = UnresolvedRequest::try_new(Vec::new(), 100)?.with_page_items(100)?;
+    assert_eq!(
+        service
+            .unresolved(&mut snapshot, &paged, &cancellation)?
+            .items()
+            .len(),
+        unresolved_count
+    );
+    let wide_page = UnresolvedRequest::try_new(Vec::new(), 100)?.with_page_items(101)?;
+    assert!(matches!(
+        service.unresolved(&mut snapshot, &wide_page, &cancellation),
+        Err(DepgraphServiceError::ResourceLimitExceeded {
+            limit: DepgraphResourceLimit::MaxTraversal,
+            maximum: 100,
+            observed: Some(101),
+        })
+    ));
+
+    // The component search visits every ring edge forward and backward
+    // against the snapshot-wide budget only. Choosing each representative
+    // cycle visits every ring edge once more, and those visits count toward
+    // max_traversal.
+    let ring_edge_visits = shape.files;
     let node_ids = |cycles: &[depgraph_core::CycleResult]| {
         cycles
             .iter()
@@ -1951,8 +1975,8 @@ fn issue_617_618_default_max_traversal_lists_unresolved_and_cycles_of_a_mid_size
         Err(DepgraphServiceError::ResourceLimitExceeded {
             limit: DepgraphResourceLimit::MaxTraversal,
             maximum,
-            observed: None,
-        }) if maximum == (ring_edge_visits - 1) as u64
+            observed: Some(observed),
+        }) if maximum == (ring_edge_visits - 1) as u64 && observed == ring_edge_visits as u64
     ));
     Ok(())
 }

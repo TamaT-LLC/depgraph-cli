@@ -4,8 +4,8 @@ use std::{
 };
 
 use depgraph_store::{
-    EdgeRecord, EvidenceRecord, GraphSnapshot, PhaseCoverageRecord, ProfileCorrelationRecord,
-    ProfileMatrixEntryRecord, SiteRecord,
+    EdgeRecord, EvidenceRecord, GraphSnapshot, NodeRecord, PhaseCoverageRecord,
+    ProfileCorrelationRecord, ProfileMatrixEntryRecord, SiteRecord,
 };
 
 use crate::{
@@ -223,6 +223,7 @@ pub struct CyclesResult {
     snapshot_id: ResolvedSnapshotId,
     scan_id: String,
     cycles: Vec<CycleResult>,
+    nodes: Vec<NodeRecord>,
 }
 
 impl CyclesResult {
@@ -240,15 +241,26 @@ impl CyclesResult {
     pub fn cycles(&self) -> &[CycleResult] {
         &self.cycles
     }
+
+    /// The nodes the cycles name, in ID order, so a caller can show their
+    /// paths and names next to the IDs.
+    #[must_use]
+    pub fn nodes(&self) -> &[NodeRecord] {
+        &self.nodes
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct UnresolvedRequest {
     kinds: Vec<String>,
     max_traversal: usize,
+    page_items: Option<usize>,
 }
 
 impl UnresolvedRequest {
+    /// A listing whose caller returns every matching site at once (CLI
+    /// `--all`): `max_traversal` bounds all of them. Use
+    /// [`Self::with_page_items`] for a paged listing.
     pub fn try_new(kinds: Vec<String>, max_traversal: usize) -> DepgraphServiceResult<Self> {
         validate_string_filter(&kinds)?;
         validate_traversal_limit(max_traversal)?;
@@ -258,7 +270,26 @@ impl UnresolvedRequest {
         Ok(Self {
             kinds,
             max_traversal,
+            page_items: None,
         })
+    }
+
+    /// Marks the listing as paged: the caller returns at most `page_items`
+    /// sites per page, so `max_traversal` bounds those rather than every
+    /// matching site The total still counts
+    /// every match.
+    pub fn with_page_items(mut self, page_items: usize) -> DepgraphServiceResult<Self> {
+        if page_items == 0 {
+            return Err(DepgraphServiceError::InvalidInput);
+        }
+        self.page_items = Some(page_items);
+        Ok(self)
+    }
+
+    /// Items one page returns, or `None` when every match is returned.
+    #[must_use]
+    pub const fn page_items(&self) -> Option<usize> {
+        self.page_items
     }
 
     #[must_use]
@@ -814,10 +845,22 @@ impl DepgraphService {
         if cancellation.is_cancelled() {
             return Err(DepgraphServiceError::Cancelled);
         }
+        let named = cycles
+            .iter()
+            .flat_map(|cycle| cycle.node_ids.iter().map(String::as_str))
+            .collect::<BTreeSet<_>>();
+        let mut nodes = snapshot
+            .nodes
+            .iter()
+            .filter(|node| named.contains(node.id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        nodes.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(CyclesResult {
             snapshot_id,
             scan_id: snapshot.scan.id.clone(),
             cycles,
+            nodes,
         })
     }
 
@@ -1117,10 +1160,13 @@ pub(crate) fn cycles_bounded_with_cancellation(
     )
 }
 
-/// Lists the cycles of one level. Indexing the snapshot and the per-node
-/// steps of the search count against `scan_maximum`; only the adjacency edges
-/// the search visits count against the request's `max_traversal`, as in the
-/// dependency traversal (Issue #618).
+/// Lists the cycles of one level. Indexing the snapshot and every step of the
+/// search count against `scan_maximum`. The strongly connected component
+/// search visits each adjacency edge of the level a bounded number of times
+/// whatever the result is, so only the edges visited to build the returned
+/// representative cycles count toward the request's `max_traversal`
+/// (Issue #618). A `max_traversal` smaller than those visits fails after the
+/// search with the number of visits as `observed`.
 fn cycles_bounded_with_budget(
     snapshot: &GraphSnapshot,
     request: &CyclesRequest,
@@ -1233,6 +1279,7 @@ fn cycles_bounded_with_budget(
             .entry(node_ids)
             .or_insert_with(|| request.level().node_kind().to_owned());
     }
+    work.finish()?;
     let mut results = Vec::with_capacity(ordered_results.len());
     for (node_ids, level) in ordered_results {
         work.scan(CycleWorkPhase::Finalization)?;
@@ -1350,21 +1397,41 @@ impl<'a> CycleWork<'a> {
     }
 
     /// One adjacency edge the search visits.
+    ///
+    /// The component search visits every edge of the level once in each
+    /// direction whatever the result is, so its visits count against the
+    /// snapshot-wide budget only. The visits that build the representative
+    /// cycle of each strongly connected component grow with the components
+    /// that are returned, so they also count toward `max_traversal`. They do
+    /// not stop at it: the snapshot-wide budget still bounds them, and
+    /// [`Self::finish`] reports how many the request needed.
     fn edge(&mut self, phase: CycleWorkPhase) -> DepgraphServiceResult<()> {
         if (self.is_cancelled)() {
             return Err(DepgraphServiceError::Cancelled);
         }
-        if self.edge_visits >= self.max_traversal {
+        if self.scanned >= self.scan_maximum {
+            return Err(snapshot_scan_limit(self.scan_maximum));
+        }
+        self.scanned += 1;
+        if matches!(phase, CycleWorkPhase::Finalization) {
+            self.edge_visits = self.edge_visits.saturating_add(1);
+            #[cfg(test)]
+            CYCLE_EDGE_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        record_cycle_work(phase);
+        Ok(())
+    }
+
+    /// Fails with the `max_traversal` the request needed when the
+    /// representative cycles visited more edges than it allows.
+    fn finish(&self) -> DepgraphServiceResult<()> {
+        if self.edge_visits > self.max_traversal {
             return Err(DepgraphServiceError::resource_limit(
                 DepgraphResourceLimit::MaxTraversal,
                 saturating_u64(self.max_traversal),
-                None,
+                Some(saturating_u64(self.edge_visits)),
             ));
         }
-        self.edge_visits += 1;
-        #[cfg(test)]
-        CYCLE_EDGE_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        record_cycle_work(phase);
         Ok(())
     }
 }
@@ -1431,8 +1498,9 @@ fn unresolved_bounded_with_cancellation(
 /// Lists unresolved sites. Indexing the snapshot's evidence, edges,
 /// correlations, coverage, and sites, and materializing the results, count
 /// against `scan_maximum`. The request's `max_traversal` bounds the number of
-/// unresolved sites returned and is checked before any is materialized, so
-/// its error reports how many sites matched (Issue #617).
+/// unresolved sites the caller returns: one page of a paged listing, or every
+/// match of an unpaged one (Issue #617). It is checked before any
+/// site is materialized, so its error reports that number.
 fn unresolved_bounded_with_budget(
     snapshot: &GraphSnapshot,
     request: &UnresolvedRequest,
@@ -1508,11 +1576,19 @@ fn unresolved_bounded_with_budget(
         }
         selected.push(site);
     }
-    if selected.len() > request.max_traversal() {
+    // Only the sites the caller returns count against max_traversal: a paged
+    // listing returns at most one page of them, and an unpaged one all of
+    // them. Every match is still selected, ordered, and materialized for the
+    // total, the summary, and stable cursors, which the snapshot-wide budget
+    // above bounds.
+    let returned = request
+        .page_items()
+        .map_or(selected.len(), |page_items| page_items.min(selected.len()));
+    if returned > request.max_traversal() {
         return Err(DepgraphServiceError::resource_limit(
             DepgraphResourceLimit::MaxTraversal,
             saturating_u64(request.max_traversal()),
-            Some(saturating_u64(selected.len())),
+            Some(saturating_u64(returned)),
         ));
     }
 
@@ -2734,6 +2810,50 @@ mod tests {
             1
         );
 
+        // A paged listing counts only the sites one page returns against
+        // max_traversal, and still lists every match for the total.
+        reset();
+        let paged = UnresolvedRequest::try_new(Vec::new(), 10)
+            .and_then(|request| request.with_page_items(10))
+            .expect("paged unresolved request");
+        assert_eq!(
+            unresolved_bounded_cancellable(&snapshot, &paged, &CancellationToken::new())
+                .expect("a page within max_traversal succeeds although more sites match")
+                .len(),
+            site_count
+        );
+        let wide_page = UnresolvedRequest::try_new(Vec::new(), 10)
+            .and_then(|request| request.with_page_items(11))
+            .expect("page wider than max_traversal");
+        assert!(matches!(
+            unresolved_bounded_cancellable(&snapshot, &wide_page, &CancellationToken::new())
+                .expect_err("a page wider than max_traversal returns no result"),
+            DepgraphServiceError::ResourceLimitExceeded {
+                limit: DepgraphResourceLimit::MaxTraversal,
+                maximum: 10,
+                observed: Some(11),
+            }
+        ));
+        let page_beyond_matches = UnresolvedRequest::try_new(Vec::new(), site_count)
+            .and_then(|request| request.with_page_items(site_count + 100))
+            .expect("page wider than the matches");
+        assert_eq!(
+            unresolved_bounded_cancellable(
+                &snapshot,
+                &page_beyond_matches,
+                &CancellationToken::new()
+            )
+            .expect("a page counts at most the matching sites")
+            .len(),
+            site_count
+        );
+        assert!(matches!(
+            UnresolvedRequest::try_new(Vec::new(), 1)
+                .and_then(|request| request.with_page_items(0))
+                .expect_err("an empty page is rejected"),
+            DepgraphServiceError::InvalidInput
+        ));
+
         for (counter, stage) in [
             (&UNRESOLVED_ORDERED_INSERT_VISITS, "ordered insertion"),
             (
@@ -2954,11 +3074,18 @@ mod tests {
             CYCLE_FINALIZATION_WORK.load(std::sync::atomic::Ordering::Relaxed),
         ]
         .into_iter()
-        .sum::<usize>()
-            - edge_visits;
-        // Each of the 24 ring edges is visited forward, backward, and once
-        // while choosing the representative cycle (Issue #618).
-        assert_eq!(edge_visits, 24 * 3);
+        .sum::<usize>();
+        // Each of the 24 ring edges is visited forward and backward by the
+        // component search, which counts against the snapshot-wide budget
+        // only, and once while choosing the representative cycle, which also
+        // counts toward max_traversal.
+        assert_eq!(edge_visits, 24);
+        assert_eq!(
+            CYCLE_TRAVERSAL_WORK.load(std::sync::atomic::Ordering::Relaxed),
+            // 24 nodes finish forward and are assigned backward, 6 component
+            // starts, and the 24 * 2 edges of the component search.
+            24 * 2 + 24 + 24 + 24 * 2
+        );
         let assert_same_cycles = |actual: &[CycleResult]| {
             assert_eq!(actual.len(), expected.len());
             for (actual, expected) in actual.iter().zip(&expected) {
@@ -2984,8 +3111,8 @@ mod tests {
             DepgraphServiceError::ResourceLimitExceeded {
                 limit: DepgraphResourceLimit::MaxTraversal,
                 maximum,
-                observed: None,
-            } if maximum == (edge_visits - 1) as u64
+                observed: Some(observed),
+            } if maximum == (edge_visits - 1) as u64 && observed == edge_visits as u64
         ));
 
         reset_cycle_counters();
