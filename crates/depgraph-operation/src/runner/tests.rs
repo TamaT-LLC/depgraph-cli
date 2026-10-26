@@ -441,8 +441,8 @@ fn legacy_runtime_import_input(mut durable_input: serde_json::Value) -> serde_js
 
 fn cancellable_capabilities() -> CapabilitySet {
     CapabilitySet::new([
-        depgraph_mcp_tools::AgentCapability::Read,
-        depgraph_mcp_tools::AgentCapability::StoreWrite,
+        depgraph_agent_contract::AgentCapability::Read,
+        depgraph_agent_contract::AgentCapability::StoreWrite,
     ])
     .unwrap()
 }
@@ -548,8 +548,8 @@ fn cooperative_checkpoint_observes_cancel_and_deadline() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             NOW + 2,
@@ -1054,8 +1054,8 @@ fn cancellation_requested_after_dispatch_wins_over_completed_outcome() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1141,8 +1141,8 @@ fn cancellation_in_scan_completion_window_keeps_previous_current_snapshot() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1257,8 +1257,8 @@ fn scan_cancel_cleanup_failure_is_retried_before_terminalizing() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1377,8 +1377,8 @@ fn cancellation_in_runtime_import_completion_window_keeps_base_snapshot_current(
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1473,8 +1473,8 @@ fn cancellation_winner_retries_runtime_cleanup_before_terminalizing() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1650,8 +1650,8 @@ fn dispatch_time_runtime_cancel_cleanup_error_is_retryable() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -1792,8 +1792,8 @@ fn cancellation_reclaim_after_runtime_stage_crash_removes_only_staging_evidence(
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),
@@ -3727,8 +3727,8 @@ fn operation_owned_runtime_stage_survives_other_operation_cleanup_and_recovers()
                 &repository,
                 &operation_b,
                 &CapabilitySet::new([
-                    depgraph_mcp_tools::AgentCapability::Read,
-                    depgraph_mcp_tools::AgentCapability::StoreWrite,
+                    depgraph_agent_contract::AgentCapability::Read,
+                    depgraph_agent_contract::AgentCapability::StoreWrite,
                 ])
                 .unwrap(),
                 system_now_ms().unwrap(),
@@ -5892,8 +5892,8 @@ fn guardian_cancels_the_dispatch_token_when_cancellation_is_requested() {
             &repository,
             &operation_id,
             &CapabilitySet::new([
-                depgraph_mcp_tools::AgentCapability::Read,
-                depgraph_mcp_tools::AgentCapability::StoreWrite,
+                depgraph_agent_contract::AgentCapability::Read,
+                depgraph_agent_contract::AgentCapability::StoreWrite,
             ])
             .unwrap(),
             system_now_ms().unwrap(),

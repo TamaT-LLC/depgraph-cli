@@ -103,13 +103,13 @@ fn cross_language_fixture_export(root: &Path) -> Result<(Value, Value)> {
         source_revision: None,
         properties: BTreeMap::new(),
     }];
-    let openapi = depgraph_core::scan_openapi_repository(root, &profiles)?
+    let openapi = depgraph_contract_scan::scan_openapi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no OpenAPI graph")?;
-    let protobuf = depgraph_core::scan_protobuf_repository(root, &profiles)?
+    let protobuf = depgraph_contract_scan::scan_protobuf_repository(root, &profiles)?
         .context("packaged cross-language fixture has no Protobuf graph")?;
-    let graphql = depgraph_core::scan_graphql_repository(root, &profiles)?
+    let graphql = depgraph_contract_scan::scan_graphql_repository(root, &profiles)?
         .context("packaged cross-language fixture has no GraphQL graph")?;
-    let ffi = depgraph_core::scan_ffi_repository(root, &profiles)?
+    let ffi = depgraph_contract_scan::scan_ffi_repository(root, &profiles)?
         .context("packaged cross-language fixture has no FFI graph")?;
 
     let operation = openapi

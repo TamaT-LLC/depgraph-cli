@@ -1005,7 +1005,7 @@ const HOSTILE_DECISIONS: [HostileDecision; 2] = [
         pattern: concat!(
             r"^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|",
             r"crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|",
-            r"crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|",
+            r"crates/depgraph-mcp/|crates/depgraph-agent-contract/|crates/depgraph-operation/|",
             r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
             r"docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)",
         ),
