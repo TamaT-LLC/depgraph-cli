@@ -25,7 +25,7 @@ The request-level projection a worker receives is the `split` object of a
 `depgraph-analysis-unit-v2` request (`$defs/splitBinding`). The core planner in
 `crates/depgraph-core/src/analysis_split.rs` is the semantic authority; the
 public fixture under `fixtures/analysis-split-plan-v1` and
-`crates/depgraph-core/tests/analysis_split_contract.rs` are its evidence. See
+`crates/depgraph-core/tests/it/analysis_split_contract.rs` are its evidence. See
 `docs/40_arch_design/adr-presplit-analysis-planning.md`. The shipped Go worker
 advertises `analysis-loader-scope-v1` and `analysis-go-package-loader-v1`;
 the request `split` object is the closed `$defs/splitBinding` and the worker
