@@ -1845,7 +1845,7 @@ fn issue_541_omitted_structural_edges_lets_an_allowlist_name_structural_kinds() 
 
 // Issue #617 / #618: unresolved and cycles on a mid-sized snapshot.
 
-#[path = "support/issue_617_fixture.rs"]
+#[path = "../support/issue_617_fixture.rs"]
 mod issue_617_fixture;
 use issue_617_fixture::{Issue617Shape, seed_issue_617_graph};
 

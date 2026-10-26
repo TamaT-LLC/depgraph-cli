@@ -388,7 +388,7 @@ the projection of three scenarios (`current-workers-default-budget`,
 `current-workers-two-file-budget`, `go-package-loader-default-budget`); set
 `DEPGRAPH_UPDATE_FIXTURES=1` to regenerate it after an intentional change.
 
-`crates/depgraph-core/tests/analysis_split_contract.rs` verifies, against the
+`crates/depgraph-core/tests/it/analysis_split_contract.rs` verifies, against the
 fixture: the projection golden; the same input produces the same plan across
 checkouts and runs; a budget change changes the plan but not the discovery
 plan ID or any unit input fingerprint; out-of-unit references stay in the

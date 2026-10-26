@@ -172,7 +172,7 @@ path exhausts the single budget, every range completes within the unchanged
 per-range limit, the unused findings are identical, the second request reuses
 every checkpoint, and the CLI envelope reports the same ranged execution.
 
-`crates/depgraph-core/tests/health_range.rs` covers the remaining acceptance
+`crates/depgraph-core/tests/it/health_range.rs` covers the remaining acceptance
 items on smaller shapes with the same generator: the planner reads aggregates
 only and is deterministic; the planner, global context, and range loaders each
 charge their own budget and fail closed at `MAX_HEALTH_PLANNER_ROWS` /
