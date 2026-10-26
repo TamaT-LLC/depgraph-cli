@@ -1,0 +1,49 @@
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    if: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read the Dependabot update type
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Reconcile squash auto-merge with the update type
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch | version-update:semver-minor) want=SQUASH ;;
+            *) want=NONE ;;
+          esac
+          current="$(gh pr view "$PR_URL" --json state,autoMergeRequest --jq '.state + ":" + (.autoMergeRequest.mergeMethod // "NONE")')"
+          case "$want:$current" in
+            *:MERGED:* | *:CLOSED:*) echo "pull request is no longer open; nothing to reconcile" ;;
+            SQUASH:OPEN:NONE) gh pr merge "$PR_URL" --auto --squash --match-head-commit "$EXPECTED_HEAD" ;;
+            SQUASH:OPEN:SQUASH | NONE:OPEN:NONE) echo "auto-merge already matches update type '$UPDATE_TYPE'" ;;
+            NONE:OPEN:SQUASH) gh pr merge "$PR_URL" --disable-auto ;;
+            NONE:OPEN:MERGE | NONE:OPEN:REBASE) echo "leaving the existing auto-merge method in place" ;;
+            *)
+              echo "::error::auto-merge is already armed ($current); refusing to switch it to squash"
+              exit 1
+              ;;
+          esac

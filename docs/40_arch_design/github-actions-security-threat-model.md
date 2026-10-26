@@ -82,6 +82,15 @@ source identity is wrong; its complete write-scope set is exactly `actions` and
 `contents`. It must never run repository scripts or consume an
 artifact from the triggering run.
 
+The Dependabot auto-merge workflow is the only `pull_request_target` workflow.
+GitHub runs that workflow from the latest commit on the default branch. The job
+checks out nothing and runs no repository script. Its job runs only when `github.actor` and the pull
+request author are both `dependabot[bot]`. The job token is `contents: write`
+and `pull-requests: write`. It arms squash auto-merge for semver patch and
+semver minor updates, and it disarms an existing squash arm when the update is
+no longer one of those classes. GitHub completes that merge only after the
+required checks pass. A semver-major update is not armed.
+
 The v0.5.0 post-publish recovery workflow is an incident-specific read-only
 closure verifier, not a second publisher. It has no dispatch inputs and only
 job-scoped `actions: read` and `contents: read`. It pins the immutable source,
@@ -151,6 +160,7 @@ To update an Action:
 | Release tag points at another commit | immutable stable source guard cancels the run and removes the tag |
 | `workflow_run` executes attacker code with write token | guard consumes metadata only and performs no checkout or repository execution |
 | Post-publish recovery rewrites release history | no inputs or write scopes; exact immutable run/tag/evidence binding and published-binary canary only |
+| A pull request steers the `pull_request_target` write token | byte-pinned default-branch workflow, no checkout, Dependabot actor and author, squash auto-merge waits for required checks |
 | Private advisory leaks into public CI | advisory data stays in GitHub Security Advisories and is represented publicly only by redacted dry-run digests |
 
 ## Evidence

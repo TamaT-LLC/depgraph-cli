@@ -152,6 +152,8 @@ pub(crate) fn verify_github_actions_security(root: &Path) -> Result<()> {
         "| Fork changes a workflow to print a secret |",
         "| `workflow_run` executes attacker code with write token |",
         "| Post-publish recovery rewrites release history |",
+        "The Dependabot auto-merge workflow is the only `pull_request_target` workflow.",
+        "| A pull request steers the `pull_request_target` write token |",
     ] {
         if !threat_model.contains(required) {
             bail!("GitHub Actions threat model is missing {required:?}");
@@ -198,6 +200,57 @@ pub(crate) const NPM_POST_PUBLISH_RETRY_BLOCK: &str = concat!(
     "            fi\n",
 );
 
+const DEPENDABOT_AUTO_MERGE_WORKFLOW: &str = r#"name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    if: ${{ github.actor == 'dependabot[bot]' && github.event.pull_request.user.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Read the Dependabot update type
+        id: metadata
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+      - name: Reconcile squash auto-merge with the update type
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch | version-update:semver-minor) want=SQUASH ;;
+            *) want=NONE ;;
+          esac
+          current="$(gh pr view "$PR_URL" --json state,autoMergeRequest --jq '.state + ":" + (.autoMergeRequest.mergeMethod // "NONE")')"
+          case "$want:$current" in
+            *:MERGED:* | *:CLOSED:*) echo "pull request is no longer open; nothing to reconcile" ;;
+            SQUASH:OPEN:NONE) gh pr merge "$PR_URL" --auto --squash --match-head-commit "$EXPECTED_HEAD" ;;
+            SQUASH:OPEN:SQUASH | NONE:OPEN:NONE) echo "auto-merge already matches update type '$UPDATE_TYPE'" ;;
+            NONE:OPEN:SQUASH) gh pr merge "$PR_URL" --disable-auto ;;
+            NONE:OPEN:MERGE | NONE:OPEN:REBASE) echo "leaving the existing auto-merge method in place" ;;
+            *)
+              echo "::error::auto-merge is already armed ($current); refusing to switch it to squash"
+              exit 1
+              ;;
+          esac
+"#;
+
 pub(crate) fn verify_workflow_policy_text(
     name: &str,
     workflow: &str,
@@ -207,7 +260,7 @@ pub(crate) fn verify_workflow_policy_text(
     let normalized_workflow = workflow.replace("\r\n", "\n").replace('\r', "\n");
     let workflow = normalized_workflow.as_str();
     let write_permissions = write_permission_scopes(workflow);
-    if workflow.contains("pull_request_target")
+    if (workflow.contains("pull_request_target") && name != "dependabot-auto-merge.yml")
         || contains_yaml_hex_escape(workflow)
         || write_permissions.contains(&"write-all")
         || has_noncanonical_permissions_declaration(workflow)
@@ -470,6 +523,11 @@ pub(crate) fn verify_workflow_policy_text(
                 || !workflow.contains("permissions:\n      actions: write\n      contents: write")
             {
                 bail!("stable release source guard must be metadata-only and job-scoped");
+            }
+        }
+        "dependabot-auto-merge.yml" => {
+            if workflow != DEPENDABOT_AUTO_MERGE_WORKFLOW {
+                bail!("{name} must match the reviewed Dependabot auto-merge workflow bytes");
             }
         }
         _ => {

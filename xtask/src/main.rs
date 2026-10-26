@@ -6093,6 +6093,7 @@ mod tests {
 
         for workflow_name in [
             "ci.yml",
+            "dependabot-auto-merge.yml",
             "homebrew-tap.yml",
             "npm-release.yml",
             "release-post-publish-recovery.yml",
@@ -6138,6 +6139,51 @@ mod tests {
                 .is_err()
             );
         }
+
+        let auto_merge =
+            fs::read_to_string(root.join(".github/workflows/dependabot-auto-merge.yml"))?;
+        for widening in [
+            auto_merge.replacen(
+                "version-update:semver-patch | version-update:semver-minor) want=SQUASH",
+                "version-update:semver-patch | version-update:semver-minor | version-update:semver-major) want=SQUASH",
+                1,
+            ),
+            auto_merge.replacen("*) want=NONE", "*) want=SQUASH", 1),
+            auto_merge.replacen(" --auto --squash", " --squash", 1),
+            auto_merge.replacen(
+                "    steps:\n",
+                "    steps:\n      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n",
+                1,
+            ),
+            auto_merge.replace("github.token", "secrets.GITHUB_TOKEN"),
+            auto_merge.replacen("\non:\n", "\non:\n  workflow_dispatch:\n", 1),
+            auto_merge.replacen(
+                "      pull-requests: write\n",
+                "      pull-requests: write\n      actions: write\n",
+                1,
+            ),
+            auto_merge.replacen("github.actor == 'dependabot[bot]' && ", "", 1),
+        ] {
+            assert_ne!(widening, auto_merge);
+            assert!(
+                verify_workflow_policy_text(
+                    "dependabot-auto-merge.yml",
+                    &widening,
+                    &pins,
+                    &mut BTreeSet::new()
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            verify_workflow_policy_text(
+                "auto-merge-copy.yml",
+                &auto_merge,
+                &pins,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
 
         let mutable = ci.replacen(
             "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
