@@ -1,14 +1,15 @@
 use std::io;
 
-use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentCapability, AgentContext, AgentCurrentSnapshot, AgentDependenciesOutput,
     AgentDependenciesResponse, AgentDependencyDetail, AgentDependencyDirection, AgentEdge,
     AgentErrorCode, AgentGraphExportFormat, AgentGraphExportMediaType, AgentGraphExportResponse,
     AgentNode, AgentSnapshot, CanonicalResponseMapper, CursorKey, DependencyProjectionRequest,
-    LogicalRepositoryId, MAX_PAGE_BYTES, OperationAccepted, Page, PageByteLimit, PageRequest,
-    PageSize, PaginationContext, SnapshotId, SuccessEnvelope, project_dependency_items_cancellable,
+    LogicalRepositoryId, MAX_PAGE_BYTES, MappedToolResult, OperationAccepted, Page, PageByteLimit,
+    PageRequest, PageSize, PaginationContext, SnapshotId, SuccessEnvelope,
+    project_dependency_items_cancellable,
 };
+use depgraph_core::{DepgraphCapability, DepgraphServiceError, RepositoryFileError};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -30,7 +31,7 @@ fn issue_300_closed_context_is_accepted_by_the_public_mapper() {
     let mapped =
         CanonicalResponseMapper::success(&SuccessEnvelope::new(repository_id(), None, context))
             .expect("closed context is a public result");
-    let structured = mapped.result().structured_content.as_ref().unwrap();
+    let structured = mapped.structured_content();
     assert_eq!(
         structured["result"]["snapshot"],
         json!({"available": false})
@@ -61,12 +62,8 @@ fn snapshot_id() -> SnapshotId {
     SNAPSHOT_ID.parse().expect("valid snapshot ID")
 }
 
-fn text_content(result: &rmcp::model::CallToolResult) -> &str {
-    assert_eq!(result.content.len(), 1, "exactly one content block");
-    &result.content[0]
-        .as_text()
-        .expect("the sole content block must be text")
-        .text
+fn text_content(result: &MappedToolResult) -> &str {
+    result.text()
 }
 
 #[test]
@@ -78,17 +75,14 @@ fn canonical_mapper_keeps_structured_content_and_single_text_content_byte_identi
     );
 
     let mapped = CanonicalResponseMapper::success(&envelope).expect("map success response");
-    let result = mapped.result();
-    let structured = result
-        .structured_content
-        .as_ref()
-        .expect("structured content");
-    let canonical_structured =
-        depgraph_mcp_tools::canonical_json_bytes(structured).expect("canonical structured content");
+    let result = &mapped;
+    let structured = result.structured_content();
+    let canonical_structured = depgraph_agent_contract::canonical_json_bytes(structured)
+        .expect("canonical structured content");
 
     assert_eq!(text_content(result).as_bytes(), canonical_structured);
     assert_eq!(mapped.output_bytes(), canonical_structured.len());
-    assert_eq!(result.is_error, Some(false));
+    assert!(!result.is_error());
 }
 
 #[test]
@@ -111,13 +105,9 @@ fn graph_export_mapper_preserves_export_file_remediation_after_envelope_overflow
 
     let mapped = CanonicalResponseMapper::export_success(&envelope)
         .expect("oversized export maps to a bounded typed error");
-    let structured = mapped
-        .result()
-        .structured_content
-        .as_ref()
-        .expect("structured error content");
+    let structured = mapped.structured_content();
 
-    assert_eq!(mapped.result().is_error, Some(true));
+    assert!(mapped.is_error());
     assert_eq!(structured["error"]["code"], "RESOURCE_EXHAUSTED");
     assert_eq!(structured["error"]["remediation"], "export_file");
     assert!(structured.get("result").is_none());
@@ -133,16 +123,14 @@ fn accepted_response_uses_the_same_canonical_mapper_contract() {
     let envelope = SuccessEnvelope::new(repository_id(), Some(snapshot_id()), accepted);
 
     let mapped = CanonicalResponseMapper::success(&envelope).expect("map accepted response");
-    let result = mapped.result();
-    let structured = result
-        .structured_content
-        .as_ref()
-        .expect("structured accepted content");
+    let result = &mapped;
+    let structured = result.structured_content();
 
-    assert_eq!(result.is_error, Some(false));
+    assert!(!result.is_error());
     assert_eq!(
         text_content(result).as_bytes(),
-        depgraph_mcp_tools::canonical_json_bytes(structured).expect("canonical accepted content")
+        depgraph_agent_contract::canonical_json_bytes(structured)
+            .expect("canonical accepted content")
     );
 }
 
@@ -196,11 +184,8 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
     for (source, expected_code) in cases {
         let mapped = CanonicalResponseMapper::service_error(repository_id(), &source)
             .expect("map service error");
-        let result = mapped.result();
-        let structured = result
-            .structured_content
-            .as_ref()
-            .expect("structured error content");
+        let result = &mapped;
+        let structured = result.structured_content();
         let error = structured
             .get("error")
             .and_then(|value| value.get("code"))
@@ -208,10 +193,10 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
             .expect("typed error code");
 
         assert_eq!(error, serde_json::to_value(expected_code).unwrap());
-        assert_eq!(result.is_error, Some(true));
+        assert!(result.is_error());
         assert_eq!(
             text_content(result).as_bytes(),
-            depgraph_mcp_tools::canonical_json_bytes(structured)
+            depgraph_agent_contract::canonical_json_bytes(structured)
                 .expect("canonical structured error")
         );
         let disclosure = text_content(result).to_ascii_lowercase();
@@ -227,7 +212,7 @@ fn service_errors_map_to_closed_redacted_tool_errors() {
 fn mapped_error(source: &DepgraphServiceError) -> Value {
     let mapped =
         CanonicalResponseMapper::service_error(repository_id(), source).expect("map service error");
-    mapped.result().structured_content.as_ref().unwrap()["error"].clone()
+    mapped.structured_content()["error"].clone()
 }
 
 #[test]
@@ -356,9 +341,9 @@ fn issue_617_unresolved_and_cycle_limits_and_out_of_range_arguments_are_named() 
     );
     // Argument details without a range keep their previous wire shape.
     assert_eq!(
-        serde_json::to_value(depgraph_mcp_tools::AgentErrorDetails::argument(
+        serde_json::to_value(depgraph_agent_contract::AgentErrorDetails::argument(
             Some("limit"),
-            depgraph_mcp_tools::AgentArgumentReason::OutOfRange,
+            depgraph_agent_contract::AgentArgumentReason::OutOfRange,
         ))
         .unwrap(),
         json!({"kind": "argument", "argument": "limit", "reason": "out_of_range"})
@@ -493,7 +478,7 @@ fn mapper_redacts_sensitive_strings_from_closed_success_dtos() {
 
         let mapped =
             CanonicalResponseMapper::success(&unsafe_envelope).expect("map redacted success");
-        let text = text_content(mapped.result()).to_ascii_lowercase();
+        let text = text_content(&mapped).to_ascii_lowercase();
 
         assert!(
             !text.contains(&sensitive.to_ascii_lowercase()),
@@ -697,8 +682,8 @@ fn item_and_byte_bounded_pages_reassemble_the_canonical_full_result() {
     assert!(page_count > 1);
     assert_eq!(reassembled, items);
     assert_eq!(
-        depgraph_mcp_tools::canonical_json_bytes(&reassembled).unwrap(),
-        depgraph_mcp_tools::canonical_json_bytes(&items).unwrap()
+        depgraph_agent_contract::canonical_json_bytes(&reassembled).unwrap(),
+        depgraph_agent_contract::canonical_json_bytes(&items).unwrap()
     );
 }
 
@@ -914,7 +899,7 @@ fn project_fixture(
     detail: AgentDependencyDetail,
     page: &PageRequest,
     pagination: &PaginationContext,
-) -> Result<AgentDependenciesOutput, depgraph_mcp_tools::AgentError> {
+) -> Result<AgentDependenciesOutput, depgraph_agent_contract::AgentError> {
     project_items(&dependency_fixture_items(), detail, page, pagination)
 }
 
@@ -944,7 +929,7 @@ fn project_items(
     detail: AgentDependencyDetail,
     page: &PageRequest,
     pagination: &PaginationContext,
-) -> Result<AgentDependenciesOutput, depgraph_mcp_tools::AgentError> {
+) -> Result<AgentDependenciesOutput, depgraph_agent_contract::AgentError> {
     project_dependency_items_cancellable(
         dependency_root(),
         items,
@@ -964,14 +949,14 @@ fn large_page() -> PageRequest {
     )
 }
 
-fn mapped_bytes<T: depgraph_mcp_tools::PublicToolResult>(result: T) -> Vec<u8> {
+fn mapped_bytes<T: depgraph_agent_contract::PublicToolResult>(result: T) -> Vec<u8> {
     let mapped = CanonicalResponseMapper::success(&SuccessEnvelope::new(
         repository_id(),
         Some(snapshot_id()),
         result,
     ))
     .expect("dependency response maps");
-    text_content(mapped.result()).as_bytes().to_vec()
+    text_content(&mapped).as_bytes().to_vec()
 }
 
 #[test]
@@ -1130,7 +1115,7 @@ fn issue_542_byte_budget_pages_every_detail_and_reassembles_the_complete_result(
             ))
             .unwrap();
             budget = budget.max(mapped.output_bytes());
-            let value: Value = serde_json::from_str(text_content(mapped.result())).unwrap();
+            let value: Value = serde_json::from_str(text_content(&mapped)).unwrap();
             match value["result"][field].get("next_cursor") {
                 Some(next) => single_cursor = Some(next.as_str().unwrap().parse().unwrap()),
                 None => break,
@@ -1159,7 +1144,7 @@ fn issue_542_byte_budget_pages_every_detail_and_reassembles_the_complete_result(
                 "{detail:?} over budget"
             );
             pages += 1;
-            let value: Value = serde_json::from_str(text_content(mapped.result())).unwrap();
+            let value: Value = serde_json::from_str(text_content(&mapped)).unwrap();
             let page = &value["result"][field];
             assert!(page["returned_items"].as_u64().unwrap() >= 1);
             collected.extend(page["items"].as_array().unwrap().iter().cloned());

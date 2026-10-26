@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
-use depgraph_core::{
-    DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
-    MAX_DEPENDENCY_EDGE_KINDS,
-};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     ALL_CLI_ACTIONS, AgentCurrentSnapshot, AgentNamedSnapshot, AgentRepositoryList,
     AgentRepositorySummary, CapabilityProfile, CliAction, IdempotencyKey,
     MAX_IDEMPOTENCY_KEY_CHARS, OperationAccepted, OperationBehavior, OperationId,
     STANDARD_JSON_SCHEMA_FORMATS, SuccessEnvelope, ToolAuthorization, ToolCatalog,
+};
+use depgraph_core::{
+    DEFAULT_STRUCTURAL_EDGE_SELECTION, DepgraphCapability, DepgraphCapabilitySet,
+    MAX_DEPENDENCY_EDGE_KINDS,
 };
 
 use serde_json::{Value, json};

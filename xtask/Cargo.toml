@@ -10,8 +10,8 @@ publish = false
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+depgraph-agent-contract = { path = "../crates/depgraph-agent-contract" }
 depgraph-core = { path = "../crates/depgraph-core" }
-depgraph-mcp-tools = { path = "../crates/depgraph-mcp-tools" }
 depgraph-operation = { path = "../crates/depgraph-operation" }
 depgraph-protocol = { path = "../crates/depgraph-protocol" }
 depgraph-store = { path = "../crates/depgraph-store" }

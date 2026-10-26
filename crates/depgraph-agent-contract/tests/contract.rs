@@ -1,6 +1,6 @@
 use std::num::NonZeroU32;
 
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AcceptedOperationStatus, AgentArgumentReason, AgentBuildOutcome, AgentCapability,
     AgentChangedSince, AgentCompletedSnapshot, AgentCondition, AgentContext,
     AgentCorrelationDifference, AgentCorrelationStatus, AgentCoverage, AgentCurrentSnapshot,
@@ -660,7 +660,7 @@ fn agent_edge_accepts_a_rendered_condition_larger_than_an_agent_label() {
         "key": "feature",
         "values": values,
     }));
-    assert!(condition.len() > depgraph_mcp_tools::MAX_AGENT_LABEL_BYTES);
+    assert!(condition.len() > depgraph_agent_contract::MAX_AGENT_LABEL_BYTES);
 
     AgentEdge::new_with_condition(
         parse("edge:long-condition"),
@@ -1502,15 +1502,15 @@ fn option_a_negotiation_preserves_baseline_and_uses_one_identity() {
     let recovery = operation().recovery().clone();
     assert_eq!(
         recovery.status(),
-        depgraph_mcp_tools::BaselineOperationTool::OperationGet
+        depgraph_agent_contract::BaselineOperationTool::OperationGet
     );
     assert_eq!(
         recovery.result(),
-        depgraph_mcp_tools::BaselineOperationTool::OperationResult
+        depgraph_agent_contract::BaselineOperationTool::OperationResult
     );
     assert_eq!(
         recovery.cancel(),
-        depgraph_mcp_tools::BaselineOperationTool::OperationCancel
+        depgraph_agent_contract::BaselineOperationTool::OperationCancel
     );
 }
 
@@ -2623,7 +2623,7 @@ fn import_evidence_rejects_raw_properties_and_detail() {
 
 #[test]
 fn issue_579_analysis_degradations_are_optional_bounded_and_round_trip() {
-    use depgraph_mcp_tools::{
+    use depgraph_agent_contract::{
         AgentAnalysisDegradation, AgentId, AgentLabel, AgentToken,
         MAX_AGENT_ANALYSIS_DEGRADATION_REASONS,
     };
@@ -2714,7 +2714,7 @@ fn issue_579_analysis_degradations_are_optional_bounded_and_round_trip() {
 
 #[test]
 fn issue_566_context_summary_replaces_profile_ids_and_full_keeps_the_legacy_bytes() {
-    use depgraph_mcp_tools::{AgentContextDetail, AgentContextOutput, AgentContextSummary};
+    use depgraph_agent_contract::{AgentContextDetail, AgentContextOutput, AgentContextSummary};
 
     let legacy = context();
     let full = AgentContextOutput::project(legacy.clone(), AgentContextDetail::Full);
@@ -2778,7 +2778,7 @@ fn import_group(imports: Vec<AgentImportEvidence>, import_count: u64) -> Value {
 
 #[test]
 fn issue_566_import_groups_validate_kinds_and_counts() {
-    use depgraph_mcp_tools::{
+    use depgraph_agent_contract::{
         AgentEdgesImportsResponse, AgentImportGroup, MAX_AGENT_IMPORT_GROUP_NAMES,
     };
 
@@ -2848,7 +2848,7 @@ fn issue_566_import_groups_validate_kinds_and_counts() {
 
 #[test]
 fn issue_566_fan_in_items_require_a_dependent() {
-    use depgraph_mcp_tools::AgentFanInItem;
+    use depgraph_agent_contract::AgentFanInItem;
 
     let item = json!({
         "node_id": "file:a",
