@@ -1,0 +1,23 @@
+[package]
+name = "depgraph-contract-scan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded static GraphQL, OpenAPI, Protobuf, and FFI contract extractors for depgraph"
+
+[dependencies]
+anyhow.workspace = true
+depgraph-protocol = { path = "../depgraph-protocol" }
+hex.workspace = true
+petgraph.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+walkdir.workspace = true
+workspace-hack = { version = "0.7", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true

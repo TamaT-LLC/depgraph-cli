@@ -8,13 +8,13 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use depgraph_agent_contract::{
+    AgentHostCapabilityProfile, AgentHostFormat, agent_host_launch_arguments,
+};
 use depgraph_core::{
     DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits, StoreLockGuard,
     acquire_store_writer_lock, compiler_pack_host_target, default_store_path,
     worker::preflight_web_runtime,
-};
-use depgraph_mcp_tools::{
-    AgentHostCapabilityProfile, AgentHostFormat, agent_host_launch_arguments,
 };
 use depgraph_operation::{
     OperationRunnerExclusionGuard, operation_journal_path, try_acquire_operation_runner_exclusion,
@@ -2785,7 +2785,7 @@ mod tests {
             .runtime_root()
             .join("bin")
             .join(executable_name("depgraph-mcp"));
-        depgraph_mcp_tools::render_agent_host_configuration(
+        depgraph_agent_contract::render_agent_host_configuration(
             AgentHostFormat::Codex,
             AgentHostCapabilityProfile::Read,
             command.to_str().unwrap(),
@@ -2828,7 +2828,7 @@ mod tests {
             .runtime_root()
             .join("bin")
             .join(executable_name("depgraph-mcp"));
-        let generated = depgraph_mcp_tools::render_agent_host_configuration(
+        let generated = depgraph_agent_contract::render_agent_host_configuration(
             host.agent_format(),
             AgentHostCapabilityProfile::Read,
             command.to_str().unwrap(),
