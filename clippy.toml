@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "assert_cmd::assert::Assert::failure", reason = "`.failure()` accepts any non-zero exit; pin the expected exit with `.code(N)`" },
+]
