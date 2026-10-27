@@ -35,8 +35,8 @@ use crate::{
         resplit_execution_unit,
     },
     cache::{
-        CacheRejection, ScanCachePlan, ScanCachePreparation, prepare_scan_cache,
-        validate_scan_cache_hit_inputs,
+        CacheRejection, ScanCachePlan, ScanCachePreparation, ToolFingerprintMemo,
+        prepare_scan_cache, validate_scan_cache_hit_inputs,
     },
     cancellation::CancellationToken,
     config::Config,
@@ -944,12 +944,15 @@ async fn run_scan_with_cache_mode_and_cancellation_inner(
         .as_ref()
         .and_then(|plan| plan.syntax.dimensions.get("file_content").cloned());
     let checkpoint_store_path = store.database_path();
+    // Scoped to this scan: a later scan in the same process starts empty.
+    let tool_fingerprints = ToolFingerprintMemo::default();
     let execution_context = AnalysisExecutionContext {
         root: &root,
         scan_id: &scan_id,
         config,
         cache_mode,
         cancellation: &cancellation,
+        tool_fingerprints: &tool_fingerprints,
     };
     let schedule = prepare_analysis_schedule(
         &execution_context,
