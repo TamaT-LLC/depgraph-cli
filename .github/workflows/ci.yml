@@ -194,6 +194,16 @@ jobs:
 
   web:
     runs-on: ubuntu-24.04
+    env:
+      # The resumable-analysis step builds depgraph-cli and the health-range
+      # step then runs a depgraph-core example. In the CLI build strsim is a
+      # runtime dependency (clap), so it is compiled with the dev profile's
+      # debuginfo; in the example build it is only a proc-macro dependency
+      # (darling), so the build-override profile drops that debuginfo. The
+      # different strsim unit cascaded through darling, rmcp, and workspace-hack
+      # into a second depgraph-core build. With dev debuginfo off both builds
+      # resolve to the same units and the example reuses the CLI's artifacts.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     defaults:
       run:
         working-directory: workers/web
@@ -247,7 +257,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
-          key: resumable-analysis-${{ hashFiles('Cargo.toml') }}
+          # Shared with go-loader-scope, which builds a subset of these
+          # artifacts and only restores this entry. A shared key replaces the
+          # job-based key (and ignores `key`), so the Cargo.toml hash lives here.
+          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -265,23 +278,6 @@ jobs:
         with:
           name: resumable-analysis-report
           path: ${{ runner.temp }}/depgraph-resumable-report.json
-          if-no-files-found: error
-      # Public synthetic Go fixtures: the module-loader control fails the
-      # 1,024-file package at a reduced per-unit memory limit while the
-      # package-bounded path completes under the same limit with the same
-      # canonical graph (#463).
-      - name: Verify package-bounded Go loading completes where the whole-module load fails
-        if: steps.decide.outputs.run == 'true'
-        id: go_loader_scope_e2e
-        working-directory: .
-        env:
-          DEPGRAPH_GO_LOADER_SCOPE_REPORT: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
-        run: cargo xtask go-loader-scope-e2e
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'"
-        with:
-          name: go-loader-scope-report
-          path: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
           if-no-files-found: error
       # Public synthetic health fixture: the whole-snapshot path exhausts the
       # single work budget while the ranged path completes under the unchanged
@@ -401,7 +397,7 @@ jobs:
           if-no-files-found: error
 
   benchmark:
-    needs: [rust, go, web]
+    needs: [rust, go, web, go-loader-scope]
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     env:
@@ -460,7 +456,7 @@ jobs:
           if-no-files-found: error
 
   integration:
-    needs: [rust, go, web]
+    needs: [rust, go, web, go-loader-scope]
     if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     strategy:
       # Preserve the successful platform evidence when the other matrix leg
@@ -979,7 +975,7 @@ jobs:
           du -sh target 2>/dev/null || echo "target directory is absent"
 
   windows-smoke:
-    needs: [rust, go, web]
+    needs: [rust, go, web, go-loader-scope]
     if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only
     runs-on: windows-2025
     env:
@@ -1510,3 +1506,79 @@ jobs:
         env:
           DEPGRAPH_TARGET: ${{ matrix.target }}
         run: cargo xtask package
+
+  # Public synthetic Go fixtures: the module-loader control fails the 1,024-file
+  # package at a reduced per-unit memory limit while the package-bounded path
+  # completes under the same limit with the same canonical graph (#463). This
+  # was the longest step of the web job; the fan-out and big-package fixtures
+  # share nothing, so each runs on its own runner beside web. The big-package
+  # control, package, and resume scans stay together: the package scan compares
+  # against the control's graph and the resume scan reuses the package store.
+  go-loader-scope:
+    runs-on: ubuntu-24.04
+    strategy:
+      # Keep the other fixture's report when one leg fails.
+      fail-fast: false
+      matrix:
+        scenarios: [bigpkg, fanout]
+    env:
+      # Must match the web job so the shared rust-cache entry restores here.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so pull_request path filtering can diff base..head.
+          fetch-depth: 0
+      # The Go worker, the Web worker, and depgraph-cli are what the web scope
+      # already guards (it ignores no workers/go path), so the same decision
+      # applies.
+      - name: Decide whether the go-loader-scope checks must run
+        id: decide
+        working-directory: .
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci-affected-scope.sh decide web
+      - name: Skip the go-loader-scope checks when unrelated
+        if: steps.decide.outputs.run != 'true'
+        run: echo "Skipping the go-loader-scope checks (no relevant path changes)"
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+        if: steps.decide.outputs.run == 'true'
+        with:
+          version: 10.33.0
+          standalone: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: steps.decide.outputs.run == 'true'
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: workers/web/pnpm-lock.yaml
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain install 1.93.1 --profile minimal
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup default 1.93.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.decide.outputs.run == 'true'
+        with:
+          # The web job saves this entry; it holds every artifact this job builds.
+          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
+          save-if: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.decide.outputs.run == 'true'
+        with:
+          go-version: 1.26.1
+          cache-dependency-path: workers/go/go.sum
+      - name: Verify package-bounded Go loading completes where the whole-module load fails
+        if: steps.decide.outputs.run == 'true'
+        id: go_loader_scope_e2e
+        env:
+          DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS: ${{ matrix.scenarios }}
+          DEPGRAPH_GO_LOADER_SCOPE_REPORT: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+        run: cargo xtask go-loader-scope-e2e
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: "!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'"
+        with:
+          name: go-loader-scope-report-${{ matrix.scenarios }}
+          path: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+          if-no-files-found: error
