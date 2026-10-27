@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use depgraph_core::CancellationToken;
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentError, AgentErrorCode, AgentErrorDetails, AgentRemediation, AgentResourceLimit,
 };
+use depgraph_core::CancellationToken;
 use serde::Serialize;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 

@@ -13,8 +13,8 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+depgraph-agent-contract = { path = "../depgraph-agent-contract" }
 depgraph-core = { path = "../depgraph-core" }
-depgraph-mcp-tools = { path = "../depgraph-mcp-tools" }
 depgraph-operation = { path = "../depgraph-operation" }
 rmcp = { version = "=3.1.0", default-features = false, features = ["macros", "server", "transport-io"] }
 serde.workspace = true

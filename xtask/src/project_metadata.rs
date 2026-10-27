@@ -262,9 +262,9 @@ pub(crate) fn verify_workflow_policy_text(
                 || !workflow.contains("\n  pull_request:")
                 || !workflow.contains("\n  workflow_dispatch:")
                 || ![
-                    "\n  benchmark:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
-                    "\n  integration:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
-                    "\n  windows-smoke:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
+                    "\n  benchmark:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch'\n",
+                    "\n  integration:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
+                    "\n  windows-smoke:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
@@ -619,12 +619,14 @@ const INTEGRATION_TARGET_SIZE_REPORT: &str =
 
 /// The jobs whose pull request steps `scripts/ci-affected-scope.sh` may skip:
 /// (job, scope passed to `decide`, label used in the step names, whether the
-/// job is a required check). A required check must never carry a job-level
-/// `if:`, or a skipped job would leave the check pending.
-const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 3] = [
+/// job must always run as a whole). A required check, or a job the dispatch
+/// jobs need, must never carry a job-level `if:`, or a skipped job would leave
+/// the check pending or skip its dependents.
+const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 4] = [
     ("go", "go", "go", true),
     ("go-macos", "go", "go-macos", false),
     ("web", "web", "web", true),
+    ("go-loader-scope", "web", "go-loader-scope", true),
 ];
 
 /// The script and the CI step text that invokes it.
@@ -634,12 +636,18 @@ const CI_AFFECTED_SCOPE_TEST: &str = "scripts/tests/ci-affected-scope.test.mjs";
 const CI_DECIDE_GATE: &str = "        if: steps.decide.outputs.run == 'true'";
 const GO_MACOS_JOB_CONDITION: &str = "    if: ${{ !inputs.benchmark_only }}";
 
-/// Web evidence uploads that run whenever their producing step ran. When the
-/// decide step skips that producer, its outcome is `skipped` and the upload is
-/// skipped with it, so these need no decide gate of their own.
-const CI_WEB_OUTCOME_GATED_UPLOADS: [&str; 2] = [
-    "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
-    "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
+/// Evidence uploads that run whenever their producing step ran, by job. When
+/// the decide step skips that producer, its outcome is `skipped` and the upload
+/// is skipped with it, so these need no decide gate of their own.
+const CI_OUTCOME_GATED_UPLOADS: [(&str, &str); 2] = [
+    (
+        "go-loader-scope",
+        "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
+    ),
+    (
+        "web",
+        "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
+    ),
 ];
 
 /// Paths that make every gated job run. Pinned verbatim against the arrays in
@@ -826,10 +834,10 @@ fn step_condition_is(step: &str, allowed: &[&str]) -> bool {
     matches!(conditions.as_slice(), [condition] if allowed.contains(&condition.as_str()))
 }
 
-/// Pull request path filtering for the Go, macOS Go, and Web jobs. Each gated
-/// job checks out full history, runs the canonical decide step, prints the
-/// canonical skip notice, and gates every remaining step on the decision (or,
-/// for the Web evidence uploads, on the producing step's outcome). The Rust job
+/// Pull request path filtering for the Go, macOS Go, Web, and Go loader-scope
+/// jobs. Each gated job checks out full history, runs the canonical decide
+/// step, prints the canonical skip notice, and gates every remaining step on
+/// the decision (or, for the evidence uploads, on the producing step's outcome). The Rust job
 /// stays unconditional because it owns the document-contract tests.
 fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
     if workflow.matches(CI_AFFECTED_SCOPE_DECIDE_RUN).count() != CI_AFFECTED_SCOPE_JOBS.len() {
@@ -868,13 +876,16 @@ fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
             bail!("CI {job_name} job has no checks behind its affected-scope gate");
         }
         let mut allowed = vec![CI_DECIDE_GATE];
-        if job_name == "web" {
-            allowed.extend(CI_WEB_OUTCOME_GATED_UPLOADS);
-        }
-        for step in rest {
-            let outcome_gated = CI_WEB_OUTCOME_GATED_UPLOADS
+        allowed.extend(
+            CI_OUTCOME_GATED_UPLOADS
                 .iter()
-                .any(|condition| workflow_block_has_line(step, condition));
+                .filter(|(job, _)| *job == job_name)
+                .map(|(_, condition)| *condition),
+        );
+        for step in rest {
+            let outcome_gated = CI_OUTCOME_GATED_UPLOADS
+                .iter()
+                .any(|(_, condition)| workflow_block_has_line(step, condition));
             if !step_condition_is(step, &allowed)
                 || (outcome_gated && !step.starts_with("uses: actions/upload-artifact@"))
             {
@@ -994,7 +1005,7 @@ const HOSTILE_DECISIONS: [HostileDecision; 2] = [
         pattern: concat!(
             r"^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|",
             r"crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|",
-            r"crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|",
+            r"crates/depgraph-mcp/|crates/depgraph-agent-contract/|crates/depgraph-operation/|",
             r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
             r"docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)",
         ),
@@ -2925,7 +2936,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
-        "needs: [rust, go, web]",
+        "needs: [rust, go, web, go-loader-scope]",
         "node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs",
         "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs",
         "scripts/benchmark-mvp.sh",
@@ -3627,8 +3638,8 @@ mod tests {
     #[test]
     fn intermediate_state_bound_rejects_a_bound_moved_to_another_job() {
         let ci = checked_in_ci_workflow();
-        let web_job = "  web:\n    runs-on: ubuntu-24.04\n    defaults:\n";
-        assert_eq!(ci.matches(web_job).count(), 1);
+        let go_job = "  go:\n    runs-on: ubuntu-24.04\n    env:\n";
+        assert_eq!(ci.matches(go_job).count(), 1);
         let drift = ci
             .replacen(
                 WINDOWS_SMOKE_BOUND,
@@ -3636,15 +3647,14 @@ mod tests {
                 1,
             )
             .replacen(
-                web_job,
+                go_job,
                 concat!(
-                    "  web:\n",
+                    "  go:\n",
                     "    runs-on: ubuntu-24.04\n",
                     "    env:\n",
                     "      CARGO_INCREMENTAL: \"0\"\n",
                     "      CARGO_PROFILE_DEV_DEBUG: \"0\"\n",
                     "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n",
-                    "    defaults:\n",
                 ),
                 1,
             );
@@ -3913,6 +3923,30 @@ mod tests {
                 ci.replacen(
                     "  go:\n    runs-on: ubuntu-24.04\n",
                     "  go:\n    if: false\n    runs-on: ubuntu-24.04\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope job skipped as a whole",
+                ci.replacen(
+                    "  go-loader-scope:\n    runs-on: ubuntu-24.04\n",
+                    "  go-loader-scope:\n    if: false\n    runs-on: ubuntu-24.04\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope decides with the go scope",
+                ci.replacen(
+                    &affected_scope_decide_step("go-loader-scope", "web"),
+                    &affected_scope_decide_step("go-loader-scope", "go"),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope e2e ungated",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true'\n        id: go_loader_scope_e2e\n",
+                    "        id: go_loader_scope_e2e\n",
                     1,
                 ),
             ),

@@ -1,14 +1,6 @@
-use std::{
-    fmt,
-    fs::{self, File, Metadata},
-    io::Read,
-    path::{Component, Path, PathBuf},
-};
+use std::{fmt, path::Path};
 
 use serde::{Deserialize, Serialize};
-
-#[cfg(not(unix))]
-use std::fs::OpenOptions;
 
 pub const BOUNDED_QUERY_CONTRACT_VERSION: &str = "bounded-graph-query-v1";
 pub const BOUNDED_QUERY_CREDENTIAL_POLICY_VERSION: &str = "release-redaction-shapes-v1";
@@ -303,130 +295,17 @@ pub fn read_bounded_query_file(repository_root: &Path, query_file: &Path) -> Que
     })
 }
 
+/// Repository-confined bounded read; see
+/// [`depgraph_protocol::read_bounded_repository_file`]. Refusals keep their
+/// stable code and surface as security-class input diagnostics.
 pub fn read_bounded_repository_file(
     repository_root: &Path,
     file: &Path,
     max_bytes: usize,
 ) -> QueryResult<Vec<u8>> {
-    let max_bytes = u64::try_from(max_bytes).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_size_or_type_invalid",
-            QueryFailureClass::Security,
-            "query file byte limit is invalid",
-        )
-    })?;
-    let read_limit = max_bytes.checked_add(1).ok_or_else(|| {
-        QueryDiagnostic::input(
-            "query_file_size_or_type_invalid",
-            QueryFailureClass::Security,
-            "query file byte limit is invalid",
-        )
-    })?;
-    let root = fs::canonicalize(repository_root).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_repository_boundary_unavailable",
-            QueryFailureClass::Security,
-            "query file repository boundary is unavailable",
-        )
-    })?;
-    let candidate = confined_candidate(repository_root, &root, file)?;
-    reject_symlink_components(&root, &candidate)?;
-    let canonical = fs::canonicalize(&candidate).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_unavailable",
-            QueryFailureClass::Security,
-            "query file is unavailable",
-        )
-    })?;
-    if !canonical.starts_with(&root) {
-        return Err(QueryDiagnostic::input(
-            "query_file_outside_repository",
-            QueryFailureClass::Security,
-            "query file is outside the repository boundary",
-        ));
-    }
-
-    let path_before = fs::symlink_metadata(&candidate).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_unavailable",
-            QueryFailureClass::Security,
-            "query file is unavailable",
-        )
-    })?;
-    if path_before.file_type().is_symlink() || !path_before.file_type().is_file() {
-        return Err(QueryDiagnostic::input(
-            "query_file_not_regular",
-            QueryFailureClass::Security,
-            "query file must be a non-symlink regular file",
-        ));
-    }
-
-    let mut opened = open_query_file(&root, &candidate)?;
-    let before = opened.file.metadata().map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_metadata_unavailable",
-            QueryFailureClass::Security,
-            "query file metadata is unavailable",
-        )
-    })?;
-    if !before.file_type().is_file() || before.len() > max_bytes {
-        return Err(QueryDiagnostic::input(
-            "query_file_size_or_type_invalid",
-            QueryFailureClass::Security,
-            "query file type or size is invalid",
-        ));
-    }
-    if !same_file_identity(&path_before, &before) {
-        return Err(QueryDiagnostic::input(
-            "query_file_changed_during_open",
-            QueryFailureClass::Security,
-            "query file changed while it was opened",
-        ));
-    }
-
-    let capacity = usize::try_from(before.len()).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_size_or_type_invalid",
-            QueryFailureClass::Security,
-            "query file type or size is invalid",
-        )
-    })?;
-    let mut bytes = Vec::with_capacity(capacity);
-    opened
-        .file
-        .by_ref()
-        .take(read_limit)
-        .read_to_end(&mut bytes)
-        .map_err(|_| {
-            QueryDiagnostic::input(
-                "query_file_read_failed",
-                QueryFailureClass::Security,
-                "query file could not be read safely",
-            )
-        })?;
-    let after = opened.file.metadata().map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_metadata_unavailable",
-            QueryFailureClass::Security,
-            "query file metadata is unavailable",
-        )
-    })?;
-    let path_after = fs::symlink_metadata(&candidate).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_changed_during_read",
-            QueryFailureClass::Security,
-            "query file changed while it was read",
-        )
-    })?;
-    if !bounded_file_snapshot_is_stable(&before, &after, &path_after, bytes.len(), max_bytes) {
-        return Err(QueryDiagnostic::input(
-            "query_file_changed_during_read",
-            QueryFailureClass::Security,
-            "query file changed while it was read",
-        ));
-    }
-
-    Ok(bytes)
+    depgraph_protocol::read_bounded_repository_file(repository_root, file, max_bytes).map_err(
+        |error| QueryDiagnostic::input(error.code, QueryFailureClass::Security, error.message),
+    )
 }
 
 pub fn parse_bounded_query_file(
@@ -435,322 +314,6 @@ pub fn parse_bounded_query_file(
 ) -> QueryResult<QueryAst> {
     let query = read_bounded_query_file(repository_root, query_file)?;
     parse_bounded_query(&query)
-}
-
-fn confined_candidate(
-    requested_root: &Path,
-    canonical_root: &Path,
-    query_file: &Path,
-) -> QueryResult<PathBuf> {
-    if query_file
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(QueryDiagnostic::input(
-            "query_file_parent_traversal",
-            QueryFailureClass::Security,
-            "query file path contains parent traversal",
-        ));
-    }
-    let candidate = if query_file.is_absolute() {
-        query_file
-            .strip_prefix(requested_root)
-            .map(|relative| canonical_root.join(relative))
-            .unwrap_or_else(|_| query_file.to_path_buf())
-    } else {
-        canonical_root.join(query_file)
-    };
-    if !candidate.starts_with(canonical_root) {
-        return Err(QueryDiagnostic::input(
-            "query_file_outside_repository",
-            QueryFailureClass::Security,
-            "query file is outside the repository boundary",
-        ));
-    }
-    Ok(candidate)
-}
-
-fn reject_symlink_components(root: &Path, candidate: &Path) -> QueryResult<()> {
-    let relative = candidate.strip_prefix(root).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_outside_repository",
-            QueryFailureClass::Security,
-            "query file is outside the repository boundary",
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        match component {
-            Component::Normal(name) => current.push(name),
-            Component::CurDir => continue,
-            _ => {
-                return Err(QueryDiagnostic::input(
-                    "query_file_path_invalid",
-                    QueryFailureClass::Security,
-                    "query file path is invalid",
-                ));
-            }
-        }
-        let metadata = fs::symlink_metadata(&current).map_err(|_| {
-            QueryDiagnostic::input(
-                "query_file_unavailable",
-                QueryFailureClass::Security,
-                "query file is unavailable",
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(QueryDiagnostic::input(
-                "query_file_symlink_rejected",
-                QueryFailureClass::Security,
-                "query file path contains a symlink",
-            ));
-        }
-    }
-    Ok(())
-}
-
-struct OpenedQueryFile {
-    file: File,
-    #[cfg(windows)]
-    _parent_directories: Vec<File>,
-}
-
-#[cfg(unix)]
-fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
-    use std::{
-        ffi::CString,
-        os::{
-            fd::{AsRawFd as _, FromRawFd as _},
-            unix::ffi::OsStrExt as _,
-        },
-    };
-
-    let relative = path.strip_prefix(root).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_outside_repository",
-            QueryFailureClass::Security,
-            "query file is outside the repository boundary",
-        )
-    })?;
-    let names = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name),
-            Component::CurDir => None,
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if names.is_empty() || names.len() != relative.components().count() {
-        return Err(query_file_open_error());
-    }
-
-    let root_name =
-        CString::new(root.as_os_str().as_bytes()).map_err(|_| query_file_open_error())?;
-    // SAFETY: root_name is a valid NUL-terminated path and no ownership is
-    // transferred through the open call.
-    let root_fd = unsafe {
-        libc::open(
-            root_name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if root_fd < 0 {
-        return Err(query_file_open_error());
-    }
-    // SAFETY: root_fd was returned uniquely by libc::open above.
-    let mut directory = unsafe { File::from_raw_fd(root_fd) };
-    let root_path_metadata = fs::metadata(root).map_err(|_| query_file_open_error())?;
-    let root_handle_metadata = directory.metadata().map_err(|_| query_file_open_error())?;
-    if !same_file_identity(&root_path_metadata, &root_handle_metadata) {
-        return Err(query_file_open_error());
-    }
-
-    for (index, name) in names.iter().enumerate() {
-        let name = CString::new(name.as_bytes()).map_err(|_| query_file_open_error())?;
-        let is_file = index + 1 == names.len();
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | if is_file { 0 } else { libc::O_DIRECTORY };
-        // SAFETY: directory remains open for the call, name is NUL-terminated,
-        // and openat returns a new owned descriptor on success.
-        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
-        if descriptor < 0 {
-            return Err(query_file_open_error());
-        }
-        // SAFETY: descriptor was returned uniquely by libc::openat above.
-        let opened = unsafe { File::from_raw_fd(descriptor) };
-        if is_file {
-            return Ok(OpenedQueryFile { file: opened });
-        }
-        directory = opened;
-    }
-    Err(query_file_open_error())
-}
-
-#[cfg(windows)]
-fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let relative = path.strip_prefix(root).map_err(|_| {
-        QueryDiagnostic::input(
-            "query_file_outside_repository",
-            QueryFailureClass::Security,
-            "query file is outside the repository boundary",
-        )
-    })?;
-    let names = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(name) => Some(name),
-            Component::CurDir => None,
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if names.is_empty() || names.len() != relative.components().count() {
-        return Err(query_file_open_error());
-    }
-
-    let mut parent_directories = Vec::with_capacity(names.len());
-    let mut current = root.to_path_buf();
-    let root_directory = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(&current)
-        .map_err(|_| query_file_open_error())?;
-    let root_metadata = root_directory
-        .metadata()
-        .map_err(|_| query_file_open_error())?;
-    if root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || !root_metadata.is_dir()
-    {
-        return Err(query_file_open_error());
-    }
-    // Excluding FILE_SHARE_DELETE pins the repository root while descendants
-    // are inspected and the final file is opened.
-    parent_directories.push(root_directory);
-    for name in &names[..names.len() - 1] {
-        current.push(name);
-        let directory = OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&current)
-            .map_err(|_| query_file_open_error())?;
-        let metadata = directory.metadata().map_err(|_| query_file_open_error())?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
-            return Err(query_file_open_error());
-        }
-        // Excluding FILE_SHARE_DELETE pins every opened ancestor against
-        // rename or replacement until the final file has been opened.
-        parent_directories.push(directory);
-    }
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(false)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .map_err(|_| query_file_open_error())?;
-    let metadata = file.metadata().map_err(|_| query_file_open_error())?;
-    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(query_file_open_error());
-    }
-    Ok(OpenedQueryFile {
-        file,
-        _parent_directories: parent_directories,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_query_file(root: &Path, path: &Path) -> QueryResult<OpenedQueryFile> {
-    let canonical = fs::canonicalize(path).map_err(|_| query_file_open_error())?;
-    if !canonical.starts_with(root) {
-        return Err(query_file_open_error());
-    }
-    OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open(&canonical)
-        .map(|file| OpenedQueryFile { file })
-        .map_err(|_| query_file_open_error())
-}
-
-fn query_file_open_error() -> QueryDiagnostic {
-    QueryDiagnostic::input(
-        "query_file_open_failed",
-        QueryFailureClass::Security,
-        "query file could not be opened safely",
-    )
-}
-
-fn metadata_modified(metadata: &Metadata) -> Option<std::time::SystemTime> {
-    metadata.modified().ok()
-}
-
-#[cfg(test)]
-fn query_file_snapshot_is_stable(
-    before: &Metadata,
-    after: &Metadata,
-    path_after: &Metadata,
-    bytes_read: usize,
-) -> bool {
-    bounded_file_snapshot_is_stable(
-        before,
-        after,
-        path_after,
-        bytes_read,
-        MAX_QUERY_BYTES as u64,
-    )
-}
-
-fn bounded_file_snapshot_is_stable(
-    before: &Metadata,
-    after: &Metadata,
-    path_after: &Metadata,
-    bytes_read: usize,
-    max_bytes: u64,
-) -> bool {
-    u64::try_from(bytes_read).is_ok_and(|bytes_read| {
-        bytes_read <= max_bytes
-            && before.len() == after.len()
-            && bytes_read == after.len()
-            && same_file_identity(before, after)
-            && same_file_identity(after, path_after)
-            && metadata_modified(before) == metadata_modified(after)
-    })
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    // Rust 1.93 does not expose by-handle volume serial and file index
-    // accessors on stable. Replacement is already prevented by the
-    // non-delete-shared root/parent handles and the non-write/delete-shared
-    // final handle, so this baseline-stable metadata comparison corroborates
-    // the read snapshot without relying on a newer standard library.
-    left.file_attributes() == right.file_attributes()
-        && left.creation_time() == right.creation_time()
-        && left.last_write_time() == right.last_write_time()
-        && left.file_size() == right.file_size()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    left.len() == right.len() && metadata_modified(left) == metadata_modified(right)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1881,9 +1444,8 @@ mod tests {
 
     use super::{
         BOUNDED_QUERY_CONTRACT_VERSION, Expression, Literal, MAX_QUERY_BYTES, QueryDirection,
-        QueryFailureClass, ScalarOperator, bounded_file_snapshot_is_stable, parse_bounded_query,
-        parse_bounded_query_bytes, parse_bounded_query_file, query_file_snapshot_is_stable,
-        read_bounded_query_file, read_bounded_repository_file,
+        QueryFailureClass, ScalarOperator, parse_bounded_query, parse_bounded_query_bytes,
+        parse_bounded_query_file, read_bounded_query_file, read_bounded_repository_file,
     };
 
     const MINIMAL_QUERY: &str = r#"MATCH p = (source:"route")-["calls"*1..1]->(target:"external") RETURN source.id LIMIT 1"#;
@@ -2227,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn query_file_ast_is_checkout_independent_and_snapshot_change_is_detected() {
+    fn query_file_ast_is_checkout_independent() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         fs::write(first.path().join("query.depgraph"), MINIMAL_QUERY).unwrap();
@@ -2236,49 +1798,6 @@ mod tests {
             parse_bounded_query_file(first.path(), Path::new("query.depgraph")).unwrap(),
             parse_bounded_query_file(second.path(), Path::new("query.depgraph")).unwrap()
         );
-
-        let file = first.path().join("race.depgraph");
-        fs::write(&file, b"before").unwrap();
-        let handle = fs::File::open(&file).unwrap();
-        let before = handle.metadata().unwrap();
-        handle
-            .set_times(fs::FileTimes::new().set_modified(
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
-            ))
-            .unwrap();
-        let after = handle.metadata().unwrap();
-        assert!(!query_file_snapshot_is_stable(
-            &before,
-            &after,
-            &after,
-            after.len() as usize
-        ));
-
-        let replacement = first.path().join("replacement.depgraph");
-        fs::write(&replacement, b"before").unwrap();
-        let replacement_metadata = fs::metadata(&replacement).unwrap();
-        assert!(!query_file_snapshot_is_stable(
-            &after,
-            &after,
-            &replacement_metadata,
-            after.len() as usize
-        ));
-
-        let growing = first.path().join("growing.depgraph");
-        fs::write(&growing, b"before").unwrap();
-        let handle = fs::File::open(&growing).unwrap();
-        let before_growth = handle.metadata().unwrap();
-        let mut append = fs::OpenOptions::new().append(true).open(&growing).unwrap();
-        std::io::Write::write_all(&mut append, b"-after").unwrap();
-        let after_growth = handle.metadata().unwrap();
-        let path_after_growth = fs::metadata(&growing).unwrap();
-        assert!(!bounded_file_snapshot_is_stable(
-            &before_growth,
-            &after_growth,
-            &path_after_growth,
-            before_growth.len() as usize,
-            MAX_QUERY_BYTES as u64,
-        ));
     }
 
     #[test]
@@ -2314,17 +1833,6 @@ mod tests {
             read_bounded_query_file(
                 repository.path(),
                 Path::new("linked-queries/nested.depgraph")
-            )
-            .is_err()
-        );
-
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("outside.depgraph"), MINIMAL_QUERY).unwrap();
-        symlink(outside.path(), repository.path().join("swapped-parent")).unwrap();
-        assert!(
-            super::open_query_file(
-                repository.path(),
-                &repository.path().join("swapped-parent/outside.depgraph")
             )
             .is_err()
         );

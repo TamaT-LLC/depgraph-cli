@@ -10,32 +10,11 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
-use depgraph_core::service::{
-    BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
-    DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
-    DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
-    GraphExportRequest, GraphExportResult, HealthAuditRequest, HealthFindingGetRequest,
-    HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest, ImpactRequest,
-    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, NodeMatchMode,
-    PolicyEvaluateRequest, PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
-    RepositoryOutputPrecondition, RuntimeValidateRequest, ServiceSnapshotSelector,
-    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
-    UnresolvedRequest,
-};
-use depgraph_core::{
-    CancellationToken, Confidence, CycleLevel, DEFAULT_HOTSPOT_WEIGHTS, DepgraphCapability,
-    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
-    DepgraphServiceLimits, EdgeKindFilter, EdgeKindFilterError, FindingKind, GraphQueryFilter,
-    HealthFinding, HotspotWeights, ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity,
-    SnapshotLocator, StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
-    verify_compiler_pack,
-};
-use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AGENT_IMPORT_GROUPS_PAGE_BYTES, AgentContextDetail, AgentContextOutput, AgentDependencyRollup,
     AgentEdgesImportsResponse, AgentFanInItem, AgentImportGroup,
 };
-use depgraph_mcp_tools::{
+use depgraph_agent_contract::{
     AgentArgumentReason, AgentCompletedSnapshot, AgentContext, AgentCycleLevel, AgentDaemonStatus,
     AgentDependencyDetail, AgentDependencyDirection, AgentDoctor, AgentEdge, AgentEdgeDetail,
     AgentEdgesOutput, AgentEdgesSummaryResponse, AgentError, AgentErrorCode, AgentErrorDetails,
@@ -59,6 +38,28 @@ use depgraph_mcp_tools::{
     project_cycles_page_cancellable, project_dependencies_output_cancellable,
     project_impact_response_cancellable, project_unresolved_page_cancellable,
 };
+use depgraph_core::service::{
+    BoundedQueryMode, BoundedQueryRequest, ClosedRecordDiff, CyclesRequest,
+    DEFAULT_GRAPH_EXPORT_MAX_EDGES, DEFAULT_GRAPH_EXPORT_MAX_NODES, DependenciesRequest,
+    DependencyDirection, DoctorRequest, EdgeDirection, ExplainPathRequest, GraphExportFormat,
+    GraphExportRequest, GraphExportResult, HealthAuditRequest, HealthFindingGetRequest,
+    HealthFindingsRequest, HealthHotspotsRequest, HealthSummaryRequest, ImpactRequest,
+    MAX_HEALTH_CHURN_COMMITS, MAX_HEALTH_FILTER_ITEMS, MAX_HEALTH_FINDINGS, NodeMatchMode,
+    PolicyEvaluateRequest, PolicyEvaluationResult, ProfilePlanRequest, RepositoryInitRequest,
+    RepositoryOutputPrecondition, RuntimeValidateRequest, ServiceSnapshotSelector,
+    SnapshotDiffFilters, SnapshotDiffRequest, SnapshotDiffResult, SnapshotNameCreateRequest,
+    UnresolvedRequest,
+};
+use depgraph_core::{
+    CancellationToken, Confidence, CycleLevel, DEFAULT_HOTSPOT_WEIGHTS, DepgraphCapability,
+    DepgraphCapabilitySet, DepgraphService, DepgraphServiceConfig, DepgraphServiceError,
+    DepgraphServiceLimits, EdgeKindFilter, EdgeKindFilterError, FindingKind, GraphQueryFilter,
+    HealthFinding, HotspotWeights, ImpactFilters, MAX_INTERACTIVE_QUERY_TRAVERSAL, Severity,
+    SnapshotLocator, StructuralEdgeSelection, VerifiedCompilerPack, read_compiler_pack_requirement,
+    verify_compiler_pack,
+};
+use depgraph_mcp::runtime::{AuditLogger, RuntimeClass, RuntimeConfig, RuntimeController};
+use depgraph_mcp::tool_result::IntoCallToolResult as _;
 use depgraph_operation::{
     DEADLINE_EXCEEDED_ERROR_JSON, EXECUTION_STATE_UNKNOWN_ERROR_JSON, JournalError,
     OperationHandle, OperationKind, OperationManager, OperationOutcome, OperationResultView,
@@ -1766,7 +1767,8 @@ fn task_metadata(
         created_at,
         updated_at,
     );
-    if retention.retain_until_ms() != depgraph_mcp_tools::UNBOUNDED_SCAN_RETAIN_UNTIL_MS as i64 {
+    if retention.retain_until_ms() != depgraph_agent_contract::UNBOUNDED_SCAN_RETAIN_UNTIL_MS as i64
+    {
         let ttl_ms = retention
             .retain_until_ms()
             .checked_sub(timestamps.created_at_ms())
@@ -2593,7 +2595,7 @@ fn operation_execution_deadline(
                 .and_then(|seconds| seconds.checked_mul(1_000))
                 .and_then(|budget| now_ms.checked_add(budget))
                 .ok_or_else(|| ToolExecutionFailure::Service(DepgraphServiceError::InvalidInput))?,
-            None => depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64,
+            None => depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64,
         }
     } else {
         now_ms
@@ -6222,7 +6224,7 @@ mod tests {
             &cancellation,
         )
         .unwrap();
-        let normalized_bytes = depgraph_mcp_tools::canonical_json_bytes(&input)
+        let normalized_bytes = depgraph_agent_contract::canonical_json_bytes(&input)
             .unwrap()
             .len();
         assert!(normalized_bytes > 1024 * 1024);
@@ -6400,7 +6402,7 @@ mod tests {
         let now = 1_800_000_000_000;
         assert_eq!(
             operation_execution_deadline(&config, OperationKind::ScanSubmit, now).unwrap(),
-            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64
+            depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64
         );
         assert_eq!(
             operation_execution_deadline(&config, OperationKind::DaemonStop, now).unwrap(),
@@ -6427,7 +6429,7 @@ mod tests {
             OperationKind::ScanSubmit,
             &serde_json::json!({"no_cache":false,"strict":false}),
             b"unbounded-task",
-            depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64,
+            depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64,
         )
         .unwrap();
         let mut manager = OperationManager::open(&config).unwrap();
