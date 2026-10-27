@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 mod compiler_pack_release;
+mod e2e_profile;
 mod go_semantic_e2e;
 mod governance;
 mod mcp_package_smoke;
@@ -25,6 +26,7 @@ mod util;
 
 pub(crate) use util::*;
 
+use e2e_profile::E2eProfile;
 use project_metadata::verify_project_metadata;
 use release_verify_packaged::{verify_archive, verify_packaged_cross_language};
 use sbom::{
@@ -1179,13 +1181,8 @@ fn test() -> Result<()> {
 }
 
 fn resumable_analysis_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let cli = E2eProfile::from_env()?.build_cli()?;
     build_non_rust_workers()?;
-    let target_dir = cargo_target_dir();
-    let cli = workspace_root()
-        .join(target_dir)
-        .join("debug")
-        .join(executable_name("depgraph"));
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
         .env("DEPGRAPH_BIN", &cli))?;
@@ -1206,13 +1203,8 @@ fn resumable_analysis_e2e() -> Result<()> {
 ///
 /// Set `DEPGRAPH_GO_LOADER_SCOPE_REPORT` to retain the per-unit report.
 fn go_loader_scope_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let cli = E2eProfile::from_env()?.build_cli()?;
     build_non_rust_workers()?;
-    let target_dir = cargo_target_dir();
-    let cli = workspace_root()
-        .join(target_dir)
-        .join("debug")
-        .join(executable_name("depgraph"));
     let report_path = std::env::var_os("DEPGRAPH_GO_LOADER_SCOPE_REPORT").map(PathBuf::from);
     if let Some(parent) = report_path.as_ref().and_then(|path| path.parent()) {
         fs::create_dir_all(parent)?;
@@ -1264,7 +1256,8 @@ fn write_go_loader_scope_fallback_report(report_path: Option<&Path>) -> Result<(
 ///
 /// Set `DEPGRAPH_HEALTH_RANGE_REPORT` to retain the combined report.
 fn health_range_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let profile = E2eProfile::from_env()?;
+    let cli = profile.build_cli()?;
     let target_dir = workspace_root().join(cargo_target_dir());
     let work_dir = target_dir.join("health-range-e2e");
     if work_dir.exists() {
@@ -1275,19 +1268,17 @@ fn health_range_e2e() -> Result<()> {
     let fixture_dir = work_dir.join("fixture");
     let store = fixture_dir.join("depgraph.sqlite");
     let repo = fixture_dir.join("repo");
+    // The example runs under the CLI's profile so it reuses the depgraph-core
+    // artifacts the CLI build just produced.
     let runner = [
-        "run",
-        "--locked",
-        "-p",
-        "depgraph-core",
-        "--example",
-        "health_range_e2e",
-        "--",
-    ];
+        &["run", "--locked"][..],
+        &profile.cargo_args(),
+        &["-p", "depgraph-core", "--example", "health_range_e2e", "--"],
+    ]
+    .concat();
     let report_path = std::env::var_os("DEPGRAPH_HEALTH_RANGE_REPORT")
         .map(PathBuf::from)
         .unwrap_or_else(|| work_dir.join("report.json"));
-    let cli = target_dir.join("debug").join(executable_name("depgraph"));
     let evidence =
         HealthRangeEvidence::collect(&work_dir, &fixture_dir, &store, &repo, &runner, &cli)?;
     // The combined report is written on every path (generation failure,
