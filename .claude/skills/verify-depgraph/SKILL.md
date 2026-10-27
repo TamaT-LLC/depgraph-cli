@@ -69,7 +69,7 @@ Drive the CLI only through `vdg run`, which injects the isolated env and `--stor
 $V run <label> [--expect-exit N] -- <depgraph subcommand and args>
 ```
 
-`<label>` matches `[A-Za-z0-9._-]+` and names the evidence files. The command's stdout is echoed; `--expect-exit` makes `vdg` fail (and print stderr) on a different exit code. Real recipes, all verified against the seeded fixture:
+`<label>` matches `[A-Za-z0-9._-]+` and names the evidence files. The command's stdout is echoed. `--expect-exit N` sets the exit code the command must return, and `N` defaults to `0`. If the actual exit code differs from `N`, `vdg` prints stderr and fails. Real recipes, all verified against the seeded fixture:
 
 ```sh
 $V run deps -- deps path:src/checkout.rs                 # "deps: returned 1/1 items; complete=true"
