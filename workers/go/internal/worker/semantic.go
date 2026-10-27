@@ -171,6 +171,7 @@ func (s *scannerState) extractGoSemanticGraph(sources []*sourceFile) {
 	// available as cross-unit targets.
 	s.retainAnalysisUnitSemanticScope()
 	extractor.pruneReferenceNodes()
+	s.pruneStagedDeclarationNodes()
 
 	extractor.accountSemanticSites()
 	if s.goPackages.Status == "loaded" && extractor.complete {
