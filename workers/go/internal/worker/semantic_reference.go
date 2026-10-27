@@ -262,22 +262,30 @@ func (e *goSemanticExtractor) pruneReferenceNodes() {
 	if len(e.referenceNodeIDs) == 0 {
 		return
 	}
-	referenced := map[string]bool{}
-	for _, site := range e.state.sites {
-		referenced[site.Source] = true
-		for _, targetID := range site.TargetIDs {
-			referenced[targetID] = true
-		}
-	}
-	for _, edge := range e.state.edges {
-		referenced[edge.Source] = true
-		referenced[edge.Target] = true
-	}
+	referenced := e.state.referencedNodeIDs()
 	for nodeID := range e.referenceNodeIDs {
 		if !referenced[nodeID] {
 			delete(e.state.nodes, nodeID)
 		}
 	}
+}
+
+// referencedNodeIDs is the set of node IDs that a retained site or edge of
+// this unit names as an endpoint. The protocol validator requires each of them
+// to be declared in the same stream.
+func (s *scannerState) referencedNodeIDs() map[string]bool {
+	referenced := make(map[string]bool, 2*len(s.edges)+len(s.sites))
+	for _, site := range s.sites {
+		referenced[site.Source] = true
+		for _, targetID := range site.TargetIDs {
+			referenced[targetID] = true
+		}
+	}
+	for _, edge := range s.edges {
+		referenced[edge.Source] = true
+		referenced[edge.Target] = true
+	}
+	return referenced
 }
 
 // addLocation gives a reference node the source_path and source_span that the
