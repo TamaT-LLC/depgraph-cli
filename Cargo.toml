@@ -70,10 +70,21 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 zeroize = "1.9"
 walkdir = "2.5"
 
-# 依存クレートだけ最適化する。sha2 と ra_ap_* が無最適化だと桁違いに遅く、
-# rust worker のテストが 15 倍遅くなるため。自前クレートはデバッグのまま。
+# 依存クレートを最適化する。sha2 と ra_ap_* が無最適化だと桁違いに遅く、
+# rust worker のテストが 15 倍遅くなるため。
 [profile.dev.package."*"]
 opt-level = 2
+
+# 自前クレートは、依存の根元にある depgraph-protocol だけを opt-level 1 にし、
+# 残りは 0 のままにする。opt-level 0 と 1 では generic の実体化を上流クレートと
+# 共有する（share-generics）ため、下流の core や mcp も protocol が実体化した
+# serde_json などを借りて使う。上位のテストは約 1.5〜2 倍速くなり、自前クレートの
+# 再ビルドは wall で数秒、CPU 時間で約 1.2〜1.4 倍に増える。agent-contract と
+# store も opt-level 1 にすると、テストはさらに 2〜4 割速くなるが、再ビルドの
+# CPU 時間が全部 opt-level 0 のときの約 2 倍になるため足さない。
+# debug-assertions と overflow-checks は dev の既定どおり有効のまま。
+[profile.dev.package.depgraph-protocol]
+opt-level = 1
 
 [profile.release]
 lto = "thin"
