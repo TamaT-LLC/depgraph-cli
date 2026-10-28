@@ -1,0 +1,42 @@
+# This file contains settings for `cargo nextest`.
+# See https://nexte.st/docs/configuration/ for a full list of options.
+
+[profile.default]
+# Mark a test SLOW once it has run for 15 seconds instead of nextest's default
+# 60, so tests that are growing heavy show up in the output before they set the
+# length of the run. There is no terminate-after: a slow test is reported, never
+# killed, so this setting cannot fail a run.
+slow-timeout = { period = "15s" }
+
+[profile.ci]
+# CI runs `cargo nextest run --profile ci`. The profile inherits slow-timeout
+# from the default profile.
+#
+# Repeat the slow tests, with their times, after the summary line so the job log
+# ends with the list of tests worth making lighter. Failing and retried tests
+# stay listed too, since the levels are cumulative.
+final-status-level = "slow"
+# A flaky test should fail the job rather than pass on a second attempt.
+retries = 0
+
+# Tests start in descending priority (-100 to 100, default 0), so the heaviest
+# tests begin first instead of when nextest reaches their binary in name order.
+# In CI run 40478070910 on main the 58-second depgraph-mcp::process test started
+# near the end and finished last, setting the length of the whole run. A filter
+# that stops matching after a rename only loses the priority; it fails nothing.
+[[profile.default.overrides]]
+# About 55 to 61 seconds each on the CI runner.
+filter = """
+(binary_id(depgraph-core::it) & test(/^service_graph::issue_(617_618|620)_/))
+| (binary_id(depgraph-mcp::process) & test(/^issue_617_618_/))
+"""
+priority = 100
+
+[[profile.default.overrides]]
+# About 17 to 29 seconds each on the CI runner.
+filter = """
+(binary_id(depgraph-mcp::process) & test(/^(issue_580_|cursor_paging_traverses_)/))
+| (binary_id(depgraph-core::it) & test(/^health_range::service_summarizes_/))
+| (binary_id(depgraph-operation) & test(/^runner::tests::runner_accepts_retained_/))
+"""
+priority = 50
