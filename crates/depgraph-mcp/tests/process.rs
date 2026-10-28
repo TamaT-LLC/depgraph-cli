@@ -10693,27 +10693,23 @@ fn issue_580_read_tools_project_worker_shaped_values_without_integrity_failure()
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut id = 2;
+    let mut read_calls = 0_u64;
     let mut call = |name: &str, arguments: Value| {
+        // The walk makes more reads than the product's fixed read burst;
+        // continue on a fresh MCP process instead of waiting for the token
+        // bucket to refill. A rate-limited call fails the `isError` assert.
+        if read_calls == depgraph_mcp::runtime::READ_RATE_BURST {
+            std::mem::replace(&mut mcp, InteractiveMcp::start(&root, &store_path)).finish();
+            initialize_interactive_mcp(&mut mcp, 1);
+            read_calls = 0;
+        }
+        read_calls += 1;
         id += 1;
         let mut full = json!({"contract_version": "depgraph-mcp-tools-v1"});
         full.as_object_mut()
             .unwrap()
             .extend(arguments.as_object().unwrap().clone());
-        // The walk makes more reads than the runtime read burst; wait for the
-        // token bucket instead of treating the rate limit as a failure.
-        let mut attempts = 0_u32;
-        let result = loop {
-            let result = interactive_tool_call(&mut mcp, id, name, full.clone());
-            let error = &result["structuredContent"]["error"];
-            if error["code"] == "RESOURCE_EXHAUSTED" && error["remediation"] == "retry" {
-                attempts += 1;
-                assert!(attempts < 40, "{name} stayed rate limited: {result}");
-                id += 1;
-                std::thread::sleep(Duration::from_millis(260));
-                continue;
-            }
-            break result;
-        };
+        let result = interactive_tool_call(&mut mcp, id, name, full);
         assert_eq!(result["isError"], false, "{name} {arguments}: {result}");
         output_schemas[name]
             .validate(&result["structuredContent"])
