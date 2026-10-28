@@ -103,8 +103,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # nextest schedules every test binary's tests across the runner's cores
       # at once instead of draining one binary at a time. It does not run
-      # doctests, so those keep the libtest runner.
-      - run: cargo nextest run --workspace --locked
+      # doctests, so those keep the libtest runner. The ci profile in
+      # .config/nextest.toml lists the slow tests after the summary.
+      - run: cargo nextest run --workspace --locked --profile ci
       - run: cargo test --workspace --locked --doc
 
   go:
