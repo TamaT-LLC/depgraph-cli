@@ -5970,37 +5970,76 @@ fn guardian_prevents_reclaim_while_dispatch_blocks_past_original_lease() {
     };
     assert!(dispatch_started_at_ms < original_lease_expires_at_ms);
 
-    let active_lease_expires_at_ms = loop {
+    loop {
         match wait_for_guardian
             .recv_timeout(Duration::from_secs(5))
             .expect("guardian renewal signal")
         {
-            LeaseGuardianEvent::Renewed {
-                renewed_at_ms,
-                lease_expires_at_ms,
-            } if renewed_at_ms >= original_lease_expires_at_ms => {
-                break lease_expires_at_ms;
+            LeaseGuardianEvent::Renewed { renewed_at_ms, .. }
+                if renewed_at_ms >= original_lease_expires_at_ms =>
+            {
+                break;
             }
             LeaseGuardianEvent::Renewed { .. } => {}
             event => panic!("unexpected guardian event after startup: {event:?}"),
         }
-    };
-    let competing_at_ms = system_now_ms().unwrap();
-    assert!(competing_at_ms >= original_lease_expires_at_ms);
-    assert!(active_lease_expires_at_ms > competing_at_ms);
-
+    }
+    // The guardian keeps renewing about every 100ms. Each attempt checks the
+    // lease in the journal after reading `competing_at_ms`, so a stalled test
+    // thread compares against the latest renewal. If a renewal commits after
+    // `competing_at_ms` was read, the journal rejects the attempt as coming from
+    // before the record's `updated_at_ms`, so retry with a fresh time only after
+    // confirming that renewal in the journal.
+    const MAX_COMPETING_ATTEMPTS: usize = 5;
     let mut competing_journal = OperationJournal::open(&config).unwrap();
-    assert!(matches!(
-        competing_journal.acquire_lease(
+    let journal_connection =
+        rusqlite::Connection::open(crate::operation_journal_path(&config)).unwrap();
+    journal_connection
+        .busy_timeout(Duration::from_secs(5))
+        .unwrap();
+    let read_lease_times = || {
+        journal_connection
+            .query_row(
+                "SELECT updated_at_ms, lease_expires_at_ms FROM operations
+                 WHERE operation_id=?1",
+                [operation_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    let mut competing_attempts = 0;
+    loop {
+        competing_attempts += 1;
+        let competing_at_ms = system_now_ms().unwrap();
+        assert!(competing_at_ms >= original_lease_expires_at_ms);
+        let (_, lease_expires_at_ms) = read_lease_times();
+        assert!(
+            lease_expires_at_ms > competing_at_ms,
+            "lease expired at {lease_expires_at_ms} before competing acquire at {competing_at_ms}"
+        );
+        match competing_journal.acquire_lease(
             &repository,
             &operation_id,
             &LeaseOwner::parse("competing-blocked-runner").unwrap(),
             b"competing-blocked-token",
             competing_at_ms,
             (competing_at_ms + LEASE_DURATION_MS).min(deadline_ms),
-        ),
-        Err(JournalError::LeaseHeld)
-    ));
+        ) {
+            Err(JournalError::LeaseHeld) => break,
+            Err(JournalError::IntegrityFailure) if competing_attempts < MAX_COMPETING_ATTEMPTS => {
+                let (updated_at_ms, _) = read_lease_times();
+                assert!(
+                    updated_at_ms > competing_at_ms,
+                    "competing acquire at {competing_at_ms} failed without a later renewal \
+                     (updated_at_ms {updated_at_ms})"
+                );
+            }
+            result => panic!(
+                "unexpected competing acquire result after {competing_attempts} attempts: \
+                 {result:?}"
+            ),
+        }
+    }
 
     struct CompetingDispatcher(Arc<AtomicUsize>);
     impl OperationDispatcher for CompetingDispatcher {
