@@ -955,6 +955,12 @@ struct SnapshotCreatedOutput<'a> {
 }
 
 fn main() -> ExitCode {
+    // A packaged release must never fall back to development worker overrides
+    // when its signed layout is incomplete. Every command, including the
+    // daemon, runs in a process that entered here, so set the policy before
+    // any of them can look up a worker.
+    #[cfg(feature = "packaged")]
+    depgraph_core::worker::require_release_manifest();
     let cli_thread = match std::thread::Builder::new()
         .name("depgraph-cli-main".to_owned())
         .stack_size(CLI_MAIN_STACK_BYTES)
