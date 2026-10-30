@@ -44,6 +44,11 @@ jobs:
       # runner image's preinstalled stable would change the key on each image
       # update even though the build only uses the pinned toolchain.
       - run: rustup toolchain uninstall stable
+      # Hash only Cargo.toml's [profile.*] tables for the rust-cache key: a
+      # version bump or a new workspace member must not drop the whole cache.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep separate from compiler-precise-hostile: that job saves a smaller,
@@ -55,8 +60,9 @@ jobs:
           # differently-optimized artifacts, cargo rebuilds all of them anyway, and
           # since the key still counts as a full match the rebuilt artifacts are never
           # saved back - every run after that pays the same full rebuild. Hashing
-          # Cargo.toml here forces a new cache entry whenever the profile changes.
-          key: rust-${{ hashFiles('Cargo.toml') }}
+          # the [profile.*] tables here forces a new cache entry whenever the
+          # profile changes.
+          key: rust-${{ steps.cargo-profile.outputs.hash }}
           # Cache entries are scoped to the branch that saved them, and pull
           # requests already restore main's entry through the key prefix. Saving
           # one more ~700 MB copy per pull request only fills the repository's
@@ -203,8 +209,7 @@ jobs:
     # and every CARGO*/RUST* variable is part of that key, so the two jobs
     # must declare the same (empty) set. The dev-profile debuginfo override
     # this job used to carry is gone with the dev builds: every Rust build
-    # here uses the e2e profile, whose debuginfo is already off, and the
-    # health-range example reuses the CLI's depgraph-core build.
+    # here uses the e2e profile, whose debuginfo is already off.
     defaults:
       run:
         working-directory: workers/web
@@ -258,15 +263,21 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        working-directory: .
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
           # Shared with go-loader-scope, which builds a subset of these
           # artifacts and only restores this entry. A shared key replaces the
-          # job-based key (and ignores `key`), so the Cargo.toml hash lives here.
+          # job-based key (and ignores `key`), so the profile hash lives here.
           # The hash also covers the e2e profile, which rust-cache would miss:
           # the virtual root manifest is not a workspace member it hashes.
-          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
+          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -274,9 +285,9 @@ jobs:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
       # xtask links depgraph-core, so it runs under the e2e profile too: one
-      # optimized build of the workspace crates serves xtask, the CLI it
-      # builds (xtask defaults to the e2e profile), and the health-range
-      # example, instead of an extra dev build just for xtask.
+      # optimized build of the workspace crates serves xtask and the CLI it
+      # builds (xtask defaults to the e2e profile), instead of an extra dev
+      # build just for xtask.
       - name: Verify real-worker batching, reuse, and cross-unit queries
         if: steps.decide.outputs.run == 'true'
         working-directory: .
@@ -288,25 +299,6 @@ jobs:
         with:
           name: resumable-analysis-report
           path: ${{ runner.temp }}/depgraph-resumable-report.json
-          if-no-files-found: error
-      # Public synthetic health fixture: the whole-snapshot path exhausts the
-      # single work budget while the ranged path completes under the unchanged
-      # per-range limit with identical findings (#467).
-      - name: Verify ranged health completes where the whole-snapshot budget fails
-        if: steps.decide.outputs.run == 'true'
-        id: health_range_e2e
-        working-directory: .
-        env:
-          DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
-        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e
-      # The xtask writes the report before it raises a failed comparison, so
-      # the evidence is uploaded whenever the step ran (not when an earlier
-      # step already failed and skipped it).
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "!cancelled() && steps.health_range_e2e.outcome != 'skipped'"
-        with:
-          name: health-range-report
-          path: ${{ runner.temp }}/depgraph-health-range-report.json
           if-no-files-found: error
 
   compiler-precise-hostile:
@@ -349,12 +341,17 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: compiler-precise-hostile-${{ hashFiles('Cargo.toml') }}
+          key: compiler-precise-hostile-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -418,12 +415,20 @@ jobs:
           curl --fail --silent --show-error --location \
             --output channel-rust-nightly-2026-07-17.toml \
             https://static.rust-lang.org/dist/2026-07-17/channel-rust-nightly.toml
+      - name: Build xtask for the exact Linux compiler-pack smoke
+        if: steps.compiler-pack-smoke.outputs.run == 'true'
+        # RUSTFLAGS is part of every unit's fingerprint, so building xtask under
+        # the smoke's -lld flag misses every unit the cache restored or the
+        # hostile E2E built and recompiles the whole graph. Only the cargo
+        # builds xtask spawns need the flag, and they inherit it from the smoke
+        # step below.
+        run: cargo build --locked -p xtask
       - name: Exact Linux compiler-pack semantic release smoke
         if: steps.compiler-pack-smoke.outputs.run == 'true'
         env:
           DEPGRAPH_TARGET: x86_64-unknown-linux-gnu
           RUSTFLAGS: -C linker-features=-lld
-        run: cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
+        run: target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.decide.outputs.run == 'true'
         with:
@@ -456,19 +461,32 @@ jobs:
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
       DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
       DEPGRAPH_SCAN_PROFILE: "1"
+      # Only the xtask runner is built with the dev profile here; the measured
+      # binaries are release builds. Skip its incremental artifacts and debug
+      # symbols, which this one-shot build never reuses.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # rust-cache only restores/saves build artifacts, not measurements,
           # so it has no effect on the benchmark numbers gated below.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: benchmark-${{ hashFiles('Cargo.toml') }}
+          key: benchmark-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # A benchmark gate failure happens after the build, so save the
+          # dependency artifacts even from a failed run. Workspace crates are
+          # not cached by default and are rebuilt on the next run.
+          cache-on-failure: true
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -528,6 +546,10 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Separate from rust / compiler-precise-hostile and from the other
@@ -536,7 +558,7 @@ jobs:
           # rust-cache also hashes RUSTFLAGS and every CARGO_* env into its key,
           # so those bounds can never be served from another job's cache.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}
           # The gates below run for 30+ minutes; keep the dependency artifacts
           # when a gate fails so the rerun does not start from a cold cache.
           cache-on-failure: true
@@ -1031,10 +1053,14 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: windows-smoke-${{ hashFiles('Cargo.toml') }}
+          key: windows-smoke-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -1529,9 +1555,13 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          key: native-package-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -1602,11 +1632,18 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
-          # The web job saves this entry; it holds every artifact this job builds.
-          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
+          # The web job saves this entry; it holds every artifact this job
+          # builds except the health-range example and the depgraph-core
+          # dev-dependencies it links, which the fanout leg builds each run.
+          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}
           save-if: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -1625,4 +1662,27 @@ jobs:
         with:
           name: go-loader-scope-report-${{ matrix.scenarios }}
           path: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+          if-no-files-found: error
+      # Public synthetic health fixture: the whole-snapshot path exhausts the
+      # single work budget while the ranged path completes under the unchanged
+      # per-range limit with identical findings (#467). It ran last in the web
+      # job, one of the slowest pull request jobs; the fanout leg finishes
+      # minutes before web and the bigpkg leg, so the gate runs there. The
+      # example runs under the e2e profile and reuses the CLI's depgraph-core
+      # build.
+      - name: Verify ranged health completes where the whole-snapshot budget fails
+        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'
+        id: health_range_e2e
+        working-directory: .
+        env:
+          DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
+        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e
+      # The xtask writes the report before it raises a failed comparison, so
+      # the evidence is uploaded whenever the step ran (not on the bigpkg leg,
+      # and not when an earlier step already failed and skipped it).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: "!cancelled() && steps.health_range_e2e.outcome != 'skipped'"
+        with:
+          name: health-range-report
+          path: ${{ runner.temp }}/depgraph-health-range-report.json
           if-no-files-found: error
