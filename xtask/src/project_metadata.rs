@@ -1052,6 +1052,16 @@ fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
     for decision in &HOSTILE_DECISIONS {
         verify_hostile_decision_step(hostile, decision)?;
     }
+    // The compiler-pack smoke decision compares only this job's block of
+    // ci.yml, so a top-level env or defaults would reach the smoke unseen.
+    if let Some(key) = HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS
+        .iter()
+        .find(|key| ci_workflow.lines().any(|line| line.starts_with(**key)))
+    {
+        bail!(
+            "CI workflow must not set a top-level {key:?}: the compiler-pack smoke decision compares only the compiler-precise-hostile job"
+        );
+    }
     Ok(())
 }
 
@@ -1060,6 +1070,9 @@ struct HostileDecision {
     header: &'static str,
     id: &'static str,
     pattern: &'static str,
+    /// The trimmed code lines that must follow the path filter up to the end
+    /// of the step. Blank lines and comments are not compared.
+    after_filter: &'static [&'static str],
 }
 
 /// Both decisions are pinned by step so that deleting one, or swapping its
@@ -1075,16 +1088,18 @@ const HOSTILE_DECISIONS: [HostileDecision; 2] = [
             r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
             r"docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)",
         ),
+        after_filter: &HOSTILE_FILTER_BRANCHES,
     },
     HostileDecision {
         header: "      - name: Decide whether the exact Linux compiler-pack smoke must run",
         id: "        id: compiler-pack-smoke",
+        // ci.yml is left out: the step compares the job block instead.
         pattern: concat!(
             r"^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|",
             r"crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|",
-            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
-            r"\.github/workflows/ci\.yml)",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile)",
         ),
+        after_filter: HOSTILE_SMOKE_AFTER_FILTER,
     },
 ];
 
@@ -1092,10 +1107,45 @@ const HOSTILE_RUN_TRUE: &str = r#"echo "run=true" >> "$GITHUB_OUTPUT""#;
 const HOSTILE_RUN_FALSE: &str = r#"echo "run=false" >> "$GITHUB_OUTPUT""#;
 const SHELL_ELSE: &str = "else";
 const SHELL_FI: &str = "fi";
-/// The trimmed lines that must follow the path filter, so a match runs the
-/// gated steps and anything else skips them.
+/// A match runs the gated steps and anything else skips them.
 const HOSTILE_FILTER_BRANCHES: [&str; 4] =
     [HOSTILE_RUN_TRUE, SHELL_ELSE, HOSTILE_RUN_FALSE, SHELL_FI];
+
+/// A ci.yml change runs the compiler-pack smoke only when the
+/// compiler-precise-hostile job block differs between base and head. Reading
+/// either side fails open: a missing ci.yml, a missing job, or an empty block
+/// runs the smoke.
+const HOSTILE_SMOKE_AFTER_FILTER: &[&str] = &[
+    HOSTILE_RUN_TRUE,
+    "exit 0",
+    SHELL_FI,
+    r#"if ! grep -qxF '.github/workflows/ci.yml' <<<"$changed"; then"#,
+    HOSTILE_RUN_FALSE,
+    "exit 0",
+    SHELL_FI,
+    "hostile_job() {",
+    "local workflow block",
+    r#"workflow="$(git show "$1:.github/workflows/ci.yml")" || return 1"#,
+    concat!(
+        r#"block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } "#,
+        r#"found && (/^  [^ #].*:$/ || /^[^ ]/) { exit } found { print }' <<<"$workflow")" "#,
+        "|| return 1",
+    ),
+    r#"[ -n "$block" ] || return 1"#,
+    r#"printf '%s\n' "$block""#,
+    "}",
+    r#"if ! base_job="$(hostile_job "${{ github.event.pull_request.base.sha }}")" ||"#,
+    r#"! head_job="$(hostile_job "${{ github.event.pull_request.head.sha }}")" ||"#,
+    r#"[ "$base_job" != "$head_job" ]; then"#,
+    HOSTILE_RUN_TRUE,
+    SHELL_ELSE,
+    HOSTILE_RUN_FALSE,
+    SHELL_FI,
+];
+
+/// Top-level ci.yml keys that would reach every job's steps. The compiler-pack
+/// smoke decision does not compare them, so ci.yml must not set them.
+const HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS: [&str; 2] = ["env:", "defaults:"];
 
 fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Result<()> {
     let (_, step) = workflow_step_block(hostile, decision.header)?;
@@ -1125,16 +1175,17 @@ fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Re
             bail!("CI compiler-precise hostile step {id:?} must write {output:?}");
         }
     }
-    let branches: Vec<&str> = step
+    let after_filter: Vec<&str> = step
         .lines()
         .skip_while(|line| *line != filter_line)
         .skip(1)
-        .take(HOSTILE_FILTER_BRANCHES.len())
         .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
-    if branches != HOSTILE_FILTER_BRANCHES {
+    if after_filter != decision.after_filter {
         bail!(
-            "CI compiler-precise hostile step {id:?} must follow its filter with {HOSTILE_FILTER_BRANCHES:?}"
+            "CI compiler-precise hostile step {id:?} must follow its filter with {:?}",
+            decision.after_filter
         );
     }
     Ok(())
@@ -3928,6 +3979,115 @@ mod tests {
             assert!(
                 verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
                 "swapping the filter outputs in {header:?} must be rejected"
+            );
+        }
+    }
+
+    /// Replaces everything after the smoke step's path filter with `tail`.
+    fn replace_smoke_after_filter(step: &str, pattern: Option<&str>, tail: &str) -> String {
+        let prefix = "          if grep -qE '";
+        let (head, rest) = step
+            .split_once(prefix)
+            .expect("smoke step has a here-string path filter");
+        let (filter, _) = rest
+            .split_once('\n')
+            .expect("smoke step continues after its path filter");
+        let filter = match pattern {
+            Some(pattern) => format!("{pattern}' <<<\"$changed\"; then"),
+            None => filter.to_owned(),
+        };
+        format!("{head}{prefix}{filter}\n{tail}")
+    }
+
+    /// Dropping the job block comparison turns every ci.yml edit into a skip
+    /// when ci.yml stays out of the path filter. Putting ci.yml back into the
+    /// filter instead is the old behavior that ran the smoke for any job.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_smoke_step_without_the_job_comparison() {
+        let ci = checked_in_ci_workflow();
+        let branches = concat!(
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+            "          fi\n",
+        );
+        let with_ci_yml = concat!(
+            r"^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|",
+            r"crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
+            r"\.github/workflows/ci\.yml)",
+        );
+        for pattern in [None, Some(with_ci_yml)] {
+            let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+                replace_smoke_after_filter(step, pattern, branches)
+            });
+            let hostile = workflow_job_block(&drift, "compiler-precise-hostile").unwrap();
+            assert!(
+                !hostile.contains("hostile_job"),
+                "the mutation must remove the job block comparison"
+            );
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a smoke step without the job comparison (pattern {pattern:?}) must be rejected"
+            );
+        }
+    }
+
+    /// A ci.yml or job that cannot be read on either side must run the smoke.
+    /// Each mutation turns one such failure into run=false.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_fail_closed_smoke_comparison() {
+        let ci = checked_in_ci_workflow();
+        let fail_open = concat!(
+            "          if ! base_job=\"$(hostile_job \"${{ github.event.pull_request.base.sha }}\")\" ||\n",
+            "            ! head_job=\"$(hostile_job \"${{ github.event.pull_request.head.sha }}\")\" ||\n",
+            "            [ \"$base_job\" != \"$head_job\" ]; then\n",
+        );
+        let fail_closed = concat!(
+            "          if base_job=\"$(hostile_job \"${{ github.event.pull_request.base.sha }}\")\" &&\n",
+            "            head_job=\"$(hostile_job \"${{ github.event.pull_request.head.sha }}\")\" &&\n",
+            "            [ \"$base_job\" != \"$head_job\" ]; then\n",
+        );
+        // A missing ci.yml or job leaves the block empty, and an empty block
+        // on both sides would compare equal.
+        let mutations: [(&str, &str); 2] = [
+            (fail_open, fail_closed),
+            (
+                "            [ -n \"$block\" ] || return 1\n",
+                "            [ -n \"$block\" ] || return 0\n",
+            ),
+        ];
+        for (from, to) in mutations {
+            let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+                assert_eq!(step.matches(from).count(), 1, "{from:?} occurs once");
+                step.replacen(from, to, 1)
+            });
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "replacing {from:?} with {to:?} must be rejected"
+            );
+        }
+    }
+
+    /// The smoke decision compares only the compiler-precise-hostile job, so a
+    /// top-level env or defaults would change the smoke without running it.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_top_level_env_and_defaults() {
+        let ci = checked_in_ci_workflow();
+        assert_eq!(
+            ci.matches("\njobs:\n").count(),
+            1,
+            "ci.yml has one jobs key"
+        );
+        for top_level in [
+            "env:\n  RUSTFLAGS: -C debuginfo=0\n",
+            "defaults:\n  run:\n    shell: bash\n",
+        ] {
+            let drift = ci.replacen("\njobs:\n", &format!("\n{top_level}\njobs:\n"), 1);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a top-level {top_level:?} must be rejected"
             );
         }
     }
