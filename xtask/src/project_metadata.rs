@@ -3588,6 +3588,13 @@ mod tests {
                 .count(),
             1
         );
+        // Other jobs (benchmark precedes integration) also keep
+        // `cache-on-failure: true`, so anchor the mutation on the comment that
+        // only the integration cache step carries.
+        let integration_cache_comment =
+            "          # when a gate fails so the rerun does not start from a cold cache.\n";
+        let integration_cache_on_failure = format!("{integration_cache_comment}{cache_on_failure}");
+        assert_eq!(ci.matches(&integration_cache_on_failure).count(), 1);
         let target_size_report =
             "          du -sh target 2>/dev/null || echo \"target directory is absent\"\n";
         for drift in [
@@ -3596,8 +3603,12 @@ mod tests {
             // for another `with:` entry drops the key without touching the
             // `rust` or `compiler-precise-hostile` cache steps.
             ci.replacen(cache_key, "          cache-all-crates: false\n", 1),
-            ci.replacen(cache_on_failure, "", 1),
-            ci.replacen(cache_on_failure, "          cache-on-failure: false\n", 1),
+            ci.replacen(&integration_cache_on_failure, integration_cache_comment, 1),
+            ci.replacen(
+                &integration_cache_on_failure,
+                &format!("{integration_cache_comment}          cache-on-failure: false\n"),
+                1,
+            ),
             ci.replacen(
                 "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
                 "",
