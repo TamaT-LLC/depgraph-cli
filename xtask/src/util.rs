@@ -3,6 +3,7 @@ use std::{
     io::Read as _,
     path::{Path, PathBuf},
     process::Command,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -244,9 +245,160 @@ pub(crate) fn run(command: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// Runs one named phase and prints its wall-clock time on stderr in a fixed,
+/// grep-able form:
+/// `xtask-timing: phase=<name> elapsed=<seconds>s status=<ok|error>`.
+/// The phase result is returned unchanged; a panic propagates without a line.
+pub(crate) fn timed<T>(phase: &str, run: impl FnOnce() -> Result<T>) -> Result<T> {
+    let started = Instant::now();
+    let result = run();
+    eprintln!(
+        "{}",
+        timing_line(phase, started.elapsed().as_secs_f64(), result.is_ok())
+    );
+    result
+}
+
+fn timing_line(phase: &str, elapsed_seconds: f64, ok: bool) -> String {
+    let status = if ok { "ok" } else { "error" };
+    format!("xtask-timing: phase={phase} elapsed={elapsed_seconds:.2}s status={status}")
+}
+
+/// Times a phase that spans statements instead of one closure. `finish`
+/// prints `status=ok`; dropping it unfinished (an early `?` return or a
+/// panic) prints `status=error`, in the same form as [`timed`].
+pub(crate) struct PhaseTimer {
+    phase: String,
+    started: Instant,
+    finished: bool,
+}
+
+impl PhaseTimer {
+    pub(crate) fn start(phase: impl Into<String>) -> Self {
+        Self {
+            phase: phase.into(),
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.finished = true;
+        eprintln!(
+            "{}",
+            timing_line(&self.phase, self.started.elapsed().as_secs_f64(), true)
+        );
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!(
+                "{}",
+                timing_line(&self.phase, self.started.elapsed().as_secs_f64(), false)
+            );
+        }
+    }
+}
+
+/// A named, independent phase for [`run_parallel_phases`].
+pub(crate) type ParallelPhase<'a> = (&'a str, &'a (dyn Fn() -> Result<()> + Sync));
+
+/// Runs independent phases on scoped threads, each timed under its name.
+///
+/// Every phase runs to completion. The first failure in declaration order is
+/// returned unchanged; later failures are attached as context so none is lost.
+/// A panicking phase re-panics on the caller after every thread has finished.
+pub(crate) fn run_parallel_phases(phases: &[ParallelPhase<'_>]) -> Result<()> {
+    let results = std::thread::scope(|scope| {
+        let handles = phases
+            .iter()
+            .map(|(name, phase)| scope.spawn(move || timed(name, phase)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut first_error: Option<anyhow::Error> = None;
+    for ((name, _), result) in phases.iter().zip(results) {
+        if let Err(error) = result {
+            first_error = Some(match first_error {
+                None => error,
+                Some(first) => first.context(format!("{name} also failed: {error:#}")),
+            });
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_line_has_the_grep_able_form() {
+        assert_eq!(
+            timing_line("verify/rust-semantic", 1.234, true),
+            "xtask-timing: phase=verify/rust-semantic elapsed=1.23s status=ok"
+        );
+        assert_eq!(
+            timing_line("package/archive", 0.0, false),
+            "xtask-timing: phase=package/archive elapsed=0.00s status=error"
+        );
+    }
+
+    #[test]
+    fn parallel_phases_run_every_phase_and_report_the_first_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let ran = AtomicUsize::new(0);
+        let fail_first = || -> Result<()> {
+            ran.fetch_add(1, Ordering::SeqCst);
+            bail!("first phase failed")
+        };
+        let succeed = || -> Result<()> {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        let fail_third = || -> Result<()> {
+            ran.fetch_add(1, Ordering::SeqCst);
+            bail!("third phase failed")
+        };
+        let error = run_parallel_phases(&[
+            ("test/first", &fail_first),
+            ("test/second", &succeed),
+            ("test/third", &fail_third),
+        ])
+        .expect_err("two failing phases must fail the group");
+        assert_eq!(ran.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            error.root_cause().to_string(),
+            "first phase failed",
+            "the first failure in declaration order is the root cause"
+        );
+        assert_eq!(
+            error.to_string(),
+            "test/third also failed: third phase failed"
+        );
+    }
+
+    #[test]
+    fn parallel_phases_succeed_when_every_phase_succeeds() -> Result<()> {
+        let succeed = || -> Result<()> { Ok(()) };
+        run_parallel_phases(&[("test/one", &succeed), ("test/two", &succeed)])
+    }
+
+    #[test]
+    #[should_panic(expected = "phase panicked")]
+    fn parallel_phases_propagate_a_panic() {
+        let panics = || -> Result<()> { panic!("phase panicked") };
+        let _ = run_parallel_phases(&[("test/panic", &panics)]);
+    }
 
     #[test]
     fn bounded_file_reader_accepts_the_limit_and_rejects_the_next_byte() -> Result<()> {
