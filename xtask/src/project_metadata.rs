@@ -1103,10 +1103,14 @@ fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
     }
     // The compiler-pack smoke decision compares only this job's block of
     // ci.yml, so a top-level env or defaults would reach the smoke unseen.
-    if let Some(key) = HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS
-        .iter()
-        .find(|key| ci_workflow.lines().any(|line| line.starts_with(**key)))
-    {
+    // The key is compared after YAML unquoting, so `"env":` is caught too.
+    if let Some(key) = HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS.iter().find(|key| {
+        ci_workflow
+            .lines()
+            .filter(|line| !line.starts_with([' ', '\t', '#']))
+            .filter_map(|line| line.split_once(':'))
+            .any(|(top_level, _)| yaml_scalar(top_level) == **key)
+    }) {
         bail!(
             "CI workflow must not set a top-level {key:?}: the compiler-pack smoke decision compares only the compiler-precise-hostile job"
         );
@@ -1248,7 +1252,7 @@ const HOSTILE_SMOKE_AFTER_FILTER: &[&str] = &[
 
 /// Top-level ci.yml keys that would reach every job's steps. The compiler-pack
 /// smoke decision does not compare them, so ci.yml must not set them.
-const HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS: [&str; 2] = ["env:", "defaults:"];
+const HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS: [&str; 2] = ["env", "defaults"];
 
 fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Result<()> {
     let (_, step) = workflow_step_block(hostile, decision.header)?;
@@ -4269,12 +4273,20 @@ mod tests {
         for top_level in [
             "env:\n  RUSTFLAGS: -C debuginfo=0\n",
             "defaults:\n  run:\n    shell: bash\n",
+            // Quoted keys and a space before the colon are the same YAML key.
+            "\"env\":\n  RUSTFLAGS: -C debuginfo=0\n",
+            "'env': { RUSTFLAGS: -C debuginfo=0 }\n",
+            "\"defaults\":\n  run:\n    shell: bash\n",
+            "'defaults':\n  run:\n    shell: bash\n",
+            "env :\n  RUSTFLAGS: -C debuginfo=0\n",
         ] {
             let drift = ci.replacen("\njobs:\n", &format!("\n{top_level}\njobs:\n"), 1);
             assert_ne!(drift, ci, "drift mutation must change the workflow");
+            let error = verify_compiler_precise_hostile_ci_gate(&drift)
+                .expect_err("a top-level env or defaults must be rejected");
             assert!(
-                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
-                "a top-level {top_level:?} must be rejected"
+                error.to_string().contains("must not set a top-level"),
+                "a top-level {top_level:?} must be rejected by the top-level key check, got {error}"
             );
         }
     }
