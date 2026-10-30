@@ -203,8 +203,7 @@ jobs:
     # and every CARGO*/RUST* variable is part of that key, so the two jobs
     # must declare the same (empty) set. The dev-profile debuginfo override
     # this job used to carry is gone with the dev builds: every Rust build
-    # here uses the e2e profile, whose debuginfo is already off, and the
-    # health-range example reuses the CLI's depgraph-core build.
+    # here uses the e2e profile, whose debuginfo is already off.
     defaults:
       run:
         working-directory: workers/web
@@ -274,9 +273,9 @@ jobs:
           go-version: 1.26.1
           cache-dependency-path: workers/go/go.sum
       # xtask links depgraph-core, so it runs under the e2e profile too: one
-      # optimized build of the workspace crates serves xtask, the CLI it
-      # builds (xtask defaults to the e2e profile), and the health-range
-      # example, instead of an extra dev build just for xtask.
+      # optimized build of the workspace crates serves xtask and the CLI it
+      # builds (xtask defaults to the e2e profile), instead of an extra dev
+      # build just for xtask.
       - name: Verify real-worker batching, reuse, and cross-unit queries
         if: steps.decide.outputs.run == 'true'
         working-directory: .
@@ -288,25 +287,6 @@ jobs:
         with:
           name: resumable-analysis-report
           path: ${{ runner.temp }}/depgraph-resumable-report.json
-          if-no-files-found: error
-      # Public synthetic health fixture: the whole-snapshot path exhausts the
-      # single work budget while the ranged path completes under the unchanged
-      # per-range limit with identical findings (#467).
-      - name: Verify ranged health completes where the whole-snapshot budget fails
-        if: steps.decide.outputs.run == 'true'
-        id: health_range_e2e
-        working-directory: .
-        env:
-          DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
-        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e
-      # The xtask writes the report before it raises a failed comparison, so
-      # the evidence is uploaded whenever the step ran (not when an earlier
-      # step already failed and skipped it).
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: "!cancelled() && steps.health_range_e2e.outcome != 'skipped'"
-        with:
-          name: health-range-report
-          path: ${{ runner.temp }}/depgraph-health-range-report.json
           if-no-files-found: error
 
   compiler-precise-hostile:
@@ -434,6 +414,11 @@ jobs:
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
       DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
       DEPGRAPH_SCAN_PROFILE: "1"
+      # Only the xtask runner is built with the dev profile here; the measured
+      # binaries are release builds. Skip its incremental artifacts and debug
+      # symbols, which this one-shot build never reuses.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -447,6 +432,10 @@ jobs:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: benchmark-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # A benchmark gate failure happens after the build, so save the
+          # dependency artifacts even from a failed run. Workspace crates are
+          # not cached by default and are rebuilt on the next run.
+          cache-on-failure: true
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1
@@ -1583,7 +1572,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
-          # The web job saves this entry; it holds every artifact this job builds.
+          # The web job saves this entry; it holds every artifact this job
+          # builds except the health-range example and the depgraph-core
+          # dev-dependencies it links, which the fanout leg builds each run.
           shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
           save-if: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -1603,4 +1594,27 @@ jobs:
         with:
           name: go-loader-scope-report-${{ matrix.scenarios }}
           path: ${{ runner.temp }}/depgraph-go-loader-scope-report.json
+          if-no-files-found: error
+      # Public synthetic health fixture: the whole-snapshot path exhausts the
+      # single work budget while the ranged path completes under the unchanged
+      # per-range limit with identical findings (#467). It ran last in the web
+      # job, one of the slowest pull request jobs; the fanout leg finishes
+      # minutes before web and the bigpkg leg, so the gate runs there. The
+      # example runs under the e2e profile and reuses the CLI's depgraph-core
+      # build.
+      - name: Verify ranged health completes where the whole-snapshot budget fails
+        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'
+        id: health_range_e2e
+        working-directory: .
+        env:
+          DEPGRAPH_HEALTH_RANGE_REPORT: ${{ runner.temp }}/depgraph-health-range-report.json
+        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e
+      # The xtask writes the report before it raises a failed comparison, so
+      # the evidence is uploaded whenever the step ran (not on the bigpkg leg,
+      # and not when an earlier step already failed and skipped it).
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: "!cancelled() && steps.health_range_e2e.outcome != 'skipped'"
+        with:
+          name: health-range-report
+          path: ${{ runner.temp }}/depgraph-health-range-report.json
           if-no-files-found: error
