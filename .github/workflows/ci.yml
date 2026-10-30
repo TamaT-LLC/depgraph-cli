@@ -432,8 +432,9 @@ jobs:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: benchmark-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # A benchmark gate failure happens after the build, so keep the
-          # compiled artifacts for the next run.
+          # A benchmark gate failure happens after the build, so save the
+          # dependency artifacts even from a failed run. Workspace crates are
+          # not cached by default and are rebuilt on the next run.
           cache-on-failure: true
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
