@@ -1566,12 +1566,18 @@ fn verify_health_range_evidence(
 }
 
 fn package() -> Result<()> {
+    let total = PhaseTimer::start("package/total");
     verify_release_tag()?;
     verify_project_metadata(&workspace_root())?;
     // Release binaries come from RELEASE_CARGO_BUILD_TARGETS alone; a separate
     // `--workspace` release build would only recompile the same dependency
     // graph under a third feature unification.
-    for (packages, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
+    for (index, (packages, binary, features)) in RELEASE_CARGO_BUILD_TARGETS.iter().enumerate() {
+        let build = PhaseTimer::start(format!(
+            "package/release-build-{}:{}",
+            index + 1,
+            packages.join("+")
+        ));
         let mut command = Command::new("cargo");
         command.args(["build", "--locked", "--release"]);
         for package in *packages {
@@ -1584,8 +1590,10 @@ fn package() -> Result<()> {
             command.args(["--features", features]);
         }
         run(&mut command)?;
+        build.finish();
     }
-    build_non_rust_workers()?;
+    timed("package/non-rust-workers", build_non_rust_workers)?;
+    let staging_phase = PhaseTimer::start("package/staging");
     let host = host_target()?;
     let target = std::env::var("DEPGRAPH_TARGET").unwrap_or_else(|_| host.clone());
     if target != host {
@@ -1700,7 +1708,9 @@ fn package() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
     let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
+    staging_phase.finish();
 
+    let metadata_phase = PhaseTimer::start("package/manifest-licenses-sbom");
     let workers = vec![
         worker_artifact(
             "rust",
@@ -1812,7 +1822,9 @@ fn package() -> Result<()> {
         staging.join("sbom.spdx.json"),
         serde_json::to_vec_pretty(&sbom(&target, &rust_sysroot_sha256)?)?,
     )?;
+    metadata_phase.finish();
 
+    let archive_phase = PhaseTimer::start("package/archive");
     let archive = create_archive(dist, &name)?;
     let checksum = sha256_file(&archive)?;
     let checksum_path = archive.with_extension(format!(
@@ -1830,8 +1842,10 @@ fn package() -> Result<()> {
             archive.file_name().unwrap().to_string_lossy()
         ),
     )?;
-    let (query_smoke, cross_language_smoke, mcp_smoke) =
-        verify_archive(&archive, &checksum_path, &name)?;
+    archive_phase.finish();
+    let (query_smoke, cross_language_smoke, mcp_smoke) = timed("package/verify", || {
+        verify_archive(&archive, &checksum_path, &name)
+    })?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
@@ -1845,6 +1859,7 @@ fn package() -> Result<()> {
         format!("{}\n", serde_json::to_string_pretty(&mcp_smoke)?),
     )?;
     println!("packaged {}", archive.display());
+    total.finish();
     Ok(())
 }
 

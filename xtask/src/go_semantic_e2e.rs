@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::run_parallel_phases;
+
 const BUILD: &str = "example.com/semantic/model.Build";
 const CYCLE_LEFT: &str = "example.com/semantic/model.CycleLeft";
 const CYCLE_RIGHT: &str = "example.com/semantic/model.CycleRight";
@@ -117,11 +119,28 @@ pub(crate) fn verify(
         go_path: &go_path,
     };
 
-    verify_semantic_graph(&runner, root.path(), &semantic_root)?;
-    verify_vta_graph(&runner, root.path(), &vta_root)?;
-    verify_fallback_safety(&runner, root.path(), &fallback_root)?;
-    verify_dependency_snapshot(&runner, root.path(), &dependency_root_a, &dependency_root_b)?;
-    verify_duplicate_module_root_scan(&runner, root.path(), &duplicate_module_root)?;
+    // Each group scans its own fixture copy into its own stores (distinct file
+    // names under `root`), so the groups are independent and run at once.
+    // GOMODCACHE and GOPATH are shared; the Go toolchain locks its module
+    // cache for concurrent use, and every scan gets its own build cache.
+    let temp = root.path();
+    run_parallel_phases(&[
+        ("go-semantic/semantic", &|| {
+            verify_semantic_graph(&runner, temp, &semantic_root)
+        }),
+        ("go-semantic/vta", &|| {
+            verify_vta_graph(&runner, temp, &vta_root)
+        }),
+        ("go-semantic/fallback", &|| {
+            verify_fallback_safety(&runner, temp, &fallback_root)
+        }),
+        ("go-semantic/dependency-snapshot", &|| {
+            verify_dependency_snapshot(&runner, temp, &dependency_root_a, &dependency_root_b)
+        }),
+        ("go-semantic/duplicate-module", &|| {
+            verify_duplicate_module_root_scan(&runner, temp, &duplicate_module_root)
+        }),
+    ])?;
     println!("Go semantic CLI end-to-end gate passed");
     Ok(())
 }
