@@ -1235,7 +1235,7 @@ const HOSTILE_SMOKE_AFTER_FILTER: &[&str] = &[
     r#"workflow="$(git show "$1:.github/workflows/ci.yml")" || return 1"#,
     concat!(
         r#"block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } "#,
-        r#"found && (/^  [^ #].*:$/ || /^[^ ]/) { exit } found { print }' <<<"$workflow")" "#,
+        r#"found && (/^  [^ #].*:$/ || /^[^ #]/) { exit } found { print }' <<<"$workflow")" "#,
         "|| return 1",
     ),
     r#"[ -n "$block" ] || return 1"#,
@@ -4258,6 +4258,24 @@ mod tests {
                 "replacing {from:?} with {to:?} must be rejected"
             );
         }
+    }
+
+    /// A column-0 comment inside the job must not end the extracted block.
+    /// Otherwise base and head both cut there, and a change to a later step
+    /// compares equal and skips the smoke.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_job_block_end_that_stops_at_comments() {
+        let ci = checked_in_ci_workflow();
+        let from = "|| /^[^ #]/) { exit }";
+        let to = "|| /^[^ ]/) { exit }";
+        let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+            assert_eq!(step.matches(from).count(), 1, "{from:?} occurs once");
+            step.replacen(from, to, 1)
+        });
+        assert!(
+            verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+            "a job block end that stops at column-0 comments must be rejected"
+        );
     }
 
     /// The smoke decision compares only the compiler-precise-hostile job, so a

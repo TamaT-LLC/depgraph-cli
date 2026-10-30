@@ -393,7 +393,7 @@ jobs:
           hostile_job() {
             local workflow block
             workflow="$(git show "$1:.github/workflows/ci.yml")" || return 1
-            block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } found && (/^  [^ #].*:$/ || /^[^ ]/) { exit } found { print }' <<<"$workflow")" || return 1
+            block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } found && (/^  [^ #].*:$/ || /^[^ #]/) { exit } found { print }' <<<"$workflow")" || return 1
             [ -n "$block" ] || return 1
             printf '%s\n' "$block"
           }
