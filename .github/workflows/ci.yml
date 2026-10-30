@@ -424,6 +424,11 @@ jobs:
       DEPGRAPH_CACHE_HIT_REPORT: "dist/cache-hit-benchmark-report.json"
       DEPGRAPH_BENCH_DIAGNOSTICS_DIR: "dist/benchmark-diagnostics"
       DEPGRAPH_SCAN_PROFILE: "1"
+      # Only the xtask runner is built with the dev profile here; the measured
+      # binaries are release builds. Skip its incremental artifacts and debug
+      # symbols, which this one-shot build never reuses.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
@@ -435,6 +440,9 @@ jobs:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
           key: benchmark-${{ hashFiles('Cargo.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # A benchmark gate failure happens after the build, so keep the
+          # compiled artifacts for the next run.
+          cache-on-failure: true
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.26.1

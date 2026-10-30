@@ -293,6 +293,11 @@ enum Task {
     Build {
         #[arg(long)]
         release: bool,
+        /// Build only these Rust packages instead of the whole workspace.
+        /// workspace-hack keeps their dependency features identical to the
+        /// workspace build, so the selected binaries do not change.
+        #[arg(long = "package", short = 'p', value_name = "NAME")]
+        packages: Vec<String>,
     },
     Test,
     GoSemanticE2e,
@@ -961,7 +966,7 @@ const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Task::Build { release } => build(release),
+        Task::Build { release, packages } => build(release, &packages),
         Task::Test => test(),
         Task::GoSemanticE2e => {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
@@ -1080,21 +1085,31 @@ fn compiler_pack(source: &Path, output: &Path, spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build(release: bool) -> Result<()> {
-    build_rust_workspace(release)?;
+fn build(release: bool, packages: &[String]) -> Result<()> {
+    run(Command::new("cargo").args(rust_build_args(release, packages)?))?;
     build_non_rust_workers()
 }
 
-fn build_rust_workspace(release: bool) -> Result<()> {
-    let mut cargo = Command::new("cargo");
-    // The running xtask executable cannot be replaced on Windows. It is a
-    // build-time tool rather than a release artifact, so exclude it from the
-    // product workspace build.
-    cargo.args(["build", "--workspace", "--exclude", "xtask", "--locked"]);
-    if release {
-        cargo.arg("--release");
+fn rust_build_args(release: bool, packages: &[String]) -> Result<Vec<String>> {
+    let mut args = vec!["build".to_owned()];
+    if packages.is_empty() {
+        // The running xtask executable cannot be replaced on Windows. It is a
+        // build-time tool rather than a release artifact, so exclude it from
+        // the product workspace build.
+        args.extend(["--workspace", "--exclude", "xtask"].map(str::to_owned));
+    } else {
+        for package in packages {
+            if package == "xtask" {
+                bail!("cargo xtask build cannot rebuild the running xtask executable");
+            }
+            args.extend(["-p".to_owned(), package.clone()]);
+        }
     }
-    run(&mut cargo)
+    args.push("--locked".to_owned());
+    if release {
+        args.push("--release".to_owned());
+    }
+    Ok(args)
 }
 
 fn build_non_rust_workers() -> Result<()> {
@@ -5718,6 +5733,48 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn build_selects_workspace_or_named_packages() -> Result<()> {
+        assert_eq!(
+            super::rust_build_args(true, &[])?,
+            [
+                "build",
+                "--workspace",
+                "--exclude",
+                "xtask",
+                "--locked",
+                "--release"
+            ]
+        );
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "build",
+            "--release",
+            "-p",
+            "depgraph-cli",
+            "--package",
+            "depgraph-rust-worker",
+        ])?;
+        let Task::Build { release, packages } = cli.command else {
+            panic!("build must parse as Task::Build");
+        };
+        assert!(release);
+        assert_eq!(
+            super::rust_build_args(release, &packages)?,
+            [
+                "build",
+                "-p",
+                "depgraph-cli",
+                "-p",
+                "depgraph-rust-worker",
+                "--locked",
+                "--release"
+            ]
+        );
+        assert!(super::rust_build_args(false, &["xtask".to_owned()]).is_err());
+        Ok(())
     }
 
     #[test]
