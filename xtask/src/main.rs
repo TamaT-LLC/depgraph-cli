@@ -170,19 +170,24 @@ const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
     "335945d35d3b99f169a55c3a7101806a21a6a75cd7b3249ee502cee89eb806cf";
 /// Release binaries grouped into the fewest `cargo build --release`
 /// invocations. Every group is one feature unification, so splitting a group
-/// would recompile shared dependencies and relink with thin LTO again. The
-/// distributed CLI must never fall back to development worker overrides when
-/// its signed layout is incomplete, so it always builds with the `packaged`
-/// feature and therefore cannot share a group with the packages that must stay
-/// feature-free.
-const RELEASE_CARGO_BUILD_TARGETS: &[(&[&str], Option<&str>, Option<&str>)] = &[
-    (
-        &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"],
-        None,
-        None,
-    ),
-    (&["depgraph-cli"], Some("depgraph"), Some("packaged")),
-];
+/// would recompile shared dependencies and relink with thin LTO again. All
+/// release binaries share one group. The distributed CLI must never fall back
+/// to development worker overrides when its signed layout is incomplete, so it
+/// builds with `depgraph-cli/packaged`. That feature only gates a runtime
+/// policy call in the `depgraph` binary's `main` and enables nothing in a
+/// dependency, so the other binaries in the group are built as without it.
+/// `depgraph-cli` has the single `depgraph` binary, so no `--bin` filter is
+/// needed (one would also drop the other packages' binaries).
+const RELEASE_CARGO_BUILD_TARGETS: &[(&[&str], Option<&str>, Option<&str>)] = &[(
+    &[
+        "depgraph-mcp",
+        "depgraph-operation",
+        "depgraph-rust-worker",
+        "depgraph-cli",
+    ],
+    None,
+    Some("depgraph-cli/packaged"),
+)];
 struct TargetNativeSmokeExpectation {
     target: &'static str,
     query_plan_digest: &'static str,
@@ -7564,14 +7569,16 @@ jobs:
         );
         assert_eq!(
             RELEASE_CARGO_BUILD_TARGETS,
-            [
-                (
-                    &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"][..],
-                    None,
-                    None,
-                ),
-                (&["depgraph-cli"][..], Some("depgraph"), Some("packaged")),
-            ]
+            [(
+                &[
+                    "depgraph-mcp",
+                    "depgraph-operation",
+                    "depgraph-rust-worker",
+                    "depgraph-cli",
+                ][..],
+                None,
+                Some("depgraph-cli/packaged"),
+            )]
         );
         // Every packaged executable must be produced by these invocations
         // alone, because package() no longer runs a workspace release build.

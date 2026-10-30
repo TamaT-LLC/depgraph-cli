@@ -7,7 +7,9 @@ rust-version.workspace = true
 
 [features]
 default = []
-packaged = ["depgraph-core/packaged"]
+# Release builds only. The `depgraph` binary requires a release manifest for
+# every worker lookup (see `depgraph_core::worker::require_release_manifest`).
+packaged = []
 
 [[bin]]
 name = "depgraph"
