@@ -711,10 +711,18 @@ const CI_OUTCOME_GATED_UPLOADS: [(&str, &str); 2] = [
         "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
     ),
     (
-        "web",
+        "go-loader-scope",
         "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
     ),
 ];
+
+/// Decided steps that run on one matrix leg only, by job. The health-range
+/// gate runs on the go-loader-scope fanout leg, which finishes well before the
+/// bigpkg leg and the web job.
+const CI_MATRIX_LEG_GATES: [(&str, &str); 1] = [(
+    "go-loader-scope",
+    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'",
+)];
 
 /// Paths that make every gated job run. Pinned verbatim against the arrays in
 /// `scripts/ci-affected-scope.sh`.
@@ -945,6 +953,7 @@ fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
         allowed.extend(
             CI_OUTCOME_GATED_UPLOADS
                 .iter()
+                .chain(&CI_MATRIX_LEG_GATES)
                 .filter(|(job, _)| *job == job_name)
                 .map(|(_, condition)| *condition),
         );
@@ -4028,6 +4037,30 @@ mod tests {
                 ),
             ),
             (
+                "health-range e2e ungated",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    "        id: health_range_e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "health-range e2e drops the decision",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    "        if: matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "web runs the fanout-only health-range gate",
+                ci.replacen(
+                    "      - if: steps.decide.outputs.run == 'true'\n        run: pnpm test\n",
+                    "      - if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        run: pnpm test\n",
+                    1,
+                ),
+            ),
+            (
                 "rust job gains a decide step",
                 ci.replacen(
                     &rust_checkout_then_node,
@@ -4134,7 +4167,7 @@ mod tests {
                 ),
             ),
             (
-                "web runs a gate through the dev-profile alias",
+                "go-loader-scope runs a gate through the dev-profile alias",
                 ci.replacen(
                     "        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e\n",
                     "        run: cargo xtask health-range-e2e\n",
