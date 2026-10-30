@@ -44,6 +44,11 @@ jobs:
       # runner image's preinstalled stable would change the key on each image
       # update even though the build only uses the pinned toolchain.
       - run: rustup toolchain uninstall stable
+      # Hash only Cargo.toml's [profile.*] tables for the rust-cache key: a
+      # version bump or a new workspace member must not drop the whole cache.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep separate from compiler-precise-hostile: that job saves a smaller,
@@ -55,8 +60,9 @@ jobs:
           # differently-optimized artifacts, cargo rebuilds all of them anyway, and
           # since the key still counts as a full match the rebuilt artifacts are never
           # saved back - every run after that pays the same full rebuild. Hashing
-          # Cargo.toml here forces a new cache entry whenever the profile changes.
-          key: rust-${{ hashFiles('Cargo.toml') }}
+          # the [profile.*] tables here forces a new cache entry whenever the
+          # profile changes.
+          key: rust-${{ steps.cargo-profile.outputs.hash }}
           # Cache entries are scoped to the branch that saved them, and pull
           # requests already restore main's entry through the key prefix. Saving
           # one more ~700 MB copy per pull request only fills the repository's
@@ -257,15 +263,21 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        working-directory: .
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
           # Shared with go-loader-scope, which builds a subset of these
           # artifacts and only restores this entry. A shared key replaces the
-          # job-based key (and ignores `key`), so the Cargo.toml hash lives here.
+          # job-based key (and ignores `key`), so the profile hash lives here.
           # The hash also covers the e2e profile, which rust-cache would miss:
           # the virtual root manifest is not a workspace member it hashes.
-          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
+          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -329,12 +341,17 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
           # Separate from rust job: CARGO_INCREMENTAL=0 and hostile e2e path.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: compiler-precise-hostile-${{ hashFiles('Cargo.toml') }}
+          key: compiler-precise-hostile-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.decide.outputs.run == 'true'
@@ -425,12 +442,16 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # rust-cache only restores/saves build artifacts, not measurements,
           # so it has no effect on the benchmark numbers gated below.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: benchmark-${{ hashFiles('Cargo.toml') }}
+          key: benchmark-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # A benchmark gate failure happens after the build, so save the
           # dependency artifacts even from a failed run. Workspace crates are
@@ -495,6 +516,10 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Separate from rust / compiler-precise-hostile and from the other
@@ -503,7 +528,7 @@ jobs:
           # rust-cache also hashes RUSTFLAGS and every CARGO_* env into its key,
           # so those bounds can never be served from another job's cache.
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}
           # The gates below run for 30+ minutes; keep the dependency artifacts
           # when a gate fails so the rerun does not start from a cold cache.
           cache-on-failure: true
@@ -998,10 +1023,14 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
-          key: windows-smoke-${{ hashFiles('Cargo.toml') }}
+          key: windows-smoke-${{ steps.cargo-profile.outputs.hash }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -1496,9 +1525,13 @@ jobs:
       - run: rustup default 1.93.1
       # See the `rust` job for why the image's stable toolchain is removed.
       - run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
+          key: native-package-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}
           cache-on-failure: true
           save-if: ${{ github.event_name == 'workflow_dispatch' }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -1569,13 +1602,18 @@ jobs:
       # See the `rust` job for why the image's stable toolchain is removed.
       - if: steps.decide.outputs.run == 'true'
         run: rustup toolchain uninstall stable
+      # See the `rust` job for why only the profile tables are hashed.
+      - if: steps.decide.outputs.run == 'true'
+        id: cargo-profile
+        shell: bash
+        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
           # The web job saves this entry; it holds every artifact this job
           # builds except the health-range example and the depgraph-core
           # dev-dependencies it links, which the fanout leg builds each run.
-          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}
+          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}
           save-if: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.decide.outputs.run == 'true'

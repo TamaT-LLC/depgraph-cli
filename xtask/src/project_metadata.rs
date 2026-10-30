@@ -562,8 +562,9 @@ fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
 
 /// The integration job builds the debug graph and then the release package on
 /// one hosted runner without `cargo clean` in between. Its resource policy is a
-/// matrix-scoped `Swatinem/rust-cache` entry, so the `-lld` Linux leg and the
-/// incremental/debug bounds never share a cache with `rust` or
+/// matrix-scoped `Swatinem/rust-cache` entry, keyed by the hash of Cargo.toml's
+/// `[profile.*]` tables (the `cargo-profile` step), so the `-lld` Linux leg and
+/// the incremental/debug bounds never share a cache with `rust` or
 /// `compiler-precise-hostile`; that entry also keeps `cache-on-failure: true` so
 /// a failed 30+ minute gate never forces the rerun to rebuild its dependencies
 /// from a cold cache. Around the heaviest gates the job reports both the
@@ -572,6 +573,9 @@ fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
 /// disk regression shows up in the log instead of as an opaque build failure.
 fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     let integration = workflow_job_block(workflow, "integration")?;
+    if !cargo_profile_step_precedes_rust_cache(integration) {
+        return Ok(false);
+    }
     let steps = integration.split("\n      - ").skip(1).collect::<Vec<_>>();
     let cache_steps = steps
         .iter()
@@ -581,7 +585,7 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
         return Ok(false);
     };
     if !cache_step.contains(
-        "\n          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+        "\n          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n",
     ) || !workflow_block_has_line(cache_step, "          cache-on-failure: true")
     {
         return Ok(false);
@@ -613,6 +617,37 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     }))
 }
 
+/// The `run:` line of the `cargo-profile` step that computes
+/// `steps.cargo-profile.outputs.hash` for the rust-cache keys.
+const CARGO_PROFILE_HASH_RUN: &str = r#"        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT""#;
+
+/// Whether `job` runs exactly one `cargo-profile` step with
+/// [`CARGO_PROFILE_HASH_RUN`] before its rust-cache step. Without that step the
+/// key's `steps.cargo-profile.outputs.hash` expands to an empty string, so the
+/// key stops changing when a profile changes. The step is matched by its `id`
+/// and `run:` line only, since `web` also sets `working-directory: .`.
+fn cargo_profile_step_precedes_rust_cache(job: &str) -> bool {
+    let steps = job.split("\n      - ").skip(1).collect::<Vec<_>>();
+    let profile_steps = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.starts_with("id: cargo-profile\n")
+                || step.contains("\n        id: cargo-profile\n")
+        })
+        .collect::<Vec<_>>();
+    let [(profile, profile_step)] = profile_steps.as_slice() else {
+        return false;
+    };
+    let Some(cache) = steps
+        .iter()
+        .position(|step| step.starts_with("uses: Swatinem/rust-cache@"))
+    else {
+        return false;
+    };
+    workflow_block_has_line(profile_step, CARGO_PROFILE_HASH_RUN) && *profile < cache
+}
+
 /// The `target/` size line every integration disk report runs after `df -h`:
 /// free space alone cannot tell a `target/` blowup from a runner image change.
 const INTEGRATION_TARGET_SIZE_REPORT: &str =
@@ -636,9 +671,11 @@ const E2E_CACHE_JOBS: [&str; 2] = ["web", "go-loader-scope"];
 
 /// The rust-cache key both [`E2E_CACHE_JOBS`] use. A shared key replaces the
 /// job-based key, and rust-cache does not hash the virtual root manifest (it
-/// is not a workspace member), so the `Cargo.toml` hash that carries the `e2e`
-/// profile has to be part of the key itself.
-const E2E_CACHE_SHARED_KEY: &str = "          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}";
+/// is not a workspace member), so the hash of Cargo.toml's `[profile.*]` tables
+/// (the `cargo-profile` step), which carries the `e2e` profile, has to be part
+/// of the key itself.
+const E2E_CACHE_SHARED_KEY: &str =
+    "          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}";
 
 /// How CI invokes an e2e gate. xtask links depgraph-core, so running it under
 /// the same `e2e` profile as the CLI it builds lets both share one optimized
@@ -665,6 +702,9 @@ fn verify_e2e_build_alignment(workflow: &str) -> Result<()> {
             || !workflow_block_has_line(job, E2E_CACHE_SHARED_KEY)
         {
             bail!("CI {job_name} job must use the shared e2e rust-cache key");
+        }
+        if !cargo_profile_step_precedes_rust_cache(job) {
+            bail!("CI {job_name} job must hash the Cargo.toml profiles before rust-cache");
         }
         if job.contains(crate::e2e_profile::E2E_PROFILE_ENV) {
             bail!("CI {job_name} job must build the e2e gates under the default profile");
@@ -3495,12 +3535,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT, GithubActionsPolicy,
-        affected_scope_decide_step, extra_native_package_is_manual_and_bounded,
-        integration_job_pins_resource_policy, job_pins_intermediate_state_bound,
-        verify_ci_affected_scope_gates, verify_ci_affected_scope_script_text,
-        verify_compiler_precise_hostile_ci_gate, verify_e2e_build_alignment,
-        verify_workflow_policy_text, workflow_job_block, workflow_step_block,
+        BENCHMARK_ONLY_INPUT, CARGO_PROFILE_HASH_RUN, E2E_CACHE_JOBS, EXTRA_NATIVE_PACKAGES_INPUT,
+        GithubActionsPolicy, affected_scope_decide_step,
+        extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
+        job_pins_intermediate_state_bound, verify_ci_affected_scope_gates,
+        verify_ci_affected_scope_script_text, verify_compiler_precise_hostile_ci_gate,
+        verify_e2e_build_alignment, verify_workflow_policy_text, workflow_job_block,
+        workflow_step_block,
     };
 
     /// The three jobs that build twice on one runner without reclaiming
@@ -3586,8 +3627,7 @@ mod tests {
     #[test]
     fn integration_resource_policy_rejects_cache_and_disk_report_drift() {
         let ci = checked_in_ci_workflow();
-        let cache_key =
-            "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
+        let cache_key = "          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n";
         assert_eq!(ci.matches(cache_key).count(), 1);
         let cache_on_failure = "          cache-on-failure: true\n";
         assert_eq!(
@@ -3671,6 +3711,79 @@ mod tests {
             assert!(
                 !integration_job_pins_resource_policy(&drift).expect("drifted integration job is extractable"),
                 "drifted integration resource policy must be rejected"
+            );
+        }
+    }
+
+    /// Mutations of one job's `cargo-profile` step: the step removed, its
+    /// `id` removed, its `run:` line changed, and the step moved after
+    /// rust-cache. Each mutation is applied to that job's block only.
+    fn cargo_profile_step_drifts(ci: &str, job_name: &str) -> Vec<(&'static str, String)> {
+        let job = workflow_job_block(ci, job_name).unwrap();
+        let steps = job.split("\n      - ").collect::<Vec<_>>();
+        let profile_steps = steps
+            .iter()
+            .filter(|step| {
+                step.starts_with("id: cargo-profile\n")
+                    || step.contains("\n        id: cargo-profile\n")
+            })
+            .collect::<Vec<_>>();
+        let [profile_step] = profile_steps.as_slice() else {
+            panic!("{job_name} must have exactly one cargo-profile step");
+        };
+        let profile_step = format!("\n      - {profile_step}");
+        let id_line = if profile_step.starts_with("\n      - id: cargo-profile\n") {
+            "\n      - id: cargo-profile\n"
+        } else {
+            "\n        id: cargo-profile\n"
+        };
+        let id_replacement = if id_line.starts_with("\n      - ") {
+            "\n      - name: Hash the Cargo.toml profiles\n"
+        } else {
+            "\n"
+        };
+        let cache_start = job
+            .find("\n      - uses: Swatinem/rust-cache@")
+            .expect("job has a rust-cache step");
+        let cache_end = job[cache_start + 1..]
+            .find("\n      - ")
+            .map_or(job.len(), |end| cache_start + 1 + end);
+        let cache_step = &job[cache_start..cache_end];
+        let mutate = |changed: String| ci.replace(job, &changed);
+        vec![
+            ("step removed", mutate(job.replacen(&profile_step, "", 1))),
+            ("id removed", mutate(job.replacen(id_line, id_replacement, 1))),
+            (
+                "run line changed",
+                mutate(job.replacen(
+                    CARGO_PROFILE_HASH_RUN,
+                    "        run: echo \"hash=$(git hash-object Cargo.toml)\" >> \"$GITHUB_OUTPUT\"",
+                    1,
+                )),
+            ),
+            (
+                "step moved after rust-cache",
+                mutate(
+                    job.replacen(&profile_step, "", 1)
+                        .replacen(cache_step, &format!("{cache_step}{profile_step}"), 1),
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn integration_resource_policy_rejects_cargo_profile_step_drift() {
+        let ci = checked_in_ci_workflow();
+        assert!(integration_job_pins_resource_policy(&ci).unwrap());
+        for (label, drift) in cargo_profile_step_drifts(&ci, "integration") {
+            assert_ne!(
+                drift, ci,
+                "{label}: drift mutation must change the workflow"
+            );
+            assert!(
+                !integration_job_pins_resource_policy(&drift)
+                    .expect("drifted integration job is extractable"),
+                "{label}: integration job without the cargo-profile step must be rejected"
             );
         }
     }
@@ -4138,7 +4251,7 @@ mod tests {
         let ci = checked_in_ci_workflow();
         verify_e2e_build_alignment(&ci).unwrap();
         let loader_job = "  go-loader-scope:\n    runs-on: ubuntu-24.04\n";
-        let loader_restore = "          shared-key: web-e2e-${{ hashFiles('Cargo.toml') }}\n          save-if: false\n";
+        let loader_restore = "          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}\n          save-if: false\n";
         let loader_gate =
             "        run: cargo run --locked --profile e2e -p xtask -- go-loader-scope-e2e\n";
         for (label, drift) in [
@@ -4159,10 +4272,10 @@ mod tests {
                 ),
             ),
             (
-                "go-loader-scope key drops the manifest hash",
+                "go-loader-scope key drops the profile hash",
                 ci.replacen(
                     loader_restore,
-                    &loader_restore.replacen("-${{ hashFiles('Cargo.toml') }}", "", 1),
+                    &loader_restore.replacen("-${{ steps.cargo-profile.outputs.hash }}", "", 1),
                     1,
                 ),
             ),
@@ -4191,6 +4304,24 @@ mod tests {
                 verify_e2e_build_alignment(&drift).is_err(),
                 "{label}: drifted workflow must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn e2e_build_alignment_rejects_cargo_profile_step_drift() {
+        let ci = checked_in_ci_workflow();
+        verify_e2e_build_alignment(&ci).unwrap();
+        for job_name in E2E_CACHE_JOBS {
+            for (label, drift) in cargo_profile_step_drifts(&ci, job_name) {
+                assert_ne!(
+                    drift, ci,
+                    "{job_name} {label}: drift mutation must change the workflow"
+                );
+                assert!(
+                    verify_e2e_build_alignment(&drift).is_err(),
+                    "{job_name} {label}: drifted workflow must be rejected"
+                );
+            }
         }
     }
 
