@@ -1101,6 +1101,60 @@ fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
     for decision in &HOSTILE_DECISIONS {
         verify_hostile_decision_step(hostile, decision)?;
     }
+    verify_hostile_compiler_pack_smoke_prebuild(hostile)?;
+    Ok(())
+}
+
+const HOSTILE_XTASK_BUILD_STEP: [&str; 3] = [
+    "      - name: Build xtask for the exact Linux compiler-pack smoke",
+    "        if: steps.compiler-pack-smoke.outputs.run == 'true'",
+    "        run: cargo build --locked -p xtask",
+];
+const HOSTILE_COMPILER_PACK_SMOKE_STEP: [&str; 6] = [
+    "      - name: Exact Linux compiler-pack semantic release smoke",
+    "        if: steps.compiler-pack-smoke.outputs.run == 'true'",
+    "        env:",
+    "          DEPGRAPH_TARGET: x86_64-unknown-linux-gnu",
+    "          RUSTFLAGS: -C linker-features=-lld",
+    "        run: target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
+];
+
+/// The lines of a workflow step with comments and blank lines dropped.
+fn workflow_step_code_lines(step: &str) -> Vec<&str> {
+    step.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect()
+}
+
+/// RUSTFLAGS is part of every unit's fingerprint, so `cargo xtask` under the
+/// smoke's `-lld` flag rebuilds xtask's whole graph. xtask is built first
+/// without RUSTFLAGS, and the smoke runs that binary directly so that only
+/// the cargo builds it spawns inherit the linker flag.
+fn verify_hostile_compiler_pack_smoke_prebuild(hostile: &str) -> Result<()> {
+    if job_env_entries(hostile)?
+        .iter()
+        .any(|entry| entry.contains("RUSTFLAGS"))
+    {
+        bail!("CI compiler-precise hostile job must not set RUSTFLAGS for every step");
+    }
+    let (build_start, build) = workflow_step_block(hostile, HOSTILE_XTASK_BUILD_STEP[0])?;
+    if workflow_step_code_lines(build) != HOSTILE_XTASK_BUILD_STEP {
+        bail!(
+            "CI compiler-precise hostile job must build xtask without RUSTFLAGS as {HOSTILE_XTASK_BUILD_STEP:?}"
+        );
+    }
+    let (smoke_start, smoke) = workflow_step_block(hostile, HOSTILE_COMPILER_PACK_SMOKE_STEP[0])?;
+    if workflow_step_code_lines(smoke) != HOSTILE_COMPILER_PACK_SMOKE_STEP {
+        bail!(
+            "CI compiler-precise hostile job must run the prebuilt xtask under -lld as {HOSTILE_COMPILER_PACK_SMOKE_STEP:?}"
+        );
+    }
+    if build_start >= smoke_start {
+        bail!("CI compiler-precise hostile job must build xtask before the compiler-pack smoke");
+    }
     Ok(())
 }
 
@@ -3066,7 +3120,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
         "crates/depgraph-operation/|xtask/src/compiler_pack_release\\.rs|scripts/compiler-precise-hostile",
         "name: Exact Linux compiler-pack semantic release smoke",
-        "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
+        "target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
@@ -4061,6 +4115,99 @@ mod tests {
             assert!(
                 verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
                 "swapping the filter outputs in {header:?} must be rejected"
+            );
+        }
+    }
+
+    const HOSTILE_XTASK_BUILD_STEP_HEADER: &str =
+        "      - name: Build xtask for the exact Linux compiler-pack smoke";
+    const HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER: &str =
+        "      - name: Exact Linux compiler-pack semantic release smoke";
+    const HOSTILE_SMOKE_RUSTFLAGS_LINE: &str = "          RUSTFLAGS: -C linker-features=-lld\n";
+    const HOSTILE_PREBUILT_SMOKE_RUN: &str =
+        "        run: target/debug/xtask compiler-pack-package";
+    const HOSTILE_XTASK_BUILD_RUN: &str = "        run: cargo build --locked -p xtask\n";
+
+    /// The smoke must run the prebuilt xtask under the -lld flag, and the
+    /// build before it must not carry the flag, or the dev build of xtask
+    /// misses every cached unit again.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_drifted_xtask_prebuild() {
+        let ci = checked_in_ci_workflow();
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        let (_, build) = workflow_step_block(hostile, HOSTILE_XTASK_BUILD_STEP_HEADER).unwrap();
+        let (_, smoke) =
+            workflow_step_block(hostile, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER).unwrap();
+        assert_eq!(build.matches(HOSTILE_XTASK_BUILD_RUN).count(), 1);
+        assert_eq!(smoke.matches(HOSTILE_SMOKE_RUSTFLAGS_LINE).count(), 1);
+        assert_eq!(smoke.matches(HOSTILE_PREBUILT_SMOKE_RUN).count(), 1);
+
+        let job_level_rustflags = {
+            let bound = "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n";
+            assert_eq!(hostile.matches(bound).count(), 1);
+            let changed = hostile.replacen(
+                bound,
+                &format!("{bound}      RUSTFLAGS: -C linker-features=-lld\n"),
+                1,
+            );
+            ci.replacen(hostile, &changed, 1)
+        };
+        let build_after_smoke =
+            drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                format!("{step}{build}")
+            })
+            .replacen(build, "", 1);
+        let drifts = [
+            (
+                "a removed build step",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |_| String::new()),
+            ),
+            (
+                "a build step under RUSTFLAGS",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_XTASK_BUILD_RUN,
+                        &format!(
+                            "        env:\n{HOSTILE_SMOKE_RUSTFLAGS_LINE}{HOSTILE_XTASK_BUILD_RUN}"
+                        ),
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a build step under another profile",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_XTASK_BUILD_RUN,
+                        "        run: cargo build --locked --release -p xtask\n",
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a smoke that rebuilds xtask through cargo xtask",
+                drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_PREBUILT_SMOKE_RUN,
+                        "        run: cargo xtask compiler-pack-package",
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a smoke without the -lld flag",
+                drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                    step.replacen(HOSTILE_SMOKE_RUSTFLAGS_LINE, "", 1)
+                }),
+            ),
+            ("a build step after the smoke", build_after_smoke),
+            ("a job-level RUSTFLAGS", job_level_rustflags),
+        ];
+        for (label, drift) in drifts {
+            assert_ne!(drift, ci, "{label} must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "{label} must be rejected"
             );
         }
     }

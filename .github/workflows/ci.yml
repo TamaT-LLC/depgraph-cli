@@ -393,12 +393,20 @@ jobs:
           curl --fail --silent --show-error --location \
             --output channel-rust-nightly-2026-07-17.toml \
             https://static.rust-lang.org/dist/2026-07-17/channel-rust-nightly.toml
+      - name: Build xtask for the exact Linux compiler-pack smoke
+        if: steps.compiler-pack-smoke.outputs.run == 'true'
+        # RUSTFLAGS is part of every unit's fingerprint, so building xtask under
+        # the smoke's -lld flag misses every unit the cache restored or the
+        # hostile E2E built and recompiles the whole graph. Only the cargo
+        # builds xtask spawns need the flag, and they inherit it from the smoke
+        # step below.
+        run: cargo build --locked -p xtask
       - name: Exact Linux compiler-pack semantic release smoke
         if: steps.compiler-pack-smoke.outputs.run == 'true'
         env:
           DEPGRAPH_TARGET: x86_64-unknown-linux-gnu
           RUSTFLAGS: -C linker-features=-lld
-        run: cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
+        run: target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: steps.decide.outputs.run == 'true'
         with:
