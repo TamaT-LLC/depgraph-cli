@@ -40,6 +40,10 @@ jobs:
       - run: node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs scripts/tests/homebrew-tap.test.mjs scripts/tests/ci-affected-scope.test.mjs scripts/tests/pr-impact.test.mjs
       - run: rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy
       - run: rustup default 1.93.1
+      # rust-cache hashes every installed toolchain into its restore key, so the
+      # runner image's preinstalled stable would change the key on each image
+      # update even though the build only uses the pinned toolchain.
+      - run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Keep separate from compiler-precise-hostile: that job saves a smaller,
@@ -251,6 +255,9 @@ jobs:
         run: rustup toolchain install 1.93.1 --profile minimal
       - if: steps.decide.outputs.run == 'true'
         run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
@@ -339,6 +346,9 @@ jobs:
         run: rustup toolchain install 1.93.1 --profile minimal
       - if: steps.decide.outputs.run == 'true'
         run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
@@ -433,6 +443,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal
       - run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # rust-cache only restores/saves build artifacts, not measurements,
@@ -500,6 +512,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Separate from rust / compiler-precise-hostile and from the other
@@ -1001,6 +1015,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # See the `rust` job above for why Cargo.toml is hashed into the key.
@@ -1497,6 +1513,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: rustup toolchain install 1.93.1 --profile minimal --component rust-src
       - run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: native-package-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}
@@ -1567,6 +1585,9 @@ jobs:
         run: rustup toolchain install 1.93.1 --profile minimal
       - if: steps.decide.outputs.run == 'true'
         run: rustup default 1.93.1
+      # See the `rust` job for why the image's stable toolchain is removed.
+      - if: steps.decide.outputs.run == 'true'
+        run: rustup toolchain uninstall stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.decide.outputs.run == 'true'
         with:
