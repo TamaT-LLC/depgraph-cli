@@ -762,8 +762,10 @@ function bigPackageScenarios(control) {
   // 1,024 files fit the default 8 MiB byte budget, which would promote the
   // module to one whole-context load. The file and byte caps keep typed and
   // semantic work as staged_bodies batches so the unchanged reduced memory
-  // limit is enough.
+  // limit is enough. The memory limit applies per worker, so these batches run
+  // at the shipped default concurrency of 2 instead of one at a time.
   configure(bigRoot, {
+    max_concurrent_units: 2,
     max_worker_memory_bytes: REDUCED_WORKER_MEMORY_BYTES,
     max_unit_source_bytes: FANOUT_UNIT_SOURCE_BYTES,
     max_unit_source_files: FANOUT_UNIT_SOURCE_FILES,

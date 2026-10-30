@@ -298,6 +298,11 @@ enum Task {
     Build {
         #[arg(long)]
         release: bool,
+        /// Build only these Rust packages instead of the whole workspace.
+        /// workspace-hack keeps their dependency features identical to the
+        /// workspace build, so the selected binaries do not change.
+        #[arg(long = "package", short = 'p', value_name = "NAME")]
+        packages: Vec<String>,
     },
     Test,
     GoSemanticE2e,
@@ -966,7 +971,7 @@ const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Task::Build { release } => build(release),
+        Task::Build { release, packages } => build(release, &packages),
         Task::Test => test(),
         Task::GoSemanticE2e => {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
@@ -1085,21 +1090,31 @@ fn compiler_pack(source: &Path, output: &Path, spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build(release: bool) -> Result<()> {
-    build_rust_workspace(release)?;
+fn build(release: bool, packages: &[String]) -> Result<()> {
+    run(Command::new("cargo").args(rust_build_args(release, packages)?))?;
     build_non_rust_workers()
 }
 
-fn build_rust_workspace(release: bool) -> Result<()> {
-    let mut cargo = Command::new("cargo");
-    // The running xtask executable cannot be replaced on Windows. It is a
-    // build-time tool rather than a release artifact, so exclude it from the
-    // product workspace build.
-    cargo.args(["build", "--workspace", "--exclude", "xtask", "--locked"]);
-    if release {
-        cargo.arg("--release");
+fn rust_build_args(release: bool, packages: &[String]) -> Result<Vec<String>> {
+    let mut args = vec!["build".to_owned()];
+    if packages.is_empty() {
+        // The running xtask executable cannot be replaced on Windows. It is a
+        // build-time tool rather than a release artifact, so exclude it from
+        // the product workspace build.
+        args.extend(["--workspace", "--exclude", "xtask"].map(str::to_owned));
+    } else {
+        for package in packages {
+            if package == "xtask" {
+                bail!("cargo xtask build cannot rebuild the running xtask executable");
+            }
+            args.extend(["-p".to_owned(), package.clone()]);
+        }
     }
-    run(&mut cargo)
+    args.push("--locked".to_owned());
+    if release {
+        args.push("--release".to_owned());
+    }
+    Ok(args)
 }
 
 fn build_non_rust_workers() -> Result<()> {
@@ -1571,12 +1586,18 @@ fn verify_health_range_evidence(
 }
 
 fn package() -> Result<()> {
+    let total = PhaseTimer::start("package/total");
     verify_release_tag()?;
     verify_project_metadata(&workspace_root())?;
     // Release binaries come from RELEASE_CARGO_BUILD_TARGETS alone; a separate
     // `--workspace` release build would only recompile the same dependency
     // graph under a third feature unification.
-    for (packages, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
+    for (index, (packages, binary, features)) in RELEASE_CARGO_BUILD_TARGETS.iter().enumerate() {
+        let build = PhaseTimer::start(format!(
+            "package/release-build-{}:{}",
+            index + 1,
+            packages.join("+")
+        ));
         let mut command = Command::new("cargo");
         command.args(["build", "--locked", "--release"]);
         for package in *packages {
@@ -1589,8 +1610,10 @@ fn package() -> Result<()> {
             command.args(["--features", features]);
         }
         run(&mut command)?;
+        build.finish();
     }
-    build_non_rust_workers()?;
+    timed("package/non-rust-workers", build_non_rust_workers)?;
+    let staging_phase = PhaseTimer::start("package/staging");
     let host = host_target()?;
     let target = std::env::var("DEPGRAPH_TARGET").unwrap_or_else(|_| host.clone());
     if target != host {
@@ -1705,7 +1728,9 @@ fn package() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
     let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
+    staging_phase.finish();
 
+    let metadata_phase = PhaseTimer::start("package/manifest-licenses-sbom");
     let workers = vec![
         worker_artifact(
             "rust",
@@ -1817,7 +1842,9 @@ fn package() -> Result<()> {
         staging.join("sbom.spdx.json"),
         serde_json::to_vec_pretty(&sbom(&target, &rust_sysroot_sha256)?)?,
     )?;
+    metadata_phase.finish();
 
+    let archive_phase = PhaseTimer::start("package/archive");
     let archive = create_archive(dist, &name)?;
     let checksum = sha256_file(&archive)?;
     let checksum_path = archive.with_extension(format!(
@@ -1835,8 +1862,10 @@ fn package() -> Result<()> {
             archive.file_name().unwrap().to_string_lossy()
         ),
     )?;
-    let (query_smoke, cross_language_smoke, mcp_smoke) =
-        verify_archive(&archive, &checksum_path, &name)?;
+    archive_phase.finish();
+    let (query_smoke, cross_language_smoke, mcp_smoke) = timed("package/verify", || {
+        verify_archive(&archive, &checksum_path, &name)
+    })?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
@@ -1850,6 +1879,7 @@ fn package() -> Result<()> {
         format!("{}\n", serde_json::to_string_pretty(&mcp_smoke)?),
     )?;
     println!("packaged {}", archive.display());
+    total.finish();
     Ok(())
 }
 
@@ -5723,6 +5753,48 @@ mod tests {
     #[test]
     fn repository_release_metadata_is_synchronized() -> Result<()> {
         verify_project_metadata(&workspace_root())
+    }
+
+    #[test]
+    fn build_selects_workspace_or_named_packages() -> Result<()> {
+        assert_eq!(
+            super::rust_build_args(true, &[])?,
+            [
+                "build",
+                "--workspace",
+                "--exclude",
+                "xtask",
+                "--locked",
+                "--release"
+            ]
+        );
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "build",
+            "--release",
+            "-p",
+            "depgraph-cli",
+            "--package",
+            "depgraph-rust-worker",
+        ])?;
+        let Task::Build { release, packages } = cli.command else {
+            panic!("build must parse as Task::Build");
+        };
+        assert!(release);
+        assert_eq!(
+            super::rust_build_args(release, &packages)?,
+            [
+                "build",
+                "-p",
+                "depgraph-cli",
+                "-p",
+                "depgraph-rust-worker",
+                "--locked",
+                "--release"
+            ]
+        );
+        assert!(super::rust_build_args(false, &["xtask".to_owned()]).is_err());
+        Ok(())
     }
 
     #[test]
