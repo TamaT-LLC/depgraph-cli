@@ -6288,7 +6288,7 @@ mod tests {
                 "CARGO_PROFILE_TEST_DEBUG: \"1\"",
             ),
             ci.replacen(
-                "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+                "          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n",
                 "          key: rust\n",
                 1,
             ),
