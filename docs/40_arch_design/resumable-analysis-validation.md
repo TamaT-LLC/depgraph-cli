@@ -127,9 +127,12 @@ boundary; CI runs both adapters and uploads the report as the
 `cargo xtask health-range-e2e` is the evidence gate for the health side of
 #467: snapshot-scoped health no longer loads the whole `GraphSnapshot` for a
 plain input but plans bounded store ranges, analyzes each range under the
-unchanged per-range budget, and reuses per-range checkpoints. The same Web CI
-job runs it after the resumable fixture and uploads the report as the
-`health-range-report` artifact, without adding a separate integration job. The xtask
+unchanged per-range budget, and reuses per-range checkpoints. CI runs it on
+the `fanout` leg of the `go-loader-scope` job, after that leg's Go loader
+fixture, and uploads the report as the `health-range-report` artifact, without
+adding a separate integration job. That job uses the Web job's affected-scope
+decision, so the gate runs on the same pull requests as before; it moved out of
+the Web job because the `fanout` leg finishes minutes earlier. The xtask
 writes the report before it raises the verdict on every path — fixture
 generation failure, a runner that exited without its own report, a CLI
 failure, or a failed comparison — with `gate.passed`, `gate.failure`, the

@@ -110,3 +110,24 @@ codegen-units = 16
 debug-assertions = true
 overflow-checks = true
 strip = "none"
+
+# Crates outside the CLI's scan path build at opt-level 0, which cuts the
+# per-run rebuild without slowing the gates:
+# - xtask only builds and spawns the CLI and the gate runners, then checks
+#   their reports;
+# - depgraph-contract-scan is not linked into the CLI (depgraph-core only uses
+#   it as a dev-dependency, which the health-range example pulls in);
+# - depgraph-operation and depgraph-agent-contract serve agent/MCP setup and
+#   constant-time command and result mapping in the CLI, never the scan.
+# Debug assertions and overflow checks are profile-wide, so they stay on here.
+[profile.e2e.package.xtask]
+opt-level = 0
+
+[profile.e2e.package.depgraph-contract-scan]
+opt-level = 0
+
+[profile.e2e.package.depgraph-operation]
+opt-level = 0
+
+[profile.e2e.package.depgraph-agent-contract]
+opt-level = 0
