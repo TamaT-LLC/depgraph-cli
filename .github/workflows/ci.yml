@@ -379,7 +379,29 @@ jobs:
         run: |
           set -euo pipefail
           changed="$(git diff --no-renames --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
-          if grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|\.github/workflows/ci\.yml)' <<<"$changed"; then
+          if grep -qE '^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile)' <<<"$changed"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! grep -qxF '.github/workflows/ci.yml' <<<"$changed"; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # ci.yml runs the smoke only when this job changes. Nothing outside
+          # the job reaches its steps: project_metadata.rs rejects a top-level
+          # env or defaults, and the smoke runs only on pull_request.
+          hostile_job() {
+            local workflow block
+            workflow="$(git show "$1:.github/workflows/ci.yml")" || return 1
+            block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } found && (/^  [^ #].*:$/ || /^[^ #]/) { exit } found { print }' <<<"$workflow")" || return 1
+            [ -n "$block" ] || return 1
+            printf '%s\n' "$block"
+          }
+          # A side that cannot be read runs the smoke, so a broken extraction
+          # never skips it.
+          if ! base_job="$(hostile_job "${{ github.event.pull_request.base.sha }}")" ||
+            ! head_job="$(hostile_job "${{ github.event.pull_request.head.sha }}")" ||
+            [ "$base_job" != "$head_job" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
