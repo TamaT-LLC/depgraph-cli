@@ -4036,7 +4036,7 @@ mod tests {
     /// A ci.yml or job that cannot be read on either side must run the smoke.
     /// Each mutation turns one such failure into run=false.
     #[test]
-    fn compiler_precise_hostile_gate_rejects_a_fail_closed_smoke_comparison() {
+    fn compiler_precise_hostile_gate_rejects_a_smoke_comparison_that_skips_on_unreadable_blocks() {
         let ci = checked_in_ci_workflow();
         let fail_open = concat!(
             "          if ! base_job=\"$(hostile_job \"${{ github.event.pull_request.base.sha }}\")\" ||\n",
