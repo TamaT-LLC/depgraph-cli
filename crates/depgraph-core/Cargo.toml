@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-packaged = []
 
 [dependencies]
 anyhow.workspace = true
