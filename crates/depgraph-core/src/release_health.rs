@@ -443,7 +443,7 @@ mod tests {
             compatible.mcp_operation_contract_version,
             "depgraph-operation-v2"
         );
-        assert_eq!(compatible.stable_release_version, "0.7.3");
+        assert_eq!(compatible.stable_release_version, "0.7.4");
         assert_eq!(compatible.previous_release_version, "0.5.4");
         assert_eq!(compatible.previous_release_store_schema_version, 17);
         assert_eq!(compatible.stable_upgrade_source_version, "0.4.0-rc.6");
