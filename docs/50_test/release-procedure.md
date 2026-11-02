@@ -47,7 +47,7 @@ tag source、remote `main`、`refs/heads/release/0.7`、source tree、exact Full
 
 `main`へのマージを一時停止し、リリース対象commitを固定する。
 GitHubのActions画面で`CI`を選び、`Run workflow`から`main`を指定し、`extra_native_packages`を有効にして実行する。
-リリース用のFull CIは、GoのmacOS（Apple Silicon）検証とLinux ARM64の追加package検証を含む10ジョブすべての成功を要求する。Intel macOS（`macos-15-intel`）のジョブは廃止した。
+リリース用のFull CIは、GoのmacOS（Apple Silicon）検証、Go loaderのbigpkg / fanout、Linux ARM64の追加package検証を含む12ジョブすべての成功を要求する。Intel macOS（`macos-15-intel`）のジョブは廃止した。
 
 CLIを使う場合は次のように実行する。
 
@@ -82,8 +82,9 @@ validatorのjob identityを同時に更新する。期待値の定数からtest 
 API driftを検出できない。既知の実API応答
 `xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json`を独立fixtureとして固定し、
 この8ジョブの履歴fixtureはbyteを固定したまま保持し、v0.6の公開証跡としては受理しない。
-現行10ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
-これはブランチ検証の記録であり、リリース用mainのFull CIを代替しない。
+現行12ジョブは`xtask/fixtures/full-ci-run-40989224808.json`に実API応答を固定する。
+これは追加native packageがskippedのブランチ検証記録であり、リリース用mainのFull CIを代替しない。
+unit testの成功例だけは、旧`xtask/fixtures/full-ci-run-34682206659.json`のnative jobとmain branchを合成する。元のskipped jobはmainでも拒否する。
 unit testは元のbranchを拒否し、mainを模した入力でジョブ名の一致と欠損・skip・改変の拒否を検証する。
 
 ## リリースタグの作成
@@ -145,7 +146,7 @@ maintenance ref側で新しいmerge commitやcherry-pickを作らず、force-pus
 stableではfast-forwardと一致確認の後だけsigned annotated tagを同じSHAへpushする。
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
-tag側のstable gateはGitHub APIから`main` headのexact ten-job Full CIを再取得する。
+tag側のstable gateはGitHub APIから`main` headのexact twelve-job Full CIを再取得する。
 製品価値の`agent-dogfood-report-v1`（SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`）と、Issue #436のcode-health `agent-dogfood-report-v2`（SHA-256 `7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`）をそれぞれ14 gateで再計算する。
 exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.7.4.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
@@ -222,13 +223,13 @@ safe scan reconnect、stdout purity、root seal、compiler semantic / rollback�
 
 さらに42点すべてについてpublic downloadとworkflow artifactのfilename、size、SHA-256
 が一致しなければ失敗する。`release-post-publish-evidence-v1` JSONは、candidate commit /
-tree、署名tag object、exact manual full-CI runと10 job、Release run、42 asset digest、
+tree、署名tag object、exact manual full-CI runと12 job、Release run、42 asset digest、
 aggregate digest、asset-set digestを記録する。最終jobはこのJSONを同じGitHub Releaseへ
 追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。最終jobの
 job-scoped tokenは、Full CIのrun/jobを読むための`actions: read`と、Releaseへ成果物を
 公開するための`contents: write`だけを持つ。
 公開後検証は「その時点の最新run」を再選択せず、`stable-release-gate.json`が記録した
-同一`full_ci_run_id`を再取得し、SHA、branch、10 job、job-set digestまで一致させる。
+同一`full_ci_run_id`を再取得し、SHA、branch、12 job、job-set digestまで一致させる。
 
 最後にLinux x86-64の公開archiveを新しいdirectoryへ展開し、固定polyglot fixtureを
 公開`depgraph`でsafe scanする。GitHub release-asset APIからpost-publish evidenceの

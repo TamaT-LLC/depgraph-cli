@@ -136,6 +136,8 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
     "compiler-precise-hostile",
     "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-loader-scope (bigpkg)",
+    "go-loader-scope (fanout)",
     "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
@@ -161,9 +163,9 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
     "ga-baseline-full-ci",
     "workflow-quality-closure",
 ];
-const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-34682206659.json";
+const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-40989224808.json";
 const CURRENT_FULL_CI_RUN_FIXTURE_SHA256: &str =
-    "3313370b911c737a28ba40a8966cfc02a54729308fb28b08b8ff5682c2dc2201";
+    "81cf9bdce191dc0ec953693332decb0249bc66fe3457bb552caa6ef697a3e181";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
@@ -199,39 +201,39 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.3";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.4";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:cf057847d142d98a676500a8a223ed705b5c95f3d3016781f08686b4c12b041d",
-        query_result_digest: "bounded-query-result:sha256:1acbcb5aea6ef658028acd80347a183303eb1a5b231de53ad9132a1d67368c3c",
-        query_output_sha256: "eaf0b5c04a676d4eada0cbf10ca5ba5a2ac9aedf228c4c6222b19f0189d144d3",
-        profile_plan_digest: "profile-selection-plan:sha256:2d16c4dd204f17a9ac5e1fa3b75c4debcfafcf9557c2dd7514b648c5cbd68aea",
-        profile_plan_output_sha256: "34e8edff890ed1358911845ef08164879aab99ca554c1d8cb8bcc14363203d42",
+        query_plan_digest: "bounded-query-plan:sha256:86d8aa10684758e9d5985d738929e34c4ea59731712db3c5e34f75610bee9221",
+        query_result_digest: "bounded-query-result:sha256:c224b28799c9939a611e8d87bf21c64639369ae91766293895101e215dce05e7",
+        query_output_sha256: "f5e85c121f93408171382f3cac723cc6941458265fe835d2d3d001bf4dbc277e",
+        profile_plan_digest: "profile-selection-plan:sha256:5567fa6171424574def1af921d039b7db66c12a673a55306de2098d1c817260d",
+        profile_plan_output_sha256: "a3f6c714a0e220dd30a0107b94d01ccc0502c0c6367772de7bbbe4376325a321",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:602689465c9f6e0921049d8f49ae9e7c821b161eede453b0cc783efe84724dac",
-        query_result_digest: "bounded-query-result:sha256:f62b8bcf799b73b10835f75f5c4ad06d7f29c95dc026ad45a3200d464915972e",
-        query_output_sha256: "a34ecdde553af4065c66f2e1858d084938dc35d99a54845b158a862a7e848060",
-        profile_plan_digest: "profile-selection-plan:sha256:63e88ec78ce8681a5911f2f81c3b6ec3110ca351f62c91b7432de1ee53654774",
-        profile_plan_output_sha256: "1eb3694e586fd78a917497b8dff770da0e8f0935721c64d90cb9e24ee5a63400",
+        query_plan_digest: "bounded-query-plan:sha256:ee8e7284708d2c1957a75df2fd80e53bb7c53db94071fac7b481984cf4e16c2a",
+        query_result_digest: "bounded-query-result:sha256:ac07aa8d6002e2623ce0041cbafb7164f317c5503acc88b524f650c1caa72e3e",
+        query_output_sha256: "64a241b53f034543898ccbb43309f4c1c7e8282e0315dce6ad3e846f51d28c9b",
+        profile_plan_digest: "profile-selection-plan:sha256:98eeb43458a5a4905d53c53fc1f6abaee2815958104cb5ec8f88c04c4bb3730b",
+        profile_plan_output_sha256: "46452d5dcbb648e37951f132723458e06253eea2cdeb6f133ae0234ae6e11e9d",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:c95e5adf4c009c4195310881f8d308de317804af926247e3fadb9baaa3a04b82",
-        query_result_digest: "bounded-query-result:sha256:bc606c05c5206b925d6c0a6dd78e1eee542aef2b93ab2a1202647878405e8002",
-        query_output_sha256: "d74ef79ce4e34764b812c0e9d16826bfa299542e0f487f39bbbd31c841425638",
-        profile_plan_digest: "profile-selection-plan:sha256:86365a26d08ee680e79a4574b0374f964933e382284e42b5abd42398cebf6f8f",
-        profile_plan_output_sha256: "c30eef07f569bc396c363f09a3889678e69caea7411ed029673fbed50178dda0",
+        query_plan_digest: "bounded-query-plan:sha256:ca606a332f168e09ff0545d1387b5b75f62f0b73f3c57de5d226834c4621dc9a",
+        query_result_digest: "bounded-query-result:sha256:a6af9f59a977f691303527f2e62ecb044a11fb08a939ed84d4ff70c72cc1b708",
+        query_output_sha256: "435fed2f70bb392bb73b6f6b474d42db694b0e820e040c1974cdaf56b66a651c",
+        profile_plan_digest: "profile-selection-plan:sha256:df4c95f6be7190995677e89776548a4b5495ab3fb1abd55266e4c26238afaf72",
+        profile_plan_output_sha256: "58e9fa23fd9e06048b14b57e835a85ff095963852bea65ded12e96c77f0945eb",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:387ae3fe60b0af58a189fd5c168a92bc777e8f0f380893f4bb2ac748ab272787",
-        query_result_digest: "bounded-query-result:sha256:8da4a503678608661123c836ca0f4bddc95ea6854dfe3fef6accb75db7314976",
-        query_output_sha256: "a42c60dfd2b4b24bce8999fed39eadac6a4380960cf2bfe984ddba86d26582d1",
-        profile_plan_digest: "profile-selection-plan:sha256:2a1bb201097afb9938d0ed6d6c1c3bab799a080603394d5f9847056f55a1c0fd",
-        profile_plan_output_sha256: "f0efb40a0d2c382737f42be1164b1670236799dcc737f7e1060afac97f704eed",
+        query_plan_digest: "bounded-query-plan:sha256:02de57ec9708426c4eb3764bd47ab82057cc276fab735d878985bfd7d3edb005",
+        query_result_digest: "bounded-query-result:sha256:558c26b45cb83f7b09101f47fc3d70b36856337c8807f97a325e5226c22048a1",
+        query_output_sha256: "a23a41f881874d959f9c23c155998199eb43b96827e291f911acb85a22e38977",
+        profile_plan_digest: "profile-selection-plan:sha256:d56254418550c11958107807d00bc3398622b9a73a17610e9d610cf727e0acd6",
+        profile_plan_output_sha256: "ee3d1e850ab56f775300a49b76c5ff3110a767f2e8b862777745bc6ca41e7036",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -713,6 +715,9 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.7.1'",
         "V0_7_1_RELEASE_SOURCE_SHA: 26aacf9b839fd5ba9d824c2efcff2efc7084aec8",
         "historical_source_sha=\"$V0_7_1_RELEASE_SOURCE_SHA\"",
+        "github.event.workflow_run.head_branch == 'v0.7.3'",
+        "V0_7_3_RELEASE_SOURCE_SHA: 2ade14f20bde57b02c4bbfbe51560961dd26d223",
+        "historical_source_sha=\"$V0_7_3_RELEASE_SOURCE_SHA\"",
         "STABLE_MAINTENANCE_REF: heads/release/0.7",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
@@ -5909,10 +5914,37 @@ mod tests {
         release_post_publish_evidence(request)
     }
 
+    fn captured_ci_with_synthetic_native_success() -> Result<Value> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        // The real current run skipped the optional native package. Retain that
+        // raw fixture and borrow its successful display identity from the older
+        // real Full CI capture only for synthetic admission tests.
+        let historical: Value =
+            serde_json::from_str(include_str!("../fixtures/full-ci-run-34682206659.json"))?;
+        let native = historical["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| {
+                job["name"] == "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)"
+            })
+            .expect("captured native package job");
+        assert_eq!(native["conclusion"], "success");
+        let skipped = input["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job["name"] == "extra-native-package")
+            .expect("captured skipped native package job");
+        assert_eq!(skipped["conclusion"], "skipped");
+        *skipped = native.clone();
+        Ok(input)
+    }
+
     #[test]
     fn full_ci_selection_skips_newer_ineligible_runs_and_chooses_latest_valid() -> Result<()> {
-        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
-        let mut valid: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let mut valid = captured_ci_with_synthetic_native_success()?;
         let source_sha = valid["head_sha"].as_str().unwrap().to_owned();
         valid["head_branch"] = json!("main");
         let candidate = |id: u64| {
@@ -5976,16 +6008,20 @@ mod tests {
             .expect("captured source")
             .to_owned();
         assert!(validate_full_ci_run(&fixture, &source_sha).is_err());
-        // The fixture is the current Full CI job inventory. The original capture
-        // included an Intel macOS extra-native-package job; that job is no longer
-        // required. Change only the branch in this synthetic admission test.
+        // A main run with the captured skipped native job must still fail.
         input["head_branch"] = json!("main");
         let temp = tempfile::tempdir()?;
         let eligible = temp.path().join("main-full-ci.json");
         fs::write(&eligible, serde_json::to_vec(&input)?)?;
+        assert!(validate_full_ci_run(&eligible, &source_sha).is_err());
+        input = captured_ci_with_synthetic_native_success()?;
+        input["head_branch"] = json!("main");
+        fs::write(&eligible, serde_json::to_vec(&input)?)?;
         let run = validate_full_ci_run(&eligible, &source_sha)?;
-        assert_eq!(run.jobs.len(), 10);
+        assert_eq!(run.jobs.len(), 12);
         for name in [
+            "go-loader-scope (bigpkg)",
+            "go-loader-scope (fanout)",
             "go-macos",
             "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
         ] {
@@ -6034,8 +6070,8 @@ mod tests {
 
     #[test]
     fn full_ci_job_identity_rejects_the_stale_linux_display_name() -> Result<()> {
-        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
-        let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let mut input = captured_ci_with_synthetic_native_success()?;
+        let source_sha = input["head_sha"].as_str().unwrap().to_owned();
         input["head_branch"] = json!("main");
         let linux = input["jobs"]
             .as_array_mut()
@@ -6051,7 +6087,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let stale = temp.path().join("stale-full-ci.json");
         fs::write(&stale, serde_json::to_vec(&input)?)?;
-        let error = validate_full_ci_run(&stale, "04fb7163d5e2139811a2e69e2a9978cfeb6e87dc")
+        let error = validate_full_ci_run(&stale, &source_sha)
             .expect_err("stale implicit matrix job identity must fail closed");
         assert_eq!(
             error.to_string(),
@@ -7685,7 +7721,7 @@ jobs:
     #[test]
     fn native_smoke_pins_match_recorded_native_observations() {
         let evidence: Value = serde_json::from_str(include_str!(
-            "../fixtures/native-smoke-v0.7.3-observations.json"
+            "../fixtures/native-smoke-v0.7.4-observations.json"
         ))
         .unwrap();
         assert_eq!(evidence["version"], VERSION);
@@ -7700,24 +7736,24 @@ jobs:
             let observed = observations[0];
             let (run, job, source_commit) = match *target {
                 "aarch64-apple-darwin" => (
-                    40140403500_u64,
-                    121010752079_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280001933_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "aarch64-unknown-linux-gnu" => (
-                    40140403500_u64,
-                    121010752185_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002101_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "x86_64-pc-windows-msvc" => (
-                    40140403500_u64,
-                    121010752006_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002158_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "x86_64-unknown-linux-gnu" => (
-                    40140403500_u64,
-                    121010752168_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002033_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 _ => panic!("missing recorded native job for {target}"),
             };
