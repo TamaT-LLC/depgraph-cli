@@ -38,6 +38,8 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
     "compiler-precise-hostile",
     "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-loader-scope (bigpkg)",
+    "go-loader-scope (fanout)",
     "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
@@ -1336,18 +1338,46 @@ impl Drop for Probe {
 mod tests {
     use super::*;
 
-    #[test]
-    fn full_ci_jobs_match_the_captured_workflow() -> Result<()> {
+    fn captured_full_ci_jobs() -> Result<Vec<Value>> {
         let captured: Value = serde_json::from_str(include_str!(
+            "../../../xtask/fixtures/full-ci-run-40989224808.json"
+        ))?;
+        let historical: Value = serde_json::from_str(include_str!(
             "../../../xtask/fixtures/full-ci-run-34682206659.json"
         ))?;
-        let mut names = captured["jobs"]
+        let mut jobs = captured["jobs"]
             .as_array()
-            .expect("captured jobs")
+            .context("captured jobs")?
+            .clone();
+        let native = historical["jobs"]
+            .as_array()
+            .context("historical jobs")?
+            .iter()
+            .find(|job| {
+                job["name"] == "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)"
+            })
+            .context("captured native package job")?;
+        let skipped = jobs
+            .iter_mut()
+            .find(|job| job["name"] == "extra-native-package")
+            .context("captured skipped native package job")?;
+        assert_eq!(skipped["conclusion"], "skipped");
+        assert_eq!(native["conclusion"], "success");
+        // Only synthetic admission fixtures replace this skipped job. The
+        // production verifier continues to require all twelve actual successes.
+        *skipped = native.clone();
+        jobs.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        Ok(jobs)
+    }
+
+    #[test]
+    fn full_ci_jobs_match_the_captured_workflow() -> Result<()> {
+        let jobs = captured_full_ci_jobs()?;
+        let names = jobs
             .iter()
             .map(|job| job["name"].as_str().expect("job name"))
             .collect::<Vec<_>>();
-        names.sort_unstable();
+        assert_eq!(names.len(), 12);
         assert_eq!(names, FULL_CI_JOB_NAMES);
         Ok(())
     }
@@ -1401,6 +1431,7 @@ mod tests {
                 .with_context(|| format!("test release evidence has no {name}"))
         };
         let commit = "a".repeat(40);
+        let full_ci_jobs = captured_full_ci_jobs()?;
         let evidence = json!({
             "schema_version":RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION,
             "repository":OFFICIAL_RELEASE_REPOSITORY,
@@ -1418,10 +1449,7 @@ mod tests {
                 "url":canonical_actions_run_url(1),
                 "head_sha":&commit,
                 "head_branch":"main",
-                "jobs":FULL_CI_JOB_NAMES.iter().map(|name| json!({
-                    "name":name,
-                    "conclusion":"success"
-                })).collect::<Vec<_>>()
+                "jobs":full_ci_jobs
             },
             "release_workflow":{
                 "run_id":2,
@@ -1590,18 +1618,24 @@ mod tests {
 
         let original_bytes = fs::read(&evidence)?;
         let original: Value = serde_json::from_slice(&original_bytes)?;
+        assert_eq!(original["full_ci"]["jobs"].as_array().unwrap().len(), 12);
         for name in [
+            "go-loader-scope (bigpkg)",
+            "go-loader-scope (fanout)",
             "go-macos",
             "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
         ] {
-            for change in ["missing", "skipped", "failure"] {
+            for change in ["missing", "skipped", "failure", "renamed", "duplicate"] {
                 let mut drift = original.clone();
                 let jobs = drift["full_ci"]["jobs"].as_array_mut().expect("CI jobs");
                 let index = jobs.iter().position(|job| job["name"] == name).unwrap();
-                if change == "missing" {
-                    jobs.remove(index);
-                } else {
-                    jobs[index]["conclusion"] = json!(change);
+                match change {
+                    "missing" => {
+                        jobs.remove(index);
+                    }
+                    "renamed" => jobs[index]["name"] = json!(format!("{name}-drift")),
+                    "duplicate" => jobs.push(jobs[index].clone()),
+                    _ => jobs[index]["conclusion"] = json!(change),
                 }
                 fs::write(&evidence, serde_json::to_vec(&drift)?)?;
                 let digest = sha256_file(&evidence)?;

@@ -1890,6 +1890,10 @@ fn create_release_evidence(
     let asset_set_sha256 = fixture_release_asset_set_sha256(&assets);
     let commit = "a".repeat(40);
     let tag = format!("v{release_version}-rc.1");
+    let full_ci_jobs = crate::FULL_CI_JOB_NAMES
+        .iter()
+        .map(|name| json!({"name": name, "conclusion": "success"}))
+        .collect::<Vec<_>>();
     let evidence = json!({
         "schema_version":RELEASE_EVIDENCE_CONTRACT_VERSION,
         "repository":"TamaT-LLC/depgraph-cli",
@@ -1907,18 +1911,7 @@ fn create_release_evidence(
             "url":"https://github.com/TamaT-LLC/depgraph-cli/actions/runs/1",
             "head_sha":commit,
             "head_branch":"main",
-            "jobs":[
-                {"name":"benchmark","conclusion":"success"},
-                {"name":"compiler-precise-hostile","conclusion":"success"},
-                {"name":"extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)","conclusion":"success"},
-                {"name":"go","conclusion":"success"},
-                {"name":"go-macos","conclusion":"success"},
-                {"name":"integration (macos-15, aarch64-apple-darwin)","conclusion":"success"},
-                {"name":"integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)","conclusion":"success"},
-                {"name":"rust","conclusion":"success"},
-                {"name":"web","conclusion":"success"},
-                {"name":"windows-smoke","conclusion":"success"}
-            ]
+            "jobs":full_ci_jobs
         },
         "release_workflow":{
             "run_id":2,
