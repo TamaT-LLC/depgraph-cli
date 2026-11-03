@@ -19,6 +19,7 @@ publish = false
 [dependencies]
 aho-corasick = { version = "1" }
 bstr = { version = "1" }
+bytes = { version = "1" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
@@ -36,7 +37,6 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-rmcp = { version = "3", default-features = false, features = ["macros", "server", "transport-io"] }
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
@@ -44,12 +44,11 @@ serde_json = { version = "1", features = ["alloc", "preserve_order"] }
 smallvec = { version = "1", default-features = false, features = ["const_new", "union"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "test-util"] }
-tokio-util = { version = "0.7", features = ["codec"] }
 toml_parser = { version = "1" }
 toml_writer = { version = "1" }
+tracing = { version = "0.1" }
 tracing-core = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
-uuid = { version = "1", features = ["serde", "v4"] }
 winnow = { version = "1" }
 
 [build-dependencies]
@@ -66,7 +65,6 @@ syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-trai
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
-libc = { version = "0.2" }
 mio = { version = "1", features = ["net", "os-ext"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
@@ -77,7 +75,6 @@ mio = { version = "1", features = ["net", "os-ext"] }
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 errno = { version = "0.3" }
-libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }

@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 mod compiler_pack_release;
+mod e2e_profile;
 mod go_semantic_e2e;
+mod governance;
 mod mcp_package_smoke;
 mod project_metadata;
 mod release_verify_packaged;
@@ -24,6 +26,7 @@ mod util;
 
 pub(crate) use util::*;
 
+use e2e_profile::E2eProfile;
 use project_metadata::verify_project_metadata;
 use release_verify_packaged::{verify_archive, verify_packaged_cross_language};
 use sbom::{
@@ -37,7 +40,7 @@ use sbom::{
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STABLE_RELEASE_GATE_SCHEMA_VERSION: &str = "stable-release-gate-v2";
 const RELEASE_POST_PUBLISH_EVIDENCE_SCHEMA_VERSION: &str = "release-post-publish-evidence-v1";
-const STABLE_RELEASE_VERSION: &str = "0.7.3";
+const STABLE_RELEASE_VERSION: &str = "0.7.4";
 const STABLE_RELEASE_BASELINE_STATUS: &str = "maintenance-ref-pinned";
 const STABLE_RELEASE_MAINTENANCE_BRANCH: &str = "refs/heads/release/0.7";
 const AGENT_DOGFOOD_REPORT_SCHEMA_VERSION: &str = "agent-dogfood-report-v1";
@@ -97,11 +100,11 @@ const CROSS_LANGUAGE_RELEASE_FIXTURE_PROFILE_ID: &str = "release:polyglot";
 const CROSS_LANGUAGE_RELEASE_FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
 const PROJECT_LICENSE_EXPRESSION: &str = "MIT OR Apache-2.0";
 const MCP_SERVER_NAME: &str = "depgraph-mcp";
-const MCP_SDK_NAME: &str = depgraph_mcp_tools::MCP_SDK_NAME;
-const MCP_SDK_VERSION: &str = depgraph_mcp_tools::MCP_SDK_VERSION;
+const MCP_SDK_NAME: &str = depgraph_agent_contract::MCP_SDK_NAME;
+const MCP_SDK_VERSION: &str = depgraph_agent_contract::MCP_SDK_VERSION;
 const MCP_MACROS_VERSION: &str = "3.1.2";
-const MCP_PROTOCOL_REVISION: &str = depgraph_mcp_tools::MCP_PROTOCOL_REVISION;
-const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_mcp_tools::MCP_TOOLS_CONTRACT_VERSION;
+const MCP_PROTOCOL_REVISION: &str = depgraph_agent_contract::MCP_PROTOCOL_REVISION;
+const MCP_TOOL_CONTRACT_VERSION: &str = depgraph_agent_contract::MCP_TOOLS_CONTRACT_VERSION;
 const MCP_OPERATION_CONTRACT_VERSION: &str = depgraph_operation::OPERATION_CONTRACT_VERSION;
 const MCP_TOOL_SCHEMA_PATH: &str = "schemas/depgraph-mcp-tools-v1.schema.json";
 const MCP_TOOL_SCHEMA_BYTES: &[u8] =
@@ -133,6 +136,8 @@ const FULL_CI_JOB_NAMES: &[&str] = &[
     "compiler-precise-hostile",
     "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
     "go",
+    "go-loader-scope (bigpkg)",
+    "go-loader-scope (fanout)",
     "go-macos",
     "integration (macos-15, aarch64-apple-darwin)",
     "integration (ubuntu-24.04, x86_64-unknown-linux-gnu, -C linker-features=-lld)",
@@ -158,28 +163,33 @@ const STABLE_RELEASE_GATE_CHECK_IDS: &[&str] = &[
     "ga-baseline-full-ci",
     "workflow-quality-closure",
 ];
-const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-34682206659.json";
+const CURRENT_FULL_CI_RUN_FIXTURE_PATH: &str = "xtask/fixtures/full-ci-run-40989224808.json";
 const CURRENT_FULL_CI_RUN_FIXTURE_SHA256: &str =
-    "3313370b911c737a28ba40a8966cfc02a54729308fb28b08b8ff5682c2dc2201";
+    "81cf9bdce191dc0ec953693332decb0249bc66fe3457bb552caa6ef697a3e181";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_PATH: &str =
     "xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json";
 const V0_5_RC6_FULL_CI_RUN_FIXTURE_SHA256: &str =
     "335945d35d3b99f169a55c3a7101806a21a6a75cd7b3249ee502cee89eb806cf";
 /// Release binaries grouped into the fewest `cargo build --release`
 /// invocations. Every group is one feature unification, so splitting a group
-/// would recompile shared dependencies and relink with thin LTO again. The
-/// distributed CLI must never fall back to development worker overrides when
-/// its signed layout is incomplete, so it always builds with the `packaged`
-/// feature and therefore cannot share a group with the packages that must stay
-/// feature-free.
-const RELEASE_CARGO_BUILD_TARGETS: &[(&[&str], Option<&str>, Option<&str>)] = &[
-    (
-        &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"],
-        None,
-        None,
-    ),
-    (&["depgraph-cli"], Some("depgraph"), Some("packaged")),
-];
+/// would recompile shared dependencies and relink with thin LTO again. All
+/// release binaries share one group. The distributed CLI must never fall back
+/// to development worker overrides when its signed layout is incomplete, so it
+/// builds with `depgraph-cli/packaged`. That feature only gates a runtime
+/// policy call in the `depgraph` binary's `main` and enables nothing in a
+/// dependency, so the other binaries in the group are built as without it.
+/// `depgraph-cli` has the single `depgraph` binary, so no `--bin` filter is
+/// needed (one would also drop the other packages' binaries).
+const RELEASE_CARGO_BUILD_TARGETS: &[(&[&str], Option<&str>, Option<&str>)] = &[(
+    &[
+        "depgraph-mcp",
+        "depgraph-operation",
+        "depgraph-rust-worker",
+        "depgraph-cli",
+    ],
+    None,
+    Some("depgraph-cli/packaged"),
+)];
 struct TargetNativeSmokeExpectation {
     target: &'static str,
     query_plan_digest: &'static str,
@@ -191,39 +201,39 @@ struct TargetNativeSmokeExpectation {
 
 // These outputs bind the core/adapter versions as well as native target context.
 // Refresh them from native gates after a version bump, preserving semantic checks.
-const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.3";
+const TARGET_NATIVE_SMOKE_EXPECTATION_VERSION: &str = "0.7.4";
 const TARGET_NATIVE_SMOKE_EXPECTATIONS: &[TargetNativeSmokeExpectation] = &[
     TargetNativeSmokeExpectation {
         target: "x86_64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:cf057847d142d98a676500a8a223ed705b5c95f3d3016781f08686b4c12b041d",
-        query_result_digest: "bounded-query-result:sha256:1acbcb5aea6ef658028acd80347a183303eb1a5b231de53ad9132a1d67368c3c",
-        query_output_sha256: "eaf0b5c04a676d4eada0cbf10ca5ba5a2ac9aedf228c4c6222b19f0189d144d3",
-        profile_plan_digest: "profile-selection-plan:sha256:2d16c4dd204f17a9ac5e1fa3b75c4debcfafcf9557c2dd7514b648c5cbd68aea",
-        profile_plan_output_sha256: "34e8edff890ed1358911845ef08164879aab99ca554c1d8cb8bcc14363203d42",
+        query_plan_digest: "bounded-query-plan:sha256:86d8aa10684758e9d5985d738929e34c4ea59731712db3c5e34f75610bee9221",
+        query_result_digest: "bounded-query-result:sha256:c224b28799c9939a611e8d87bf21c64639369ae91766293895101e215dce05e7",
+        query_output_sha256: "f5e85c121f93408171382f3cac723cc6941458265fe835d2d3d001bf4dbc277e",
+        profile_plan_digest: "profile-selection-plan:sha256:5567fa6171424574def1af921d039b7db66c12a673a55306de2098d1c817260d",
+        profile_plan_output_sha256: "a3f6c714a0e220dd30a0107b94d01ccc0502c0c6367772de7bbbe4376325a321",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-unknown-linux-gnu",
-        query_plan_digest: "bounded-query-plan:sha256:602689465c9f6e0921049d8f49ae9e7c821b161eede453b0cc783efe84724dac",
-        query_result_digest: "bounded-query-result:sha256:f62b8bcf799b73b10835f75f5c4ad06d7f29c95dc026ad45a3200d464915972e",
-        query_output_sha256: "a34ecdde553af4065c66f2e1858d084938dc35d99a54845b158a862a7e848060",
-        profile_plan_digest: "profile-selection-plan:sha256:63e88ec78ce8681a5911f2f81c3b6ec3110ca351f62c91b7432de1ee53654774",
-        profile_plan_output_sha256: "1eb3694e586fd78a917497b8dff770da0e8f0935721c64d90cb9e24ee5a63400",
+        query_plan_digest: "bounded-query-plan:sha256:ee8e7284708d2c1957a75df2fd80e53bb7c53db94071fac7b481984cf4e16c2a",
+        query_result_digest: "bounded-query-result:sha256:ac07aa8d6002e2623ce0041cbafb7164f317c5503acc88b524f650c1caa72e3e",
+        query_output_sha256: "64a241b53f034543898ccbb43309f4c1c7e8282e0315dce6ad3e846f51d28c9b",
+        profile_plan_digest: "profile-selection-plan:sha256:98eeb43458a5a4905d53c53fc1f6abaee2815958104cb5ec8f88c04c4bb3730b",
+        profile_plan_output_sha256: "46452d5dcbb648e37951f132723458e06253eea2cdeb6f133ae0234ae6e11e9d",
     },
     TargetNativeSmokeExpectation {
         target: "aarch64-apple-darwin",
-        query_plan_digest: "bounded-query-plan:sha256:c95e5adf4c009c4195310881f8d308de317804af926247e3fadb9baaa3a04b82",
-        query_result_digest: "bounded-query-result:sha256:bc606c05c5206b925d6c0a6dd78e1eee542aef2b93ab2a1202647878405e8002",
-        query_output_sha256: "d74ef79ce4e34764b812c0e9d16826bfa299542e0f487f39bbbd31c841425638",
-        profile_plan_digest: "profile-selection-plan:sha256:86365a26d08ee680e79a4574b0374f964933e382284e42b5abd42398cebf6f8f",
-        profile_plan_output_sha256: "c30eef07f569bc396c363f09a3889678e69caea7411ed029673fbed50178dda0",
+        query_plan_digest: "bounded-query-plan:sha256:ca606a332f168e09ff0545d1387b5b75f62f0b73f3c57de5d226834c4621dc9a",
+        query_result_digest: "bounded-query-result:sha256:a6af9f59a977f691303527f2e62ecb044a11fb08a939ed84d4ff70c72cc1b708",
+        query_output_sha256: "435fed2f70bb392bb73b6f6b474d42db694b0e820e040c1974cdaf56b66a651c",
+        profile_plan_digest: "profile-selection-plan:sha256:df4c95f6be7190995677e89776548a4b5495ab3fb1abd55266e4c26238afaf72",
+        profile_plan_output_sha256: "58e9fa23fd9e06048b14b57e835a85ff095963852bea65ded12e96c77f0945eb",
     },
     TargetNativeSmokeExpectation {
         target: "x86_64-pc-windows-msvc",
-        query_plan_digest: "bounded-query-plan:sha256:387ae3fe60b0af58a189fd5c168a92bc777e8f0f380893f4bb2ac748ab272787",
-        query_result_digest: "bounded-query-result:sha256:8da4a503678608661123c836ca0f4bddc95ea6854dfe3fef6accb75db7314976",
-        query_output_sha256: "a42c60dfd2b4b24bce8999fed39eadac6a4380960cf2bfe984ddba86d26582d1",
-        profile_plan_digest: "profile-selection-plan:sha256:2a1bb201097afb9938d0ed6d6c1c3bab799a080603394d5f9847056f55a1c0fd",
-        profile_plan_output_sha256: "f0efb40a0d2c382737f42be1164b1670236799dcc737f7e1060afac97f704eed",
+        query_plan_digest: "bounded-query-plan:sha256:02de57ec9708426c4eb3764bd47ab82057cc276fab735d878985bfd7d3edb005",
+        query_result_digest: "bounded-query-result:sha256:558c26b45cb83f7b09101f47fc3d70b36856337c8807f97a325e5226c22048a1",
+        query_output_sha256: "a23a41f881874d959f9c23c155998199eb43b96827e291f911acb85a22e38977",
+        profile_plan_digest: "profile-selection-plan:sha256:d56254418550c11958107807d00bc3398622b9a73a17610e9d610cf727e0acd6",
+        profile_plan_output_sha256: "ee3d1e850ab56f775300a49b76c5ff3110a767f2e8b862777745bc6ca41e7036",
     },
 ];
 const SBOM_SCOPE: &str = "Scope: package-manager component boundary; system runtimes/toolchains and dependencies embedded inside upstream prebuilt packages are not recursively enumerated.";
@@ -290,6 +300,11 @@ enum Task {
     Build {
         #[arg(long)]
         release: bool,
+        /// Build only these Rust packages instead of the whole workspace.
+        /// workspace-hack keeps their dependency features identical to the
+        /// workspace build, so the selected binaries do not change.
+        #[arg(long = "package", short = 'p', value_name = "NAME")]
+        packages: Vec<String>,
     },
     Test,
     GoSemanticE2e,
@@ -700,6 +715,9 @@ fn verify_stable_release_source_guard(root: &Path) -> Result<()> {
         "github.event.workflow_run.head_branch == 'v0.7.1'",
         "V0_7_1_RELEASE_SOURCE_SHA: 26aacf9b839fd5ba9d824c2efcff2efc7084aec8",
         "historical_source_sha=\"$V0_7_1_RELEASE_SOURCE_SHA\"",
+        "github.event.workflow_run.head_branch == 'v0.7.3'",
+        "V0_7_3_RELEASE_SOURCE_SHA: 2ade14f20bde57b02c4bbfbe51560961dd26d223",
+        "historical_source_sha=\"$V0_7_3_RELEASE_SOURCE_SHA\"",
         "STABLE_MAINTENANCE_REF: heads/release/0.7",
         "STABLE_MAIN_REF: heads/main",
         "STABLE_BASELINE_STATUS: maintenance-ref-pinned",
@@ -958,7 +976,7 @@ const ARCHIVE_MTIME: u64 = 1_234_567_890;
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Task::Build { release } => build(release),
+        Task::Build { release, packages } => build(release, &packages),
         Task::Test => test(),
         Task::GoSemanticE2e => {
             go_semantic_e2e::run_development(&workspace_root(), &cargo_target_dir())
@@ -1051,8 +1069,8 @@ fn main() -> Result<()> {
             output,
         } => public_readiness_verify(
             &bundle,
-            depgraph_core::PublicReadinessExpectedState {
-                repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+            governance::PublicReadinessExpectedState {
+                repository: governance::PUBLIC_READINESS_REPOSITORY.into(),
                 candidate_commit,
                 audited_refs_digest,
                 github_settings_digest,
@@ -1077,21 +1095,31 @@ fn compiler_pack(source: &Path, output: &Path, spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build(release: bool) -> Result<()> {
-    build_rust_workspace(release)?;
+fn build(release: bool, packages: &[String]) -> Result<()> {
+    run(Command::new("cargo").args(rust_build_args(release, packages)?))?;
     build_non_rust_workers()
 }
 
-fn build_rust_workspace(release: bool) -> Result<()> {
-    let mut cargo = Command::new("cargo");
-    // The running xtask executable cannot be replaced on Windows. It is a
-    // build-time tool rather than a release artifact, so exclude it from the
-    // product workspace build.
-    cargo.args(["build", "--workspace", "--exclude", "xtask", "--locked"]);
-    if release {
-        cargo.arg("--release");
+fn rust_build_args(release: bool, packages: &[String]) -> Result<Vec<String>> {
+    let mut args = vec!["build".to_owned()];
+    if packages.is_empty() {
+        // The running xtask executable cannot be replaced on Windows. It is a
+        // build-time tool rather than a release artifact, so exclude it from
+        // the product workspace build.
+        args.extend(["--workspace", "--exclude", "xtask"].map(str::to_owned));
+    } else {
+        for package in packages {
+            if package == "xtask" {
+                bail!("cargo xtask build cannot rebuild the running xtask executable");
+            }
+            args.extend(["-p".to_owned(), package.clone()]);
+        }
     }
-    run(&mut cargo)
+    args.push("--locked".to_owned());
+    if release {
+        args.push("--release".to_owned());
+    }
+    Ok(args)
 }
 
 fn build_non_rust_workers() -> Result<()> {
@@ -1178,13 +1206,8 @@ fn test() -> Result<()> {
 }
 
 fn resumable_analysis_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let cli = E2eProfile::from_env()?.build_cli()?;
     build_non_rust_workers()?;
-    let target_dir = cargo_target_dir();
-    let cli = workspace_root()
-        .join(target_dir)
-        .join("debug")
-        .join(executable_name("depgraph"));
     run(Command::new("node")
         .arg("scripts/resumable-analysis-e2e.mjs")
         .env("DEPGRAPH_BIN", &cli))?;
@@ -1205,13 +1228,8 @@ fn resumable_analysis_e2e() -> Result<()> {
 ///
 /// Set `DEPGRAPH_GO_LOADER_SCOPE_REPORT` to retain the per-unit report.
 fn go_loader_scope_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let cli = E2eProfile::from_env()?.build_cli()?;
     build_non_rust_workers()?;
-    let target_dir = cargo_target_dir();
-    let cli = workspace_root()
-        .join(target_dir)
-        .join("debug")
-        .join(executable_name("depgraph"));
     let report_path = std::env::var_os("DEPGRAPH_GO_LOADER_SCOPE_REPORT").map(PathBuf::from);
     if let Some(parent) = report_path.as_ref().and_then(|path| path.parent()) {
         fs::create_dir_all(parent)?;
@@ -1263,7 +1281,8 @@ fn write_go_loader_scope_fallback_report(report_path: Option<&Path>) -> Result<(
 ///
 /// Set `DEPGRAPH_HEALTH_RANGE_REPORT` to retain the combined report.
 fn health_range_e2e() -> Result<()> {
-    run(Command::new("cargo").args(["build", "--locked", "-p", "depgraph-cli"]))?;
+    let profile = E2eProfile::from_env()?;
+    let cli = profile.build_cli()?;
     let target_dir = workspace_root().join(cargo_target_dir());
     let work_dir = target_dir.join("health-range-e2e");
     if work_dir.exists() {
@@ -1274,19 +1293,17 @@ fn health_range_e2e() -> Result<()> {
     let fixture_dir = work_dir.join("fixture");
     let store = fixture_dir.join("depgraph.sqlite");
     let repo = fixture_dir.join("repo");
+    // The example runs under the CLI's profile so it reuses the depgraph-core
+    // artifacts the CLI build just produced.
     let runner = [
-        "run",
-        "--locked",
-        "-p",
-        "depgraph-core",
-        "--example",
-        "health_range_e2e",
-        "--",
-    ];
+        &["run", "--locked"][..],
+        &profile.cargo_args(),
+        &["-p", "depgraph-core", "--example", "health_range_e2e", "--"],
+    ]
+    .concat();
     let report_path = std::env::var_os("DEPGRAPH_HEALTH_RANGE_REPORT")
         .map(PathBuf::from)
         .unwrap_or_else(|| work_dir.join("report.json"));
-    let cli = target_dir.join("debug").join(executable_name("depgraph"));
     let evidence =
         HealthRangeEvidence::collect(&work_dir, &fixture_dir, &store, &repo, &runner, &cli)?;
     // The combined report is written on every path (generation failure,
@@ -1574,12 +1591,18 @@ fn verify_health_range_evidence(
 }
 
 fn package() -> Result<()> {
+    let total = PhaseTimer::start("package/total");
     verify_release_tag()?;
     verify_project_metadata(&workspace_root())?;
     // Release binaries come from RELEASE_CARGO_BUILD_TARGETS alone; a separate
     // `--workspace` release build would only recompile the same dependency
     // graph under a third feature unification.
-    for (packages, binary, features) in RELEASE_CARGO_BUILD_TARGETS {
+    for (index, (packages, binary, features)) in RELEASE_CARGO_BUILD_TARGETS.iter().enumerate() {
+        let build = PhaseTimer::start(format!(
+            "package/release-build-{}:{}",
+            index + 1,
+            packages.join("+")
+        ));
         let mut command = Command::new("cargo");
         command.args(["build", "--locked", "--release"]);
         for package in *packages {
@@ -1592,8 +1615,10 @@ fn package() -> Result<()> {
             command.args(["--features", features]);
         }
         run(&mut command)?;
+        build.finish();
     }
-    build_non_rust_workers()?;
+    timed("package/non-rust-workers", build_non_rust_workers)?;
+    let staging_phase = PhaseTimer::start("package/staging");
     let host = host_target()?;
     let target = std::env::var("DEPGRAPH_TARGET").unwrap_or_else(|_| host.clone());
     if target != host {
@@ -1708,7 +1733,9 @@ fn package() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let rust_sysroot_component = prepare_rust_sysroot_component(&staging)?;
     let rust_sysroot_sha256 = rust_sysroot_component.sha256.clone();
+    staging_phase.finish();
 
+    let metadata_phase = PhaseTimer::start("package/manifest-licenses-sbom");
     let workers = vec![
         worker_artifact(
             "rust",
@@ -1820,7 +1847,9 @@ fn package() -> Result<()> {
         staging.join("sbom.spdx.json"),
         serde_json::to_vec_pretty(&sbom(&target, &rust_sysroot_sha256)?)?,
     )?;
+    metadata_phase.finish();
 
+    let archive_phase = PhaseTimer::start("package/archive");
     let archive = create_archive(dist, &name)?;
     let checksum = sha256_file(&archive)?;
     let checksum_path = archive.with_extension(format!(
@@ -1838,8 +1867,10 @@ fn package() -> Result<()> {
             archive.file_name().unwrap().to_string_lossy()
         ),
     )?;
-    let (query_smoke, cross_language_smoke, mcp_smoke) =
-        verify_archive(&archive, &checksum_path, &name)?;
+    archive_phase.finish();
+    let (query_smoke, cross_language_smoke, mcp_smoke) = timed("package/verify", || {
+        verify_archive(&archive, &checksum_path, &name)
+    })?;
     fs::write(
         dist.join(format!("{name}.query-smoke.json")),
         format!("{}\n", serde_json::to_string_pretty(&query_smoke)?),
@@ -1853,6 +1884,7 @@ fn package() -> Result<()> {
         format!("{}\n", serde_json::to_string_pretty(&mcp_smoke)?),
     )?;
     println!("packaged {}", archive.display());
+    total.finish();
     Ok(())
 }
 
@@ -3316,16 +3348,15 @@ fn prefixed_lowercase_sha256(value: &str, prefix: &str) -> bool {
 
 fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
     let desired_path = workspace_root().join(".github/settings-desired-v1.json");
-    let desired = depgraph_core::parse_github_settings_desired(
-        &fs::read(&desired_path).with_context(|| {
+    let desired =
+        governance::parse_github_settings_desired(&fs::read(&desired_path).with_context(|| {
             format!(
                 "failed to read canonical GitHub settings manifest {}",
                 desired_path.display()
             )
-        })?,
-    )
-    .context("canonical GitHub settings manifest is invalid")?;
-    let snapshot: depgraph_core::GitHubSettingsApiSnapshot =
+        })?)
+        .context("canonical GitHub settings manifest is invalid")?;
+    let snapshot: governance::GitHubSettingsApiSnapshot =
         serde_json::from_slice(&fs::read(snapshot_path).with_context(|| {
             format!(
                 "failed to read redacted GitHub settings snapshot {}",
@@ -3333,7 +3364,7 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
             )
         })?)
         .context("redacted GitHub settings snapshot does not satisfy its closed schema")?;
-    let evaluation = depgraph_core::evaluate_github_settings(&desired, &snapshot)?;
+    let evaluation = governance::evaluate_github_settings(&desired, &snapshot)?;
     fs::write(
         output,
         format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
@@ -3345,7 +3376,7 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
         )
     })?;
 
-    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+    if evaluation.decision == governance::PublicReadinessDecision::Reject {
         bail!(
             "GitHub settings verification rejected; redacted evaluation={}",
             output.display()
@@ -3360,10 +3391,10 @@ fn github_settings_verify(snapshot_path: &Path, output: &Path) -> Result<()> {
 
 fn public_readiness_verify(
     bundle_path: &Path,
-    expected: depgraph_core::PublicReadinessExpectedState,
+    expected: governance::PublicReadinessExpectedState,
     output: &Path,
 ) -> Result<()> {
-    let bundle: depgraph_core::PublicReadinessBundle =
+    let bundle: governance::PublicReadinessBundle =
         serde_json::from_slice(&fs::read(bundle_path).with_context(|| {
             format!(
                 "failed to read public readiness bundle {}",
@@ -3371,7 +3402,7 @@ fn public_readiness_verify(
             )
         })?)
         .context("public readiness bundle does not satisfy its closed schema")?;
-    let evaluation = depgraph_core::evaluate_public_readiness(&bundle, &expected)?;
+    let evaluation = governance::evaluate_public_readiness(&bundle, &expected)?;
     fs::write(
         output,
         format!("{}\n", serde_json::to_string_pretty(&evaluation)?),
@@ -3383,7 +3414,7 @@ fn public_readiness_verify(
         )
     })?;
 
-    if evaluation.decision == depgraph_core::PublicReadinessDecision::Reject {
+    if evaluation.decision == governance::PublicReadinessDecision::Reject {
         bail!(
             "public readiness verification rejected; redacted evaluation={}",
             output.display()
@@ -5730,6 +5761,48 @@ mod tests {
     }
 
     #[test]
+    fn build_selects_workspace_or_named_packages() -> Result<()> {
+        assert_eq!(
+            super::rust_build_args(true, &[])?,
+            [
+                "build",
+                "--workspace",
+                "--exclude",
+                "xtask",
+                "--locked",
+                "--release"
+            ]
+        );
+        let cli = <Cli as clap::Parser>::try_parse_from([
+            "cargo-xtask",
+            "build",
+            "--release",
+            "-p",
+            "depgraph-cli",
+            "--package",
+            "depgraph-rust-worker",
+        ])?;
+        let Task::Build { release, packages } = cli.command else {
+            panic!("build must parse as Task::Build");
+        };
+        assert!(release);
+        assert_eq!(
+            super::rust_build_args(release, &packages)?,
+            [
+                "build",
+                "-p",
+                "depgraph-cli",
+                "-p",
+                "depgraph-rust-worker",
+                "--locked",
+                "--release"
+            ]
+        );
+        assert!(super::rust_build_args(false, &["xtask".to_owned()]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn japanese_readme_shared_contract_drift_is_rejected() -> Result<()> {
         use super::project_metadata::{
             JapaneseDocumentation, readme_cli_examples, verify_japanese_documentation_contract,
@@ -5841,10 +5914,37 @@ mod tests {
         release_post_publish_evidence(request)
     }
 
+    fn captured_ci_with_synthetic_native_success() -> Result<Value> {
+        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
+        let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        // The real current run skipped the optional native package. Retain that
+        // raw fixture and borrow its successful display identity from the older
+        // real Full CI capture only for synthetic admission tests.
+        let historical: Value =
+            serde_json::from_str(include_str!("../fixtures/full-ci-run-34682206659.json"))?;
+        let native = historical["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| {
+                job["name"] == "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)"
+            })
+            .expect("captured native package job");
+        assert_eq!(native["conclusion"], "success");
+        let skipped = input["jobs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|job| job["name"] == "extra-native-package")
+            .expect("captured skipped native package job");
+        assert_eq!(skipped["conclusion"], "skipped");
+        *skipped = native.clone();
+        Ok(input)
+    }
+
     #[test]
     fn full_ci_selection_skips_newer_ineligible_runs_and_chooses_latest_valid() -> Result<()> {
-        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
-        let mut valid: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let mut valid = captured_ci_with_synthetic_native_success()?;
         let source_sha = valid["head_sha"].as_str().unwrap().to_owned();
         valid["head_branch"] = json!("main");
         let candidate = |id: u64| {
@@ -5908,16 +6008,20 @@ mod tests {
             .expect("captured source")
             .to_owned();
         assert!(validate_full_ci_run(&fixture, &source_sha).is_err());
-        // The fixture is the current Full CI job inventory. The original capture
-        // included an Intel macOS extra-native-package job; that job is no longer
-        // required. Change only the branch in this synthetic admission test.
+        // A main run with the captured skipped native job must still fail.
         input["head_branch"] = json!("main");
         let temp = tempfile::tempdir()?;
         let eligible = temp.path().join("main-full-ci.json");
         fs::write(&eligible, serde_json::to_vec(&input)?)?;
+        assert!(validate_full_ci_run(&eligible, &source_sha).is_err());
+        input = captured_ci_with_synthetic_native_success()?;
+        input["head_branch"] = json!("main");
+        fs::write(&eligible, serde_json::to_vec(&input)?)?;
         let run = validate_full_ci_run(&eligible, &source_sha)?;
-        assert_eq!(run.jobs.len(), 10);
+        assert_eq!(run.jobs.len(), 12);
         for name in [
+            "go-loader-scope (bigpkg)",
+            "go-loader-scope (fanout)",
             "go-macos",
             "extra-native-package (ubuntu-24.04-arm, aarch64-unknown-linux-gnu)",
         ] {
@@ -5966,8 +6070,8 @@ mod tests {
 
     #[test]
     fn full_ci_job_identity_rejects_the_stale_linux_display_name() -> Result<()> {
-        let fixture = workspace_root().join(super::CURRENT_FULL_CI_RUN_FIXTURE_PATH);
-        let mut input: Value = serde_json::from_slice(&fs::read(fixture)?)?;
+        let mut input = captured_ci_with_synthetic_native_success()?;
+        let source_sha = input["head_sha"].as_str().unwrap().to_owned();
         input["head_branch"] = json!("main");
         let linux = input["jobs"]
             .as_array_mut()
@@ -5983,7 +6087,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let stale = temp.path().join("stale-full-ci.json");
         fs::write(&stale, serde_json::to_vec(&input)?)?;
-        let error = validate_full_ci_run(&stale, "04fb7163d5e2139811a2e69e2a9978cfeb6e87dc")
+        let error = validate_full_ci_run(&stale, &source_sha)
             .expect_err("stale implicit matrix job identity must fail closed");
         assert_eq!(
             error.to_string(),
@@ -6278,7 +6382,7 @@ mod tests {
                 "CARGO_PROFILE_TEST_DEBUG: \"1\"",
             ),
             ci.replacen(
-                "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+                "          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n",
                 "          key: rust\n",
                 1,
             ),
@@ -6919,51 +7023,48 @@ jobs:
             } if snapshot == snapshot_path && output == output_path
         ));
 
-        let desired = depgraph_core::parse_github_settings_desired(include_bytes!(
+        let desired = crate::governance::parse_github_settings_desired(include_bytes!(
             "../../.github/settings-desired-v1.json"
         ))?;
-        let allow_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
-            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+        let allow_snapshot = crate::governance::GitHubSettingsApiSnapshot {
+            collection_status: crate::governance::GitHubSettingsCollectionStatus::Complete,
             settings: Some(desired.clone()),
         };
         fs::write(&snapshot_path, serde_json::to_vec(&allow_snapshot)?)?;
         github_settings_verify(&snapshot_path, &output_path)?;
-        let allow: depgraph_core::GitHubSettingsEvaluation =
+        let allow: crate::governance::GitHubSettingsEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             allow.decision,
-            depgraph_core::PublicReadinessDecision::Allow
+            crate::governance::PublicReadinessDecision::Allow
         );
         assert!(allow.drift.is_empty());
 
         let mut drifted = desired;
-        drifted.rulesets[0].enforcement = depgraph_core::GitHubRulesetEnforcement::Disabled;
-        let reject_snapshot = depgraph_core::GitHubSettingsApiSnapshot {
-            collection_status: depgraph_core::GitHubSettingsCollectionStatus::Complete,
+        drifted.rulesets[0].enforcement = crate::governance::GitHubRulesetEnforcement::Disabled;
+        let reject_snapshot = crate::governance::GitHubSettingsApiSnapshot {
+            collection_status: crate::governance::GitHubSettingsCollectionStatus::Complete,
             settings: Some(drifted),
         };
         fs::write(&snapshot_path, serde_json::to_vec(&reject_snapshot)?)?;
         let error = github_settings_verify(&snapshot_path, &output_path).unwrap_err();
         assert!(error.to_string().contains("verification rejected"));
-        let reject: depgraph_core::GitHubSettingsEvaluation =
+        let reject: crate::governance::GitHubSettingsEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             reject.decision,
-            depgraph_core::PublicReadinessDecision::Reject
+            crate::governance::PublicReadinessDecision::Reject
         );
         assert!(
-            reject
-                .drift
-                .iter()
-                .any(|drift| drift.reason
-                    == depgraph_core::GitHubSettingsDriftReason::RulesetDisabled)
+            reject.drift.iter().any(|drift| drift.reason
+                == crate::governance::GitHubSettingsDriftReason::RulesetDisabled)
         );
         Ok(())
     }
 
     fn public_readiness_fixture() -> (
-        depgraph_core::PublicReadinessBundle,
-        depgraph_core::PublicReadinessExpectedState,
+        crate::governance::PublicReadinessBundle,
+        crate::governance::PublicReadinessExpectedState,
     ) {
         const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
         const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -6971,9 +7072,9 @@ jobs:
         const HASH_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         const HASH_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-        let mut manifest = depgraph_core::PublicReadinessEvidenceManifest {
-            schema_version: depgraph_core::PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION.into(),
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let mut manifest = crate::governance::PublicReadinessEvidenceManifest {
+            schema_version: crate::governance::PUBLIC_READINESS_EVIDENCE_SCHEMA_VERSION.into(),
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -6982,12 +7083,12 @@ jobs:
             generated_at: "2026-07-26T00:02:00Z".into(),
             evidence: Vec::new(),
         };
-        let input_digest = depgraph_core::public_readiness_evidence_input_digest(&manifest);
-        manifest.evidence = depgraph_core::PUBLIC_READINESS_GATE_IDS
+        let input_digest = crate::governance::public_readiness_evidence_input_digest(&manifest);
+        manifest.evidence = crate::governance::PUBLIC_READINESS_GATE_IDS
             .iter()
             .enumerate()
             .map(|(index, gate_id)| {
-                let mut evidence = depgraph_core::PublicReadinessEvidence {
+                let mut evidence = crate::governance::PublicReadinessEvidence {
                     gate_id: (*gate_id).into(),
                     evidence_digest: String::new(),
                     input_digest: input_digest.clone(),
@@ -6997,30 +7098,30 @@ jobs:
                     producer_identity: "team:readiness-producers".into(),
                     approver_role: "independent-code-reviewer".into(),
                     approver_identity: "team:readiness-gate-reviewers".into(),
-                    tool: depgraph_core::PublicReadinessToolIdentity {
+                    tool: crate::governance::PublicReadinessToolIdentity {
                         name: "readiness-auditor".into(),
                         version: "1.0.0".into(),
                         acquisition_digest: HASH_B.into(),
                         configuration_digest: HASH_C.into(),
                     },
-                    findings: depgraph_core::PublicReadinessFindingSummary {
+                    findings: crate::governance::PublicReadinessFindingSummary {
                         resolved: 0,
                         unresolved: 0,
                     },
                 };
                 evidence.evidence_digest =
-                    depgraph_core::public_readiness_evidence_digest(&evidence).unwrap();
+                    crate::governance::public_readiness_evidence_digest(&evidence).unwrap();
                 evidence
             })
             .collect();
         let evidence_manifest_digest =
-            depgraph_core::canonical_public_readiness_digest(&manifest).unwrap();
+            crate::governance::canonical_public_readiness_digest(&manifest).unwrap();
         let gates = manifest
             .evidence
             .iter()
-            .map(|evidence| depgraph_core::PublicReadinessGate {
+            .map(|evidence| crate::governance::PublicReadinessGate {
                 id: evidence.gate_id.clone(),
-                decision: depgraph_core::PublicReadinessDecision::Allow,
+                decision: crate::governance::PublicReadinessDecision::Allow,
                 evidence_digest: evidence.evidence_digest.clone(),
                 producer_role: evidence.producer_role.clone(),
                 producer_identity: evidence.producer_identity.clone(),
@@ -7028,9 +7129,9 @@ jobs:
                 approver_identity: evidence.approver_identity.clone(),
             })
             .collect();
-        let mut record = depgraph_core::PublicReadinessRecord {
-            schema_version: depgraph_core::PUBLIC_READINESS_SCHEMA_VERSION.into(),
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let mut record = crate::governance::PublicReadinessRecord {
+            schema_version: crate::governance::PUBLIC_READINESS_SCHEMA_VERSION.into(),
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -7038,12 +7139,12 @@ jobs:
             release_gate_digest: HASH_D.into(),
             evidence_manifest_digest,
             gates,
-            decision: depgraph_core::PublicReadinessDecision::Allow,
+            decision: crate::governance::PublicReadinessDecision::Allow,
             decided_at: "2026-07-26T00:04:00Z".into(),
             accountable_role: "tamat-llc-organization-owner".into(),
-            approvals: depgraph_core::PUBLIC_READINESS_FINAL_APPROVAL_ROLES
+            approvals: crate::governance::PUBLIC_READINESS_FINAL_APPROVAL_ROLES
                 .iter()
-                .map(|role| depgraph_core::PublicReadinessApproval {
+                .map(|role| crate::governance::PublicReadinessApproval {
                     role: (*role).into(),
                     identity: format!("team:{role}s"),
                     approved_at: "2026-07-26T00:03:00Z".into(),
@@ -7055,7 +7156,7 @@ jobs:
             .approvals
             .iter()
             .map(|approval| {
-                depgraph_core::public_readiness_approval_statement_digest(
+                crate::governance::public_readiness_approval_statement_digest(
                     &record,
                     &approval.role,
                     &approval.identity,
@@ -7065,8 +7166,8 @@ jobs:
         for (approval, statement_digest) in record.approvals.iter_mut().zip(statement_digests) {
             approval.statement_digest = statement_digest;
         }
-        let expected = depgraph_core::PublicReadinessExpectedState {
-            repository: depgraph_core::PUBLIC_READINESS_REPOSITORY.into(),
+        let expected = crate::governance::PublicReadinessExpectedState {
+            repository: crate::governance::PUBLIC_READINESS_REPOSITORY.into(),
             candidate_commit: COMMIT.into(),
             audited_refs_digest: HASH_A.into(),
             github_settings_digest: HASH_B.into(),
@@ -7074,7 +7175,7 @@ jobs:
             release_gate_digest: HASH_D.into(),
         };
         (
-            depgraph_core::PublicReadinessBundle {
+            crate::governance::PublicReadinessBundle {
                 record,
                 evidence_manifest: manifest,
             },
@@ -7114,11 +7215,11 @@ jobs:
         ));
 
         public_readiness_verify(&bundle_path, expected.clone(), &output_path)?;
-        let allow: depgraph_core::PublicReadinessEvaluation =
+        let allow: crate::governance::PublicReadinessEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             allow.decision,
-            depgraph_core::PublicReadinessDecision::Allow
+            crate::governance::PublicReadinessDecision::Allow
         );
         assert!(allow.reasons.is_empty());
 
@@ -7127,16 +7228,16 @@ jobs:
             "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into();
         let error = public_readiness_verify(&bundle_path, stale, &output_path).unwrap_err();
         assert!(error.to_string().contains("verification rejected"));
-        let reject: depgraph_core::PublicReadinessEvaluation =
+        let reject: crate::governance::PublicReadinessEvaluation =
             serde_json::from_slice(&fs::read(&output_path)?)?;
         assert_eq!(
             reject.decision,
-            depgraph_core::PublicReadinessDecision::Reject
+            crate::governance::PublicReadinessDecision::Reject
         );
         assert!(
             reject
                 .reasons
-                .contains(&depgraph_core::PublicReadinessRejectionReason::CandidateStateStale)
+                .contains(&crate::governance::PublicReadinessRejectionReason::CandidateStateStale)
         );
         Ok(())
     }
@@ -7634,14 +7735,16 @@ jobs:
         );
         assert_eq!(
             RELEASE_CARGO_BUILD_TARGETS,
-            [
-                (
-                    &["depgraph-mcp", "depgraph-operation", "depgraph-rust-worker"][..],
-                    None,
-                    None,
-                ),
-                (&["depgraph-cli"][..], Some("depgraph"), Some("packaged")),
-            ]
+            [(
+                &[
+                    "depgraph-mcp",
+                    "depgraph-operation",
+                    "depgraph-rust-worker",
+                    "depgraph-cli",
+                ][..],
+                None,
+                Some("depgraph-cli/packaged"),
+            )]
         );
         // Every packaged executable must be produced by these invocations
         // alone, because package() no longer runs a workspace release build.
@@ -7676,7 +7779,7 @@ jobs:
     #[test]
     fn native_smoke_pins_match_recorded_native_observations() {
         let evidence: Value = serde_json::from_str(include_str!(
-            "../fixtures/native-smoke-v0.7.3-observations.json"
+            "../fixtures/native-smoke-v0.7.4-observations.json"
         ))
         .unwrap();
         assert_eq!(evidence["version"], VERSION);
@@ -7691,24 +7794,24 @@ jobs:
             let observed = observations[0];
             let (run, job, source_commit) = match *target {
                 "aarch64-apple-darwin" => (
-                    40140403500_u64,
-                    121010752079_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280001933_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "aarch64-unknown-linux-gnu" => (
-                    40140403500_u64,
-                    121010752185_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002101_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "x86_64-pc-windows-msvc" => (
-                    40140403500_u64,
-                    121010752006_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002158_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 "x86_64-unknown-linux-gnu" => (
-                    40140403500_u64,
-                    121010752168_u64,
-                    "eae859f83dd92a2b200a55f5feb2f987c799d625",
+                    41446265187_u64,
+                    125280002033_u64,
+                    "67ff1841731d6d4241fe9a38b8de1082694f9dcf",
                 ),
                 _ => panic!("missing recorded native job for {target}"),
             };

@@ -37,3 +37,26 @@ That small increase in the existing resolver is explicitly accepted for these
 fixes. Newly added declaration-loader helpers and importer parsing helpers were
 split until none introduced a complexity finding. Gate scripts and thresholds
 remain unchanged.
+
+## Reviewed refresh: Fallow 3.34.0 duplication fingerprints (2026-10-29)
+
+Fallow 3.33.0 changed how `fallow dupes --baseline` fingerprints a clone that
+stops inside a block (fallow-rs/fallow#3290). Fallow 3.19.0 gave such groups a
+shared `dup:<16hex>-N` key, and the old `normalized_clone_fingerprints`
+stored 90 of its 102 groups that way. Fallow 3.23.0 already stated that these
+legacy keys are deliberately not aliased to the new ones, and 3.34.0 offers no
+migration, so under 3.34.0 only the 12 groups with an ordinary `dup:<8hex>`
+key still matched. `dupes.json` was regenerated with the command above; the
+source did not change. All 102 old `clone_fingerprints` entries are present in
+the new file.
+
+The refreshed file records 103 groups. 102 have exactly the line ranges that
+Fallow 3.19.0 reports for the same source. In the old file, 40 range strings
+were stale after later edits; each pairs with a new range of the same files and
+span lengths shifted by a constant offset, and Fallow 3.19.0 matched them by
+fingerprint. The one added group,
+`src/typescript-compiler.ts:908-912|src/typescript-compiler.ts:985-989`, is
+existing code that 3.34.0 detects because it no longer filters method chains
+after a call with a callback (fallow-rs/fallow#3491); 3.33.1 still reports
+102 groups. That existing duplication is accepted here. `health.json` passes
+unchanged under 3.34.0, and no threshold or exclusion was changed.

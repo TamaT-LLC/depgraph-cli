@@ -66,7 +66,7 @@ go_ignore=(
 )
 
 # The Web job builds depgraph-cli and depgraph-core, which never depend on
-# these crates; depgraph-mcp-tools is a depgraph-cli dependency and stays.
+# these crates; depgraph-agent-contract is a depgraph-cli dependency and stays.
 web_ignore=(
   '^workers/rust/'
   '^crates/depgraph-mcp/'

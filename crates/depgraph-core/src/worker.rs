@@ -5,6 +5,7 @@ use std::{
     io::{Cursor, Write},
     path::{Path, PathBuf},
     process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -320,12 +321,38 @@ pub fn detect_adapters(root: &Path, _follow_symlinks: bool) -> Result<Vec<Adapte
     Ok(detected.into_iter().collect())
 }
 
+/// Set once by a packaged release executable before it locates any worker.
+/// It is never cleared, so a process that set it stays fail-closed.
+static RELEASE_MANIFEST_REQUIRED: AtomicBool = AtomicBool::new(false);
+
+/// Requires a release manifest for every later worker and Web build runtime
+/// lookup in this process. Without a manifest, those lookups stop with a
+/// security policy violation instead of reading the development override
+/// variables or the source checkout. The packaged `depgraph` binary calls this
+/// at the start of `main`; there is no way to turn the requirement off again.
+pub fn require_release_manifest() {
+    RELEASE_MANIFEST_REQUIRED.store(true, Ordering::SeqCst);
+}
+
+/// Whether [`require_release_manifest`] has been called in this process.
+pub fn release_manifest_required() -> bool {
+    RELEASE_MANIFEST_REQUIRED.load(Ordering::SeqCst)
+}
+
 pub fn locate_worker(adapter: AdapterKind) -> Result<WorkerSpec> {
     let executable = canonical_current_executable()?;
     locate_worker_for_executable(adapter, &executable)
 }
 
 fn locate_worker_for_executable(adapter: AdapterKind, executable: &Path) -> Result<WorkerSpec> {
+    locate_worker_for_executable_with_policy(adapter, executable, release_manifest_required())
+}
+
+fn locate_worker_for_executable_with_policy(
+    adapter: AdapterKind,
+    executable: &Path,
+    release_manifest_required: bool,
+) -> Result<WorkerSpec> {
     let executable_dir = executable.parent().unwrap_or(Path::new("."));
     if let Some(manifest_path) = release_manifest_path(executable_dir) {
         return locate_verified_bundled_worker_for_executable(
@@ -335,9 +362,7 @@ fn locate_worker_for_executable(adapter: AdapterKind, executable: &Path) -> Resu
         )
         .context("security policy violation: bundled release verification failed");
     }
-    if cfg!(feature = "packaged") || looks_like_packaged_layout(executable_dir) {
-        bail!("security policy violation: packaged installation is missing release-manifest.json");
-    }
+    deny_missing_release_manifest(release_manifest_required, executable_dir)?;
 
     // Overrides are a development/test affordance. Packaged installations
     // always have a release manifest and therefore take the verified branch
@@ -390,6 +415,20 @@ fn locate_web_build_runtime_for_executable(
     root: &Path,
     executable: &Path,
 ) -> Result<PathBuf> {
+    locate_web_build_runtime_for_executable_with_policy(
+        file_name,
+        root,
+        executable,
+        release_manifest_required(),
+    )
+}
+
+fn locate_web_build_runtime_for_executable_with_policy(
+    file_name: &str,
+    root: &Path,
+    executable: &Path,
+    release_manifest_required: bool,
+) -> Result<PathBuf> {
     if file_name.contains('/') || file_name.contains('\\') || !file_name.ends_with(".mjs") {
         bail!("security policy violation: invalid Web build runtime artifact name");
     }
@@ -434,9 +473,7 @@ fn locate_web_build_runtime_for_executable(
             })?;
         return verify_bundled_artifact(&release_root, artifact, "Web build runtime artifact");
     }
-    if cfg!(feature = "packaged") || looks_like_packaged_layout(executable_dir) {
-        bail!("security policy violation: packaged installation is missing release-manifest.json");
-    }
+    deny_missing_release_manifest(release_manifest_required, executable_dir)?;
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let candidate = repo_root.join("workers/web/dist").join(file_name);
     let candidate = candidate.canonicalize().with_context(|| {
@@ -555,6 +592,18 @@ fn release_manifest_path(executable_dir: &Path) -> Option<PathBuf> {
         candidates.push(release_root.join("release-manifest.json"));
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Stops a lookup that found no release manifest when the process requires
+/// one or the executable sits in a packaged `bin/` + `libexec/` layout.
+fn deny_missing_release_manifest(
+    release_manifest_required: bool,
+    executable_dir: &Path,
+) -> Result<()> {
+    if release_manifest_required || looks_like_packaged_layout(executable_dir) {
+        bail!("security policy violation: packaged installation is missing release-manifest.json");
+    }
+    Ok(())
 }
 
 fn looks_like_packaged_layout(executable_dir: &Path) -> bool {

@@ -251,3 +251,42 @@ func (request AnalysisUnitRequest) splitProfileProperties(outcome string) map[st
 		"analysis_loader_scope":       outcome,
 	}
 }
+
+// pruneStagedDeclarationNodes keeps a staged-bodies chunk from re-emitting the
+// whole package's declarations. Every chunk of the package type-checks the
+// declarations of all its files, so before this pass each chunk streamed every
+// symbol and type node of the package; with hundreds of chunks that repeated
+// the same nodes hundreds of times in the stream, the checkpoint, and ingest.
+//
+// A symbol or type node declared in a file this chunk does not own is dropped
+// unless a retained site or edge of this chunk names it as an endpoint. The
+// file is a reference path of the split binding, and the core assigns every
+// such path of a staged package to exactly one sibling chunk, whose own
+// declaration pass emits the node from the file it owns. Nodes are only
+// removed, never rewritten, so a node that several chunks still emit keeps
+// one serialization, and the union of the chunks stays the whole package's
+// node set.
+func (s *scannerState) pruneStagedDeclarationNodes() {
+	if s.analysisUnit == nil || !s.analysisUnit.stagedBodies() {
+		return
+	}
+	referencePaths := s.analysisUnit.Split.Loader.ReferencePaths
+	if len(referencePaths) == 0 {
+		return
+	}
+	declaredElsewhere := make(map[string]bool, len(referencePaths))
+	for _, referencePath := range referencePaths {
+		declaredElsewhere[referencePath] = true
+	}
+	referenced := s.referencedNodeIDs()
+	for nodeID, node := range s.nodes {
+		if node.Kind != "symbol" && node.Kind != "type" {
+			continue
+		}
+		sourcePath, _ := node.Properties["source_path"].(string)
+		if sourcePath == "" || s.ownsSourcePath(sourcePath) || !declaredElsewhere[cleanSlash(sourcePath)] || referenced[nodeID] {
+			continue
+		}
+		delete(s.nodes, nodeID)
+	}
+}

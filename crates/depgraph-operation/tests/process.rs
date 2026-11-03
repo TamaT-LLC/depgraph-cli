@@ -7,10 +7,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use depgraph_agent_contract::LogicalRepositoryId;
 use depgraph_core::{
     DepgraphCapability, DepgraphCapabilitySet, DepgraphServiceConfig, DepgraphServiceLimits,
 };
-use depgraph_mcp_tools::LogicalRepositoryId;
 use depgraph_operation::{
     OPERATION_RUNNER_STARTUP_CONTRACT, OperationJournal, OperationKind, OperationOutcome,
     OperationRunnerLauncher, RunnerStartupConfig, SubmitRequest, operation_journal_path,

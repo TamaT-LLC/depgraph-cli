@@ -19,6 +19,7 @@ use crate::{
     analysis_checkpoint::{
         ScanBuildCache, StagedUnitCheckpoint, UnitCheckpointKey, UnitCheckpointStore,
     },
+    cache::ToolFingerprintMemo,
     cancellation::CancellationToken,
     config::Config,
     scan::ScanCacheMode,
@@ -532,6 +533,8 @@ pub(crate) struct AnalysisExecutionContext<'a> {
     pub config: &'a Config,
     pub cache_mode: ScanCacheMode,
     pub cancellation: &'a CancellationToken,
+    /// Worker artifact and toolchain identities memoized for this scan.
+    pub tool_fingerprints: &'a ToolFingerprintMemo,
 }
 
 pub(crate) async fn execute_analysis_units<F, V>(
@@ -596,6 +599,7 @@ where
         config,
         cache_mode,
         cancellation,
+        tool_fingerprints: _,
     } = *context;
     let checkpoints = if cache_mode == ScanCacheMode::Enabled {
         store.database_path().and_then(|path| {
@@ -1428,6 +1432,7 @@ for (const event of [
             config: &config,
             cache_mode: ScanCacheMode::Disabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let store_path = temp.path().join("store.sqlite");
         let mut store = Store::open(&store_path)?;
@@ -1467,6 +1472,7 @@ for (const event of [
             config: &explicit_config,
             cache_mode: ScanCacheMode::Disabled,
             cancellation: &explicit_cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let explicit_store_path = temp.path().join("explicit-budget.sqlite");
         let mut explicit_store = Store::open(&explicit_store_path)?;
@@ -1673,6 +1679,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let mut store = Store::open(&store_path)?;
         let first =
@@ -1803,6 +1810,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let mut store = Store::open(&store_path)?;
         let first =
@@ -2020,6 +2028,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 config: &config,
                 cache_mode: ScanCacheMode::Enabled,
                 cancellation: &cancellation,
+                tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
             },
             work(false),
             consume,
@@ -2045,6 +2054,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 config: &config,
                 cache_mode: ScanCacheMode::Enabled,
                 cancellation: &cancellation,
+                tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
             },
             work(false),
             consume,
@@ -2069,6 +2079,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
                 config: &config,
                 cache_mode: ScanCacheMode::Enabled,
                 cancellation: &cancellation,
+                tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
             },
             work(true),
             consume,
@@ -2096,6 +2107,7 @@ for (const event of events) console.log(JSON.stringify({...common,...event}));
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let rejected = execute_analysis_units(
             &mut store,

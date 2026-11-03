@@ -211,8 +211,10 @@ and reproduces the control's nodes, sites, exact edges, evidence, and
 coverage. CHA `may_call` edges of a package batch are a declared subset of
 whole-program CHA: an interface call is resolved only against implementers
 in that batch's SSA program (`package-with-declaration-deps`). Resume
-replays every staged batch. CI uploads the per-unit table as
-`go-loader-scope-report`.
+replays every staged batch. CI runs the two fixtures as parallel legs of
+the `go-loader-scope` job (`DEPGRAPH_GO_LOADER_SCOPE_SCENARIOS=fanout` or
+`bigpkg`; the default `all` runs both) and uploads each leg's per-unit table
+as `go-loader-scope-report-fanout` and `go-loader-scope-report-bigpkg`.
 
 The original trial tree is not in CI and is a **required closer for epic
 #464**, not an optional follow-up. Public fixtures are necessary and not

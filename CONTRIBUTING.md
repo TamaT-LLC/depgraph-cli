@@ -117,6 +117,7 @@ the other shared release metadata.
 - `crates/depgraph-store`: SQLite migrations, immutable scan staging, ledger, and evidence persistence
 - `crates/depgraph-rustc-wrapper`: attested all-unit rustc wrapper and bounded start/terminal ledger emitter
 - `crates/depgraph-core` / `crates/depgraph-cli`: worker supervision, queries, export, doctor, and CLI UX
+- `crates/depgraph-contract-scan`: bounded static GraphQL, OpenAPI, Protobuf, and FFI contract extractors
 - `workers/rust`, `workers/go`, `workers/web`: ecosystem-native safe static adapters
 - `xtask`: reproducible build, full quality checks, release archives, checksums, SBOM, and license inventory
 

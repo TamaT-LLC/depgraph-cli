@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"sort"
@@ -327,4 +328,225 @@ func TestPackageLoaderBindingReportsWidenedOnSourceFallback(t *testing.T) {
 			t.Fatalf("profile property %s = %q, want %q", key, got, want)
 		}
 	}
+}
+
+// stagedNodeFixture is one package of three files: a.go and b.go call each
+// other across files, a.go declares a method on a type of c.go, b.go carries
+// a declaration nobody references, and c.go has no function bodies at all.
+func stagedNodeFixture(t *testing.T) string {
+	t.Helper()
+	return goLoaderTestFixture(t, map[string]string{
+		"go.mod": "module example.com/staged\n\ngo 1.26.1\n",
+		"p/a.go": `package p
+
+type A struct{ N int }
+
+func FA(n int) int { return FB(n) + 1 }
+
+func (t T) Method() int { return int(t) + Limit }
+`,
+		"p/b.go": `package p
+
+type Unused struct{ Flag bool }
+
+func FB(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return FA(n - 1)
+}
+
+func Lonely() string { return "lonely" }
+`,
+		"p/c.go": `package p
+
+type T int
+
+const Limit = 3
+
+var Shared = A{N: Limit}
+`,
+	})
+}
+
+// TestStagedBodiesChunksEmitOwnedAndEndpointNodesOnly runs the typed and the
+// semantic stage of one package as three staged-bodies chunks and as one
+// whole package-bound chunk. Each chunk emits the declaration nodes of the
+// files it owns plus the nodes its own sites and edges name, never the rest of
+// the package; every node is still emitted by at least one chunk, a node that
+// several chunks emit is serialized identically, and the union of the chunks
+// is the whole chunk's node, edge and site graph.
+func TestStagedBodiesChunksEmitOwnedAndEndpointNodesOnly(t *testing.T) {
+	root := stagedNodeFixture(t)
+	files := []string{"p/a.go", "p/b.go", "p/c.go"}
+	for _, stage := range []AnalysisUnitStage{AnalysisUnitStageTyped, AnalysisUnitStageSemantic} {
+		t.Run(string(stage), func(t *testing.T) {
+			base := AnalysisUnitRequest{
+				ContractVersion:    AnalysisUnitContractVersion,
+				UnitID:             "analysis-unit:staged",
+				Adapter:            AdapterName,
+				UnitRoot:           ".",
+				SourcePaths:        files,
+				Stage:              stage,
+				ContextPaths:       files,
+				ChunkID:            "whole",
+				ChunkCount:         1,
+				ContextFingerprint: "staged-context",
+			}
+			whole := base
+			whole.Split = splitTestPackageBinding("package", "whole", files, []string{"p"}, nil)
+			run := func(request AnalysisUnitRequest) Result {
+				t.Helper()
+				if err := request.Validate(); err != nil {
+					t.Fatalf("request %s: %v", request.ChunkID, err)
+				}
+				result, err := ScanWithAnalysisUnit(root, "", request)
+				if err != nil {
+					t.Fatalf("%s: %v", request.ChunkID, err)
+				}
+				if result.Profile.Properties["go_packages_status"] != "loaded" {
+					t.Skipf("constrained Go environment unavailable: %s", goLoaderDiagnosticSummary(result.Diagnostics))
+				}
+				if result.Profile.Properties["go_typed_stage_complete"] != "true" {
+					t.Fatalf("%s typed stage incomplete: %s", request.ChunkID, goLoaderDiagnosticSummary(result.Diagnostics))
+				}
+				return result
+			}
+			wholeResult := run(whole)
+			chunks := make([]Result, 0, len(files))
+			for index, owned := range files {
+				request := base
+				request.SourcePaths = []string{owned}
+				request.ChunkID = fmt.Sprintf("staged-%d", index)
+				request.ChunkIndex, request.ChunkCount = index, len(files)
+				references := make([]string, 0, len(files)-1)
+				for _, other := range files {
+					if other != owned {
+						references = append(references, other)
+					}
+				}
+				request.Split = splitTestPackageBinding("package", "staged_bodies", []string{owned}, []string{"p"}, references)
+				chunks = append(chunks, run(request))
+			}
+
+			wholeNodes := map[string]string{}
+			for _, node := range wholeResult.Nodes {
+				wholeNodes[node.ID] = stagedNodeJSON(t, node)
+			}
+			union := map[string]string{}
+			for index, result := range chunks {
+				owned := files[index]
+				endpoints := stagedEndpointIDs(result)
+				nodes := map[string]bool{}
+				for _, node := range result.Nodes {
+					nodes[node.ID] = true
+					encoded := stagedNodeJSON(t, node)
+					if previous, ok := union[node.ID]; ok && previous != encoded {
+						t.Fatalf("node %s differs between chunks:\n %s\n %s", node.ID, previous, encoded)
+					}
+					union[node.ID] = encoded
+					if node.Kind != "symbol" && node.Kind != "type" {
+						continue
+					}
+					sourcePath, _ := node.Properties["source_path"].(string)
+					if sourcePath != owned && !endpoints[node.ID] {
+						t.Fatalf("chunk %s emitted %s %s declared in %s that none of its sites or edges names", owned, node.Kind, node.DisplayName, sourcePath)
+					}
+				}
+				for id := range endpoints {
+					if !nodes[id] {
+						t.Fatalf("chunk %s references node %s without declaring it", owned, id)
+					}
+				}
+				if len(result.Nodes) >= len(wholeResult.Nodes) {
+					t.Fatalf("chunk %s emitted %d nodes, whole emitted %d: the package declarations were not pruned", owned, len(result.Nodes), len(wholeResult.Nodes))
+				}
+			}
+			if !reflect.DeepEqual(union, wholeNodes) {
+				for id, encoded := range wholeNodes {
+					if union[id] != encoded {
+						t.Errorf("whole node missing or different in the chunk union: %s", encoded)
+					}
+				}
+				for id, encoded := range union {
+					if _, ok := wholeNodes[id]; !ok {
+						t.Errorf("chunk union node absent from the whole chunk: %s", encoded)
+					}
+				}
+				t.FailNow()
+			}
+			// The declarations nobody references are emitted once, by the
+			// chunk that owns their file.
+			for _, name := range []string{"Unused", "Lonely"} {
+				emitted := 0
+				for _, result := range chunks {
+					for _, node := range result.Nodes {
+						if node.DisplayName == name && (node.Kind == "symbol" || node.Kind == "type") {
+							emitted++
+						}
+					}
+				}
+				if emitted != 1 {
+					t.Fatalf("%s was emitted by %d chunks, want only its owner", name, emitted)
+				}
+			}
+
+			edgeKeys := func(result Result) map[string]bool {
+				keys := map[string]bool{}
+				for _, edge := range result.Edges {
+					edge.ProfileID = ""
+					encoded, err := json.Marshal(edge)
+					if err != nil {
+						t.Fatal(err)
+					}
+					keys[string(encoded)] = true
+				}
+				return keys
+			}
+			unionEdges := map[string]bool{}
+			unionSites := map[string]string{}
+			for _, result := range chunks {
+				for key := range edgeKeys(result) {
+					unionEdges[key] = true
+				}
+				for _, site := range result.Sites {
+					unionSites[site.ID] = goLoaderSiteSummary(site)
+				}
+			}
+			if wholeEdges := edgeKeys(wholeResult); !reflect.DeepEqual(unionEdges, wholeEdges) {
+				t.Fatalf("edge union differs from the whole chunk: union=%d whole=%d", len(unionEdges), len(wholeEdges))
+			}
+			wholeSites := map[string]string{}
+			for _, site := range wholeResult.Sites {
+				wholeSites[site.ID] = goLoaderSiteSummary(site)
+			}
+			if !reflect.DeepEqual(unionSites, wholeSites) {
+				t.Fatalf("site union differs from the whole chunk: union=%d whole=%d", len(unionSites), len(wholeSites))
+			}
+		})
+	}
+}
+
+func stagedNodeJSON(t *testing.T, node Node) string {
+	t.Helper()
+	encoded, err := json.Marshal(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func stagedEndpointIDs(result Result) map[string]bool {
+	endpoints := map[string]bool{}
+	for _, edge := range result.Edges {
+		endpoints[edge.Source] = true
+		endpoints[edge.Target] = true
+	}
+	for _, site := range result.Sites {
+		endpoints[site.Source] = true
+		for _, target := range site.TargetIDs {
+			endpoints[target] = true
+		}
+	}
+	return endpoints
 }

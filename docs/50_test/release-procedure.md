@@ -7,9 +7,9 @@ PRと`main` pushでは高速CIを実行し、手動CIと`v*`タグではフル�
 
 | イベント | Workflow | 実行内容 | 目的 |
 | --- | --- | --- | --- |
-| PR | CI | Rust、Go、macOS Go、Web、compiler-precise hostile E2E（Rust は常に全ステップ。Go / macOS Go / Web は各ジョブの影響 path 変更時のみ、hostile は関連 path 変更時のみ重いステップを実行。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
-| `main` push | CI | Rust、Go、Web、compiler-precise hostile E2E（hostile 含む4ジョブを常時） | マージ結果の確認 |
-| `workflow_dispatch` | CI | 上記4ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
+| PR | CI | Rust、Go、macOS Go、Web、Go loader（bigpkg / fanout）、compiler-precise hostile E2E（Rust は常に全ステップ。Go / macOS Go / Web / Go loader は各ジョブの影響 path 変更時のみ、hostile は関連 path 変更時のみ重いステップを実行。main push / workflow_dispatch は常時） | マージ前の回帰検出 |
+| `main` push | CI | Rust、Go、macOS Go、Web、Go loader（bigpkg / fanout）、compiler-precise hostile E2E（7ジョブを常時） | マージ結果の確認 |
+| `workflow_dispatch` | CI | 上記7ジョブ（hostile 常時）、benchmark、Linux / macOS integration、Windows smoke | タグ作成前のフルCI |
 | `v*`タグのpush | Release | quality、hostile E2E、benchmark、全4 targetのarchiveとcompiler pack、aggregate verification | 配布物の構築と公開 |
 | `workflow_dispatch` | Release post-publish recovery（歴史的v0.5.0専用） | 固定済みv0.5.0 Release、元run、evidence、公開Linux archiveのread-only canary | 公開後orchestration失敗の復旧証明 |
 
@@ -24,7 +24,7 @@ workflow、Cargoのmanifestとlockfile、toolchain、xtask、scriptsなどの共
 ## リリース準備
 
 1. バージョン変更とrelease noteを一つのPRにまとめる。
-   今回のpatch releaseではbase versionを`0.7.3`とする。
+   今回のpatch releaseではbase versionを`0.7.4`とする。
 2. release noteを`docs/releases/<タグ名>.md`として追加する。
 3. タグ名をworkspace versionと一致する`vX.Y.Z`または`vX.Y.Z-rc.N`にする。
 4. `N`には先頭ゼロのない正整数を使う。
@@ -39,7 +39,7 @@ queryとprofileのdigestには製品・adapterのバージョンとnative target
 Release workflowは、タグ名と同名のrelease noteが存在し、タグ名とworkspace versionが一致する場合だけ公開へ進む。
 `v0.4.0`と`v0.4.0-rc.N`はcurrent packageでは拒否される。
 公開済み`v0.5.4`はStore schema `17`のimmutable baselineである。
-`v0.7.3`はv0.7.0のStore schema `19`、code-health契約／API、依存一覧の既定動作を維持するpatch releaseであり、baseline statusを`maintenance-ref-pinned`とする。
+`v0.7.4`はv0.7.0のStore schema `19`、code-health契約／API、依存一覧の既定動作を維持するpatch releaseであり、baseline statusを`maintenance-ref-pinned`とする。
 tag source、remote `main`、`refs/heads/release/0.7`、source tree、exact Full CI、固定Agent dogfood reportのいずれかが一致しなければ、default-branch source guardまたは`stable-release-gate-v2`がfail closedで拒否する。
 公開済み`v0.5.4`のtag、source SHA、asset、evidenceは履歴検証用に固定し、現行candidateのSHAとして再利用しない。
 
@@ -47,7 +47,7 @@ tag source、remote `main`、`refs/heads/release/0.7`、source tree、exact Full
 
 `main`へのマージを一時停止し、リリース対象commitを固定する。
 GitHubのActions画面で`CI`を選び、`Run workflow`から`main`を指定し、`extra_native_packages`を有効にして実行する。
-リリース用のFull CIは、GoのmacOS（Apple Silicon）検証とLinux ARM64の追加package検証を含む10ジョブすべての成功を要求する。Intel macOS（`macos-15-intel`）のジョブは廃止した。
+リリース用のFull CIは、GoのmacOS（Apple Silicon）検証、Go loaderのbigpkg / fanout、Linux ARM64の追加package検証を含む12ジョブすべての成功を要求する。Intel macOS（`macos-15-intel`）のジョブは廃止した。
 
 CLIを使う場合は次のように実行する。
 
@@ -82,8 +82,9 @@ validatorのjob identityを同時に更新する。期待値の定数からtest 
 API driftを検出できない。既知の実API応答
 `xtask/fixtures/v0.5.0-rc.6-full-ci-run-31867648482.json`を独立fixtureとして固定し、
 この8ジョブの履歴fixtureはbyteを固定したまま保持し、v0.6の公開証跡としては受理しない。
-現行10ジョブは`xtask/fixtures/full-ci-run-34682206659.json`に実API応答を固定する。
-これはブランチ検証の記録であり、リリース用mainのFull CIを代替しない。
+現行12ジョブは`xtask/fixtures/full-ci-run-40989224808.json`に実API応答を固定する。
+これは追加native packageがskippedのブランチ検証記録であり、リリース用mainのFull CIを代替しない。
+unit testの成功例だけは、旧`xtask/fixtures/full-ci-run-34682206659.json`のnative jobとmain branchを合成する。元のskipped jobはmainでも拒否する。
 unit testは元のbranchを拒否し、mainを模した入力でジョブ名の一致と欠損・skip・改変の拒否を検証する。
 
 ## リリースタグの作成
@@ -97,15 +98,15 @@ publish jobはlocal checkoutのtag refを信頼せず、GitHub Git Data APIか�
 `actions/checkout`の既定shallow tag checkoutはpeeled commitを同名のlocal tag refへ
 配置するため、local `git rev-parse <tag>^{tag}`では正しいremote annotated tagを検証
 できない。署名payloadとpeeled commitの検証にはremote tag object SHAだけを使う。
-v0.7.3の候補は`v0.7.3-rc.N`とし、修正後はRC番号を増やす。
+v0.7.4の候補は`v0.7.4-rc.N`とし、修正後はRC番号を増やす。
 push済みtagを移動・再利用しない。
 初回stable `v0.5.0`では、GA PRをmergeした後に`main`を一時freezeし、exact Full CIを通過した同一SHAで`refs/heads/release/0.5`を作成した。
 `v0.5.1`以降のpatch releaseでは、同じexact-source条件を維持したまま、既存の`release/0.5`をcandidateへfast-forwardする。
-v0.7.3では、既存の`refs/heads/release/0.7`をcandidateへfast-forwardし、signed tagと同じsource SHAへ固定する。
+v0.7.4では、既存の`refs/heads/release/0.7`をcandidateへfast-forwardし、signed tagと同じsource SHAへ固定する。
 次の例では、`release_tag`を実際のタグ名へ置き換える。
 
 ```bash
-release_tag="v0.7.3-rc.N" # stable tagは v0.7.3
+release_tag="v0.7.4-rc.N" # stable tagは v0.7.4
 candidate_record="$(git rev-parse --git-path depgraph-release-candidate)"
 test -f "$candidate_record"
 test ! -L "$candidate_record"
@@ -118,7 +119,7 @@ git fetch origin main
 test "$candidate" = "$(git ls-remote origin refs/heads/main | awk '{print $1}')"
 test -f "docs/releases/${release_tag}.md"
 
-if [[ "$release_tag" == "v0.7.3" ]]; then
+if [[ "$release_tag" == "v0.7.4" ]]; then
   maintenance="$(git ls-remote origin refs/heads/release/0.7 | awk '{print $1}')"
   if [[ -n "$maintenance" ]]; then
     git fetch origin refs/heads/release/0.7
@@ -130,7 +131,7 @@ if [[ "$release_tag" == "v0.7.3" ]]; then
   printf '%s\n' \
     release-baseline-v1 \
     repository=TamaT-LLC/depgraph-cli \
-    version=0.7.3 \
+    version=0.7.4 \
     commit="$candidate" |
     shasum -a 256
 fi
@@ -145,9 +146,9 @@ maintenance ref側で新しいmerge commitやcherry-pickを作らず、force-pus
 stableではfast-forwardと一致確認の後だけsigned annotated tagを同じSHAへpushする。
 default-branch source guardはRelease run要求時に三つのrefを照合し、不一致またはmaintenance refの404ならrunをcancelしてtagを削除する。
 API通信・認証・5xxや`main`取得不能は検証不能としてrunをfail closedでcancelする一方、signed tagは再試行用に保持し、ref不一致と混同しない。
-tag側のstable gateはGitHub APIから`main` headのexact ten-job Full CIを再取得する。
+tag側のstable gateはGitHub APIから`main` headのexact twelve-job Full CIを再取得する。
 製品価値の`agent-dogfood-report-v1`（SHA-256 `3e80eef4481e990984577b8269c5c2eee4c9f17df7a5b4a8ffd3648f6342f12b`）と、Issue #436のcode-health `agent-dogfood-report-v2`（SHA-256 `7cb90ae38161e375ac080f475de6c8ab36dc18afc3ce243f6cdf7306d759547f`）をそれぞれ14 gateで再計算する。
-exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.7.3.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
+exact commit、tree、baseline digest、Full CI、Release run、tag object、asset closureの最終記録は`stable-release-gate.json`と`release-post-publish-evidence-v0.7.4.json`であり、commitが自分自身のSHAをsourceへ埋め込む自己参照は使わない。
 
 タグのpushによってRelease workflowが起動する。
 Release workflowはタグ付きcommitから配布物を再構築するため、手動CIのartifactを公開には流用しない。
@@ -177,7 +178,7 @@ Apache-2.0 noticeを含む。`verify-release-assets`とstable gateの`mcp-five-t
 欠損、改変、version drift、target間schema driftを拒否する。
 
 公開済み`v0.5.4`のMCP sidecarは`mcp-package-smoke-v2`である。
-`v0.7.3`の各native jobは`mcp-package-smoke-v3`を使う。従来のprotocol/catalog、
+`v0.7.4`の各native jobは`mcp-package-smoke-v3`を使う。従来のprotocol/catalog、
 durable recovery、stdio purityに加え、`depgraph-agent-host-config-v1`からCodex、
 Claude Desktop、VS Codeのread-only設定をclean temporary homeで生成する。公開前smokeは
 closed synthetic `release-post-publish-evidence-v1`と別計算したtrusted digestを用い、
@@ -199,7 +200,7 @@ state削除までをclean home上で4 targetすべて検証する。Intel macOS 
 `-rc.N`を含むタグはprereleaseとして公開される。
 
 公開済み`v0.5.4`のstable gateは、公式`v0.4.0-rc.6` schema-13 fixtureの固定checksumを入力に、schema 17へtransactional migrationする履歴を固定する。
-`v0.7.3`のgateは同じfixtureをschema 19まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
+`v0.7.4`のgateは同じfixtureをschema 19まで移行し、legacy seal v1を検証してprovenance-aware seal v2を再構築する。
 どちらもcompleted graph identityとrollback copyのbyte不変を検証する。
 実運用ではwriterを停止し、Storeと操作ジャーナルのそれぞれでdatabaseとWAL/SHMを一組としてbackupし、checksumを記録する。
 操作ジャーナルもschema 5から6へ移行するため、rollbackではStoreと一緒に旧版の一式へ戻す。
@@ -222,13 +223,13 @@ safe scan reconnect、stdout purity、root seal、compiler semantic / rollback�
 
 さらに42点すべてについてpublic downloadとworkflow artifactのfilename、size、SHA-256
 が一致しなければ失敗する。`release-post-publish-evidence-v1` JSONは、candidate commit /
-tree、署名tag object、exact manual full-CI runと10 job、Release run、42 asset digest、
+tree、署名tag object、exact manual full-CI runと12 job、Release run、42 asset digest、
 aggregate digest、asset-set digestを記録する。最終jobはこのJSONを同じGitHub Releaseへ
 追加し、もう一度downloadしてbyte一致を確認してからsuccessになる。最終jobの
 job-scoped tokenは、Full CIのrun/jobを読むための`actions: read`と、Releaseへ成果物を
 公開するための`contents: write`だけを持つ。
 公開後検証は「その時点の最新run」を再選択せず、`stable-release-gate.json`が記録した
-同一`full_ci_run_id`を再取得し、SHA、branch、10 job、job-set digestまで一致させる。
+同一`full_ci_run_id`を再取得し、SHA、branch、12 job、job-set digestまで一致させる。
 
 最後にLinux x86-64の公開archiveを新しいdirectoryへ展開し、固定polyglot fixtureを
 公開`depgraph`でsafe scanする。GitHub release-asset APIからpost-publish evidenceの
@@ -339,9 +340,9 @@ workflowで残りの検証を完走できる。recoveryは元runをsuccessに見
 OS固有処理、toolchain、依存関係、package、release workflow、性能契約を変更するPRでは、マージ前にも`workflow_dispatch`で対象branchのフルCIを実行する。
 リリース時は`main`のフルCIを一度通し、そのexact commitへタグを作成する。
 
-## v0.7.3 patch release
+## v0.7.4 patch release
 
-v0.7.3 は main の `75f73a07` を基点に、製品と adapter の版、native smoke の実測値、リリースノートを更新する。
+v0.7.4 は main の `3b1c3a58` を基点に、製品と adapter の版、native smoke の実測値、リリースノートを更新する。
 公開済み v0.7.1 の署名 tag と source `26aacf9b839fd5ba9d824c2efcff2efc7084aec8` は履歴として固定する。
-v0.7.1 限定の性能 waiver は v0.7.3 に適用しない。
-`release/0.7` を exact Full CI が成功した main の candidate へ fast-forward してから、同じ source に署名 tag `v0.7.3` を作る。
+v0.7.1 限定の性能 waiver は v0.7.4 に適用しない。
+`release/0.7` を exact Full CI が成功した main の candidate へ fast-forward してから、同じ source に署名 tag `v0.7.4` を作る。

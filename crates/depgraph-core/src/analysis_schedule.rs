@@ -23,8 +23,8 @@ use crate::{
         AnalysisStage, measure_source_sizes, plan_analysis_split,
     },
     cache::{
-        ScanCachePreparation, fingerprint_adapters, fingerprint_scan_inputs,
-        fingerprint_toolchains, prepare_scan_cache,
+        ScanCachePreparation, ToolOutputCheck, fingerprint_adapters_with, fingerprint_scan_inputs,
+        fingerprint_toolchains_with, prepare_scan_cache,
     },
     repository_inventory::build_repository_file_inventory,
     scan::ScanCacheMode,
@@ -1081,9 +1081,17 @@ fn validate_work_inputs_with_execution_digest(
     let Some(key) = item.checkpoint_key.as_ref() else {
         return false;
     };
+    // Reuse trusts the probe outputs this scan recorded for unchanged tool
+    // artifacts. A checkpoint write re-runs the probes: the key it commits
+    // must describe the toolchain that produced the output, and a tool can
+    // select another toolchain without changing its own artifact.
+    let check = match validation {
+        AnalysisInputValidation::Reuse => ToolOutputCheck::Memoized,
+        AnalysisInputValidation::CheckpointWrite => ToolOutputCheck::Rerun,
+    };
     let execution_digest = forced_execution_digest
         .map(str::to_owned)
-        .or_else(|| execution_digest(context, &item.spec, profile_plan_id));
+        .or_else(|| execution_digest_checked(context, &item.spec, profile_plan_id, check));
     if execution_digest.as_deref() != Some(&key.execution_digest) {
         return false;
     }
@@ -1157,9 +1165,22 @@ fn execution_digest(
     spec: &WorkerSpec,
     profile_plan_id: &str,
 ) -> Option<String> {
+    execution_digest_checked(context, spec, profile_plan_id, ToolOutputCheck::Memoized)
+}
+
+/// The execution digest from the scan's memoized worker artifact and
+/// toolchain identities. Every call re-stats the artifacts; a changed stamp
+/// re-reads the artifact in full, so a replacement changes the digest.
+fn execution_digest_checked(
+    context: &AnalysisExecutionContext<'_>,
+    spec: &WorkerSpec,
+    profile_plan_id: &str,
+    check: ToolOutputCheck,
+) -> Option<String> {
     let workers = [(spec.adapter, spec.clone())];
-    let adapter = fingerprint_adapters(&workers).ok()?;
-    let toolchain = fingerprint_toolchains(context.root, &workers).ok()?;
+    let memo = context.tool_fingerprints;
+    let adapter = fingerprint_adapters_with(memo, &workers).ok()?;
+    let toolchain = fingerprint_toolchains_with(memo, context.root, &workers, check).ok()?;
     execution_digest_from_identities(context, spec, profile_plan_id, &adapter, &toolchain)
 }
 
@@ -1184,6 +1205,7 @@ fn root_digest(root: &Path) -> String {
 mod tests {
     use super::*;
     use crate::analysis_split::ANALYSIS_LOADER_SCOPE_CAPABILITY;
+    use crate::cache::{ToolFingerprintMemo, fingerprint_adapters, fingerprint_toolchains};
     use serde_json::Value;
 
     #[test]
@@ -1923,6 +1945,7 @@ mod tests {
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
 
         for adapter in [AdapterKind::Go, AdapterKind::Web] {
@@ -2013,6 +2036,7 @@ mod tests {
                 config: &changed_config,
                 cache_mode: context.cache_mode,
                 cancellation: context.cancellation,
+                tool_fingerprints: context.tool_fingerprints,
             };
             assert!(!validate_work_inputs(
                 &changed_context,
@@ -2053,6 +2077,136 @@ mod tests {
                 Some(&changed_execution),
             ));
         }
+        Ok(())
+    }
+
+    /// Within one scan the execution digest is computed once: reuse checks
+    /// only re-stat the worker and Go artifacts, and checkpoint writes re-run
+    /// `go version` without re-hashing. A worker replaced mid-scan is caught
+    /// by the next checkpoint write, and another scan recomputes everything.
+    #[cfg(unix)]
+    #[test]
+    fn execution_digest_memo_is_scan_scoped_and_catches_worker_replacement() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().join("repository");
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("main.go"), "package fixture\n")?;
+        let input_digest = fingerprint_scan_inputs(&root, None)?;
+        let proof = AnalysisInputProof::new(input_digest.clone());
+        let profile_plan_id = format!("profile-selection-plan:sha256:{}", "1".repeat(64));
+        let config = crate::Config::default();
+        let cancellation = crate::CancellationToken::new();
+        let artifact = fixture.path().join("go-worker");
+        std::fs::write(&artifact, "synthetic go worker v1\n")?;
+        let spec = WorkerSpec {
+            adapter: AdapterKind::Go,
+            program: artifact.clone().into_os_string(),
+            leading_args: Vec::new(),
+            display: "synthetic go worker".to_owned(),
+            artifact_path: artifact.clone(),
+            runtime_requirement: None,
+            expected_version: None,
+            release_attested: false,
+            attested_rust_sysroot: None,
+        };
+        let memo = ToolFingerprintMemo::without_racy_window();
+        let context = AnalysisExecutionContext {
+            root: &root,
+            scan_id: "execution-digest-memo",
+            config: &config,
+            cache_mode: ScanCacheMode::Enabled,
+            cancellation: &cancellation,
+            tool_fingerprints: &memo,
+        };
+        let execution = execution_digest(&context, &spec, &profile_plan_id)
+            .expect("the Go toolchain identity must be available in the test environment");
+        // The worker artifact and the Go runtime are each read once.
+        assert_eq!((memo.full_reads(), memo.tool_runs()), (2, 1));
+        assert_eq!(
+            Some(execution.clone()),
+            execution_digest_from_identities(
+                &context,
+                &spec,
+                &profile_plan_id,
+                &fingerprint_adapters(&[(AdapterKind::Go, spec.clone())])
+                    .expect("synthetic worker artifact must be fingerprintable"),
+                &fingerprint_toolchains(&root, &[(AdapterKind::Go, spec.clone())])
+                    .expect("Go toolchain must be fingerprintable"),
+            ),
+            "the memoized digest must equal a digest computed without the memo"
+        );
+
+        let unit_id = "go:semantic:chunk".to_owned();
+        let item = AnalysisWorkItem {
+            unit_id: unit_id.clone(),
+            request: Some(json!({
+                "contract_version": SOURCE_BATCH_CONTRACT,
+                "unit_id": unit_id,
+                "adapter": "go",
+                "unit_root": ".",
+                "source_paths": ["main.go"],
+                "context_paths": ["main.go"],
+                "auxiliary_paths": [],
+                "context_fingerprint": input_digest,
+                "stage": "semantic",
+                "chunk_id": "synthetic-chunk",
+                "chunk_index": 0,
+                "chunk_count": 1,
+            })),
+            checkpoint_key: Some(UnitCheckpointKey {
+                unit_id,
+                input_digest,
+                execution_digest: execution,
+                root_digest: root_digest(&root),
+                reference_digest: None,
+            }),
+            spec,
+        };
+        let validate = |context: &AnalysisExecutionContext<'_>, validation| {
+            validate_work_inputs(
+                context,
+                &item,
+                None,
+                &profile_plan_id,
+                Some(&proof),
+                validation,
+            )
+        };
+        for _ in 0..3 {
+            assert!(validate(&context, AnalysisInputValidation::Reuse));
+        }
+        assert_eq!(
+            (memo.full_reads(), memo.tool_runs()),
+            (2, 1),
+            "reuse checks must neither re-hash artifacts nor re-run `go version`"
+        );
+        assert!(validate(&context, AnalysisInputValidation::CheckpointWrite));
+        assert_eq!(
+            (memo.full_reads(), memo.tool_runs()),
+            (2, 2),
+            "a checkpoint write re-runs `go version` but keeps unchanged digests"
+        );
+
+        // The worker is replaced while the scan runs: same length, new inode.
+        let staged = fixture.path().join("go-worker.next");
+        std::fs::write(&staged, "synthetic go worker v2\n")?;
+        std::fs::rename(&staged, &artifact)?;
+        assert!(
+            !validate(&context, AnalysisInputValidation::CheckpointWrite),
+            "a checkpoint write must not commit output under the replaced worker's old key"
+        );
+        assert!(!validate(&context, AnalysisInputValidation::Reuse));
+        assert_eq!(memo.full_reads(), 3, "only the replaced worker is re-read");
+
+        // Another scan in the same process recomputes every identity.
+        std::fs::write(&artifact, "synthetic go worker v1\n")?;
+        let next_scan = ToolFingerprintMemo::without_racy_window();
+        let next_context = AnalysisExecutionContext {
+            tool_fingerprints: &next_scan,
+            ..context
+        };
+        assert!(validate(&next_context, AnalysisInputValidation::Reuse));
+        assert_eq!((next_scan.full_reads(), next_scan.tool_runs()), (2, 1));
         Ok(())
     }
 
@@ -2122,6 +2276,7 @@ mod tests {
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let artifact = fixture.path().join("go-worker");
         std::fs::write(&artifact, "synthetic go worker\n")?;
@@ -2352,6 +2507,7 @@ mod tests {
             config: &config,
             cache_mode: ScanCacheMode::Enabled,
             cancellation: &cancellation,
+            tool_fingerprints: &crate::cache::ToolFingerprintMemo::default(),
         };
         let artifact = fixture.path().join("go-worker");
         std::fs::write(&artifact, "synthetic go worker\n")?;

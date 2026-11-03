@@ -12,8 +12,10 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
+
+mod memo;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -182,7 +184,31 @@ impl RustToolchainSelection {
     }
 }
 
+/// Probes the toolchain once per distinct [`memo::ProbeKey`]. A cached
+/// selection is reused only while its verified commands still hash to the
+/// attested digests, and only fully verified selections are cached, so a
+/// transient probe failure (for example a timeout under load) is retried.
 pub(crate) fn probe_rust_toolchain(root: &Path) -> RustToolchainSelection {
+    let key = memo::ProbeKey::capture(root);
+    if let Some(cached) = key.as_ref().and_then(memo::cached_probe)
+        && cached
+            .commands()
+            .is_some_and(|commands| commands.verify_integrity().is_ok())
+    {
+        return cached;
+    }
+    let selection = probe_rust_toolchain_uncached(root);
+    if let Some(key) = key
+        && selection.kind == ToolchainSelectionKind::InstalledVerifiedBaseline
+        && selection.host_status() != ToolchainProbeStatus::Unavailable
+        && memo::ProbeKey::capture(root).as_ref() == Some(&key)
+    {
+        memo::remember_probe(key, selection.clone());
+    }
+    selection
+}
+
+fn probe_rust_toolchain_uncached(root: &Path) -> RustToolchainSelection {
     let host = probe_host_toolchain(root);
     if let Ok(installed) = probe_installed_baseline(root)
         && installed.status() == ToolchainProbeStatus::Compatible
@@ -484,17 +510,47 @@ fn parse_verbose_version(name: &str, output: &str) -> Result<ToolVersion> {
     })
 }
 
+/// Returns the SHA-256 attestation of a tool executable.
+///
+/// The digest is memoized under the identity of the opened file (device,
+/// inode, size, mtime and ctime), checked through the same handle the bytes
+/// would be read from. A replaced or rewritten executable therefore misses
+/// the cache and is hashed again, so the repeated digest checks around each
+/// probe and `cargo metadata` keep detecting mutation while only hashing an
+/// unchanged executable once per process.
 fn digest_tool(path: &Path) -> Result<String> {
     use std::fmt::Write as _;
 
+    let mut executable = fs::File::open(path).context("read tool executable for attestation")?;
+    let fingerprint = executable
+        .metadata()
+        .ok()
+        .and_then(|metadata| memo::FileFingerprint::from_metadata(path, &metadata));
+    if let Some(digest) = fingerprint.as_ref().and_then(memo::cached_digest) {
+        return Ok(digest);
+    }
+    let started = SystemTime::now();
+    #[cfg(test)]
+    tests::record_hash();
     // Stream the executable through the hasher: rustc alone is tens of MB,
     // and reading it whole would make every scan's peak heap carry a copy.
-    let mut executable = fs::File::open(path).context("read tool executable for attestation")?;
     let mut hasher = Sha256::new();
     io::copy(&mut executable, &mut hasher).context("read tool executable for attestation")?;
     let mut digest = String::from("sha256:");
     for byte in hasher.finalize() {
         write!(&mut digest, "{byte:02x}").expect("writing a digest to String cannot fail");
+    }
+    // Cache only bytes that provably did not change while they were read.
+    if let Some(fingerprint) = fingerprint
+        && fingerprint.settled_before(started)
+        && executable
+            .metadata()
+            .ok()
+            .and_then(|metadata| memo::FileFingerprint::from_metadata(path, &metadata))
+            .as_ref()
+            == Some(&fingerprint)
+    {
+        memo::remember_digest(fingerprint, digest.clone());
     }
     Ok(digest)
 }
@@ -700,6 +756,89 @@ fn read_bounded(mut input: impl Read, limit: usize) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::parse_verbose_version;
+    use std::cell::Cell;
+
+    thread_local! {
+        static HASHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Counts real SHA-256 passes on this thread; digests run on the calling
+    /// thread, so parallel tests cannot disturb each other's counts.
+    pub(super) fn record_hash() {
+        HASHES.with(|hashes| hashes.set(hashes.get() + 1));
+    }
+
+    fn hashes() -> usize {
+        HASHES.with(Cell::get)
+    }
+
+    /// Waits until freshly written files are older than the timestamp
+    /// granularity margin the digest cache requires.
+    #[cfg(unix)]
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_is_hashed_once_per_file_identity_and_again_after_replacement() {
+        use super::digest_tool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let tool = temp.path().join("tool");
+        std::fs::write(&tool, "first-content").unwrap();
+        settle();
+
+        let before = hashes();
+        let first = digest_tool(&tool).unwrap();
+        assert_eq!(digest_tool(&tool).unwrap(), first);
+        assert_eq!(hashes() - before, 1, "an unchanged tool is hashed once");
+
+        // Same size, new bytes: mtime and ctime move, so the cache misses.
+        std::fs::write(&tool, "other-content").unwrap();
+        let rewritten = digest_tool(&tool).unwrap();
+        assert_ne!(rewritten, first);
+        assert_eq!(hashes() - before, 2);
+
+        // A different size is a different identity as well.
+        settle();
+        std::fs::write(&tool, "longer replacement content").unwrap();
+        let resized = digest_tool(&tool).unwrap();
+        assert_ne!(resized, rewritten);
+        assert_eq!(hashes() - before, 3);
+
+        // Renaming a new file over the tool changes the inode.
+        settle();
+        let staged = temp.path().join("staged");
+        std::fs::write(&staged, "first-content").unwrap();
+        std::fs::rename(&staged, &tool).unwrap();
+        assert_eq!(digest_tool(&tool).unwrap(), first);
+        assert_eq!(hashes() - before, 4);
+
+        // Symlinked aliases share the canonical entry, like rustup proxies.
+        settle();
+        assert_eq!(digest_tool(&tool).unwrap(), first);
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&tool, &alias).unwrap();
+        assert_eq!(digest_tool(&alias).unwrap(), first);
+        assert_eq!(hashes() - before, 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn digest_cache_requires_a_settled_timestamp() {
+        use super::memo::FileFingerprint;
+        use std::time::{Duration, SystemTime};
+
+        let temp = tempfile::tempdir().unwrap();
+        let tool = temp.path().join("tool");
+        std::fs::write(&tool, "content").unwrap();
+        let metadata = std::fs::metadata(&tool).unwrap();
+        let fingerprint = FileFingerprint::from_metadata(&tool, &metadata).unwrap();
+        let changed = metadata.modified().unwrap();
+        assert!(!fingerprint.settled_before(changed));
+        assert!(fingerprint.settled_before(SystemTime::now() + Duration::from_secs(3)));
+    }
     #[cfg(unix)]
     use super::{
         PROBE_OUTPUT_LIMIT, PROBE_TIMEOUT, ToolchainProbeStatus, bounded_output,
@@ -810,6 +949,78 @@ mod tests {
                 .verify_integrity()
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_probes_hash_each_tool_once_and_still_reject_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repository");
+        let tools = temp.path().join("tools");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let root = root.canonicalize().unwrap();
+        let script = |name: &str, commit: &str| {
+            let path = tools.join(name);
+            std::fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '{} 1.93.1 (test)\\nrelease: 1.93.1\\ncommit-hash: {}\\nhost: test-host\\n'\n",
+                    name, commit,
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions).unwrap();
+            path
+        };
+        let rustc = script("rustc", crate::RUSTC_BASELINE_COMMIT);
+        let cargo = script("cargo", crate::CARGO_BASELINE_COMMIT);
+        settle();
+
+        let before = hashes();
+        let first = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
+        assert_eq!(
+            hashes() - before,
+            2,
+            "one probe hashes rustc and cargo once each"
+        );
+        let second = probe_resolved_toolchain(&root, &rustc, &cargo, PROBE_TIMEOUT).unwrap();
+        assert_eq!(second, first, "memoized digests keep the probe output");
+        assert_eq!(hashes() - before, 2, "an unchanged pair is not rehashed");
+
+        std::fs::write(&cargo, "#!/bin/sh\nexit 99\n").unwrap();
+        assert!(
+            first
+                .commands
+                .as_ref()
+                .expect("verified commands")
+                .verify_integrity()
+                .is_err()
+        );
+        assert_eq!(hashes() - before, 3, "the replaced cargo is hashed again");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_verified_selection_is_reused_without_rehashing() {
+        use super::{ToolchainSelectionKind, probe_rust_toolchain};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let first = probe_rust_toolchain(&root);
+        // Only hosts with the verified baseline installed produce a cacheable
+        // selection; elsewhere every scan probes again, as before.
+        if first.kind != ToolchainSelectionKind::InstalledVerifiedBaseline {
+            return;
+        }
+        let before = hashes();
+        let second = probe_rust_toolchain(&root);
+        assert_eq!(second, first);
+        assert_eq!(hashes() - before, 0);
     }
 
     #[cfg(unix)]

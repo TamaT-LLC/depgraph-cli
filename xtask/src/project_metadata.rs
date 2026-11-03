@@ -433,9 +433,9 @@ pub(crate) fn verify_workflow_policy_text(
                 || !workflow.contains("\n  pull_request:")
                 || !workflow.contains("\n  workflow_dispatch:")
                 || ![
-                    "\n  benchmark:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch'\n",
-                    "\n  integration:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
-                    "\n  windows-smoke:\n    needs: [rust, go, web]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
+                    "\n  benchmark:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch'\n",
+                    "\n  integration:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
+                    "\n  windows-smoke:\n    needs: [rust, go, web, go-loader-scope]\n    if: github.event_name == 'workflow_dispatch' && !inputs.benchmark_only\n",
                 ]
                 .iter()
                 .all(|required| workflow.contains(required))
@@ -470,6 +470,7 @@ pub(crate) fn verify_workflow_policy_text(
                 );
             }
             verify_ci_affected_scope_gates(workflow)?;
+            verify_e2e_build_alignment(workflow)?;
         }
         "release.yml" => {
             let stable_gate = workflow_job_block(workflow, "stable-gate")?;
@@ -737,8 +738,9 @@ fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
 
 /// The integration job builds the debug graph and then the release package on
 /// one hosted runner without `cargo clean` in between. Its resource policy is a
-/// matrix-scoped `Swatinem/rust-cache` entry, so the `-lld` Linux leg and the
-/// incremental/debug bounds never share a cache with `rust` or
+/// matrix-scoped `Swatinem/rust-cache` entry, keyed by the hash of Cargo.toml's
+/// `[profile.*]` tables (the `cargo-profile` step), so the `-lld` Linux leg and
+/// the incremental/debug bounds never share a cache with `rust` or
 /// `compiler-precise-hostile`; that entry also keeps `cache-on-failure: true` so
 /// a failed 30+ minute gate never forces the rerun to rebuild its dependencies
 /// from a cold cache. Around the heaviest gates the job reports both the
@@ -747,6 +749,9 @@ fn extra_native_package_is_manual_and_bounded(workflow: &str) -> Result<bool> {
 /// disk regression shows up in the log instead of as an opaque build failure.
 fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     let integration = workflow_job_block(workflow, "integration")?;
+    if !cargo_profile_step_precedes_rust_cache(integration) {
+        return Ok(false);
+    }
     let steps = integration.split("\n      - ").skip(1).collect::<Vec<_>>();
     let cache_steps = steps
         .iter()
@@ -756,7 +761,7 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
         return Ok(false);
     };
     if !cache_step.contains(
-        "\n          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n",
+        "\n          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n",
     ) || !workflow_block_has_line(cache_step, "          cache-on-failure: true")
     {
         return Ok(false);
@@ -788,6 +793,37 @@ fn integration_job_pins_resource_policy(workflow: &str) -> Result<bool> {
     }))
 }
 
+/// The `run:` line of the `cargo-profile` step that computes
+/// `steps.cargo-profile.outputs.hash` for the rust-cache keys.
+const CARGO_PROFILE_HASH_RUN: &str = r#"        run: echo "hash=$(awk '/^\[/{p=/^\[profile[.]/} p' Cargo.toml | git hash-object --stdin)" >> "$GITHUB_OUTPUT""#;
+
+/// Whether `job` runs exactly one `cargo-profile` step with
+/// [`CARGO_PROFILE_HASH_RUN`] before its rust-cache step. Without that step the
+/// key's `steps.cargo-profile.outputs.hash` expands to an empty string, so the
+/// key stops changing when a profile changes. The step is matched by its `id`
+/// and `run:` line only, since `web` also sets `working-directory: .`.
+fn cargo_profile_step_precedes_rust_cache(job: &str) -> bool {
+    let steps = job.split("\n      - ").skip(1).collect::<Vec<_>>();
+    let profile_steps = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.starts_with("id: cargo-profile\n")
+                || step.contains("\n        id: cargo-profile\n")
+        })
+        .collect::<Vec<_>>();
+    let [(profile, profile_step)] = profile_steps.as_slice() else {
+        return false;
+    };
+    let Some(cache) = steps
+        .iter()
+        .position(|step| step.starts_with("uses: Swatinem/rust-cache@"))
+    else {
+        return false;
+    };
+    workflow_block_has_line(profile_step, CARGO_PROFILE_HASH_RUN) && *profile < cache
+}
+
 /// The `target/` size line every integration disk report runs after `df -h`:
 /// free space alone cannot tell a `target/` blowup from a runner image change.
 const INTEGRATION_TARGET_SIZE_REPORT: &str =
@@ -795,13 +831,85 @@ const INTEGRATION_TARGET_SIZE_REPORT: &str =
 
 /// The jobs whose pull request steps `scripts/ci-affected-scope.sh` may skip:
 /// (job, scope passed to `decide`, label used in the step names, whether the
-/// job is a required check). A required check must never carry a job-level
-/// `if:`, or a skipped job would leave the check pending.
-const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 3] = [
+/// job must always run as a whole). A required check, or a job the dispatch
+/// jobs need, must never carry a job-level `if:`, or a skipped job would leave
+/// the check pending or skip its dependents.
+const CI_AFFECTED_SCOPE_JOBS: [(&str, &str, &str, bool); 4] = [
     ("go", "go", "go", true),
     ("go-macos", "go", "go-macos", false),
     ("web", "web", "web", true),
+    ("go-loader-scope", "web", "go-loader-scope", true),
 ];
+
+/// The jobs that run the e2e evidence gates from one shared rust-cache entry:
+/// `web` saves it and `go-loader-scope` only restores it.
+const E2E_CACHE_JOBS: [&str; 2] = ["web", "go-loader-scope"];
+
+/// The rust-cache key both [`E2E_CACHE_JOBS`] use. A shared key replaces the
+/// job-based key, and rust-cache does not hash the virtual root manifest (it
+/// is not a workspace member), so the hash of Cargo.toml's `[profile.*]` tables
+/// (the `cargo-profile` step), which carries the `e2e` profile, has to be part
+/// of the key itself.
+const E2E_CACHE_SHARED_KEY: &str =
+    "          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}";
+
+/// How CI invokes an e2e gate. xtask links depgraph-core, so running it under
+/// the same `e2e` profile as the CLI it builds lets both share one optimized
+/// build of the workspace crates instead of a dev build for xtask and an `e2e`
+/// build for the CLI.
+const E2E_XTASK_RUN: &str = "run: cargo run --locked --profile e2e -p xtask -- ";
+
+/// The xtask commands [`E2E_XTASK_RUN`] may run.
+const E2E_XTASK_TASKS: [&str; 3] = [
+    "resumable-analysis-e2e",
+    "health-range-e2e",
+    "go-loader-scope-e2e",
+];
+
+/// The e2e jobs must build the same units so the entry `web` saves restores
+/// in `go-loader-scope`: the same shared key, the same job-level env (every
+/// `CARGO*`/`RUST*` variable is hashed into rust-cache's key), every gate run
+/// through [`E2E_XTASK_RUN`], and no profile override.
+fn verify_e2e_build_alignment(workflow: &str) -> Result<()> {
+    let mut environments = Vec::new();
+    for job_name in E2E_CACHE_JOBS {
+        let job = workflow_job_block(workflow, job_name)?;
+        if job.matches("shared-key:").count() != 1
+            || !workflow_block_has_line(job, E2E_CACHE_SHARED_KEY)
+        {
+            bail!("CI {job_name} job must use the shared e2e rust-cache key");
+        }
+        if !cargo_profile_step_precedes_rust_cache(job) {
+            bail!("CI {job_name} job must hash the Cargo.toml profiles before rust-cache");
+        }
+        if job.contains(crate::e2e_profile::E2E_PROFILE_ENV) {
+            bail!("CI {job_name} job must build the e2e gates under the default profile");
+        }
+        let mut gates = 0;
+        for line in job.lines() {
+            let line = line.trim_start();
+            let line = line.strip_prefix("- ").unwrap_or(line);
+            if !line.starts_with("run:") || !line.contains("xtask") {
+                continue;
+            }
+            let pinned = line
+                .strip_prefix(E2E_XTASK_RUN)
+                .is_some_and(|task| E2E_XTASK_TASKS.contains(&task));
+            if !pinned {
+                bail!("CI {job_name} job must run its e2e gates through {E2E_XTASK_RUN:?}");
+            }
+            gates += 1;
+        }
+        if gates == 0 {
+            bail!("CI {job_name} job runs no e2e gate");
+        }
+        environments.push(job_env_entries(job)?);
+    }
+    if environments.windows(2).any(|pair| pair[0] != pair[1]) {
+        bail!("CI e2e jobs must declare the same job-level env to share one rust-cache entry");
+    }
+    Ok(())
+}
 
 /// The script and the CI step text that invokes it.
 const CI_AFFECTED_SCOPE_SCRIPT: &str = "scripts/ci-affected-scope.sh";
@@ -810,13 +918,27 @@ const CI_AFFECTED_SCOPE_TEST: &str = "scripts/tests/ci-affected-scope.test.mjs";
 const CI_DECIDE_GATE: &str = "        if: steps.decide.outputs.run == 'true'";
 const GO_MACOS_JOB_CONDITION: &str = "    if: ${{ !inputs.benchmark_only }}";
 
-/// Web evidence uploads that run whenever their producing step ran. When the
-/// decide step skips that producer, its outcome is `skipped` and the upload is
-/// skipped with it, so these need no decide gate of their own.
-const CI_WEB_OUTCOME_GATED_UPLOADS: [&str; 2] = [
-    "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
-    "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
+/// Evidence uploads that run whenever their producing step ran, by job. When
+/// the decide step skips that producer, its outcome is `skipped` and the upload
+/// is skipped with it, so these need no decide gate of their own.
+const CI_OUTCOME_GATED_UPLOADS: [(&str, &str); 2] = [
+    (
+        "go-loader-scope",
+        "        if: \"!cancelled() && steps.go_loader_scope_e2e.outcome != 'skipped'\"",
+    ),
+    (
+        "go-loader-scope",
+        "        if: \"!cancelled() && steps.health_range_e2e.outcome != 'skipped'\"",
+    ),
 ];
+
+/// Decided steps that run on one matrix leg only, by job. The health-range
+/// gate runs on the go-loader-scope fanout leg, which finishes well before the
+/// bigpkg leg and the web job.
+const CI_MATRIX_LEG_GATES: [(&str, &str); 1] = [(
+    "go-loader-scope",
+    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'",
+)];
 
 /// Paths that make every gated job run. Pinned verbatim against the arrays in
 /// `scripts/ci-affected-scope.sh`.
@@ -1002,10 +1124,10 @@ fn step_condition_is(step: &str, allowed: &[&str]) -> bool {
     matches!(conditions.as_slice(), [condition] if allowed.contains(&condition.as_str()))
 }
 
-/// Pull request path filtering for the Go, macOS Go, and Web jobs. Each gated
-/// job checks out full history, runs the canonical decide step, prints the
-/// canonical skip notice, and gates every remaining step on the decision (or,
-/// for the Web evidence uploads, on the producing step's outcome). The Rust job
+/// Pull request path filtering for the Go, macOS Go, Web, and Go loader-scope
+/// jobs. Each gated job checks out full history, runs the canonical decide
+/// step, prints the canonical skip notice, and gates every remaining step on
+/// the decision (or, for the evidence uploads, on the producing step's outcome). The Rust job
 /// stays unconditional because it owns the document-contract tests.
 fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
     if workflow.matches(CI_AFFECTED_SCOPE_DECIDE_RUN).count() != CI_AFFECTED_SCOPE_JOBS.len() {
@@ -1044,13 +1166,17 @@ fn verify_ci_affected_scope_gates(workflow: &str) -> Result<()> {
             bail!("CI {job_name} job has no checks behind its affected-scope gate");
         }
         let mut allowed = vec![CI_DECIDE_GATE];
-        if job_name == "web" {
-            allowed.extend(CI_WEB_OUTCOME_GATED_UPLOADS);
-        }
-        for step in rest {
-            let outcome_gated = CI_WEB_OUTCOME_GATED_UPLOADS
+        allowed.extend(
+            CI_OUTCOME_GATED_UPLOADS
                 .iter()
-                .any(|condition| workflow_block_has_line(step, condition));
+                .chain(&CI_MATRIX_LEG_GATES)
+                .filter(|(job, _)| *job == job_name)
+                .map(|(_, condition)| *condition),
+        );
+        for step in rest {
+            let outcome_gated = CI_OUTCOME_GATED_UPLOADS
+                .iter()
+                .any(|(_, condition)| workflow_block_has_line(step, condition));
             if !step_condition_is(step, &allowed)
                 || (outcome_gated && !step.starts_with("uses: actions/upload-artifact@"))
             {
@@ -1151,6 +1277,74 @@ fn verify_compiler_precise_hostile_ci_gate(ci_workflow: &str) -> Result<()> {
     for decision in &HOSTILE_DECISIONS {
         verify_hostile_decision_step(hostile, decision)?;
     }
+    // The compiler-pack smoke decision compares only this job's block of
+    // ci.yml, so a top-level env or defaults would reach the smoke unseen.
+    // The key is compared after YAML unquoting, so `"env":` is caught too.
+    if let Some(key) = HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS.iter().find(|key| {
+        ci_workflow
+            .lines()
+            .filter(|line| !line.starts_with([' ', '\t', '#']))
+            .filter_map(|line| line.split_once(':'))
+            .any(|(top_level, _)| yaml_scalar(top_level) == **key)
+    }) {
+        bail!(
+            "CI workflow must not set a top-level {key:?}: the compiler-pack smoke decision compares only the compiler-precise-hostile job"
+        );
+    }
+    verify_hostile_compiler_pack_smoke_prebuild(hostile)?;
+    Ok(())
+}
+
+const HOSTILE_XTASK_BUILD_STEP: [&str; 3] = [
+    "      - name: Build xtask for the exact Linux compiler-pack smoke",
+    "        if: steps.compiler-pack-smoke.outputs.run == 'true'",
+    "        run: cargo build --locked -p xtask",
+];
+const HOSTILE_COMPILER_PACK_SMOKE_STEP: [&str; 6] = [
+    "      - name: Exact Linux compiler-pack semantic release smoke",
+    "        if: steps.compiler-pack-smoke.outputs.run == 'true'",
+    "        env:",
+    "          DEPGRAPH_TARGET: x86_64-unknown-linux-gnu",
+    "          RUSTFLAGS: -C linker-features=-lld",
+    "        run: target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
+];
+
+/// The lines of a workflow step with comments and blank lines dropped.
+fn workflow_step_code_lines(step: &str) -> Vec<&str> {
+    step.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        })
+        .collect()
+}
+
+/// RUSTFLAGS is part of every unit's fingerprint, so `cargo xtask` under the
+/// smoke's `-lld` flag rebuilds xtask's whole graph. xtask is built first
+/// without RUSTFLAGS, and the smoke runs that binary directly so that only
+/// the cargo builds it spawns inherit the linker flag.
+fn verify_hostile_compiler_pack_smoke_prebuild(hostile: &str) -> Result<()> {
+    if job_env_entries(hostile)?
+        .iter()
+        .any(|entry| entry.contains("RUSTFLAGS"))
+    {
+        bail!("CI compiler-precise hostile job must not set RUSTFLAGS for every step");
+    }
+    let (build_start, build) = workflow_step_block(hostile, HOSTILE_XTASK_BUILD_STEP[0])?;
+    if workflow_step_code_lines(build) != HOSTILE_XTASK_BUILD_STEP {
+        bail!(
+            "CI compiler-precise hostile job must build xtask without RUSTFLAGS as {HOSTILE_XTASK_BUILD_STEP:?}"
+        );
+    }
+    let (smoke_start, smoke) = workflow_step_block(hostile, HOSTILE_COMPILER_PACK_SMOKE_STEP[0])?;
+    if workflow_step_code_lines(smoke) != HOSTILE_COMPILER_PACK_SMOKE_STEP {
+        bail!(
+            "CI compiler-precise hostile job must run the prebuilt xtask under -lld as {HOSTILE_COMPILER_PACK_SMOKE_STEP:?}"
+        );
+    }
+    if build_start >= smoke_start {
+        bail!("CI compiler-precise hostile job must build xtask before the compiler-pack smoke");
+    }
     Ok(())
 }
 
@@ -1159,6 +1353,9 @@ struct HostileDecision {
     header: &'static str,
     id: &'static str,
     pattern: &'static str,
+    /// The trimmed code lines that must follow the path filter up to the end
+    /// of the step. Blank lines and comments are not compared.
+    after_filter: &'static [&'static str],
 }
 
 /// Both decisions are pinned by step so that deleting one, or swapping its
@@ -1170,20 +1367,22 @@ const HOSTILE_DECISIONS: [HostileDecision; 2] = [
         pattern: concat!(
             r"^(Cargo\.(toml|lock)|crates/depgraph-core/|crates/depgraph-rustc-wrapper/|",
             r"crates/depgraph-rustc-query/|crates/depgraph-cli/|crates/depgraph-store/|",
-            r"crates/depgraph-mcp/|crates/depgraph-mcp-tools/|crates/depgraph-operation/|",
+            r"crates/depgraph-mcp/|crates/depgraph-agent-contract/|crates/depgraph-operation/|",
             r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
             r"docs/50_test/compiler-precise-hostile|\.github/workflows/ci\.yml)",
         ),
+        after_filter: &HOSTILE_FILTER_BRANCHES,
     },
     HostileDecision {
         header: "      - name: Decide whether the exact Linux compiler-pack smoke must run",
         id: "        id: compiler-pack-smoke",
+        // ci.yml is left out: the step compares the job block instead.
         pattern: concat!(
             r"^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|",
             r"crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|",
-            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
-            r"\.github/workflows/ci\.yml)",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile)",
         ),
+        after_filter: HOSTILE_SMOKE_AFTER_FILTER,
     },
 ];
 
@@ -1191,10 +1390,45 @@ const HOSTILE_RUN_TRUE: &str = r#"echo "run=true" >> "$GITHUB_OUTPUT""#;
 const HOSTILE_RUN_FALSE: &str = r#"echo "run=false" >> "$GITHUB_OUTPUT""#;
 const SHELL_ELSE: &str = "else";
 const SHELL_FI: &str = "fi";
-/// The trimmed lines that must follow the path filter, so a match runs the
-/// gated steps and anything else skips them.
+/// A match runs the gated steps and anything else skips them.
 const HOSTILE_FILTER_BRANCHES: [&str; 4] =
     [HOSTILE_RUN_TRUE, SHELL_ELSE, HOSTILE_RUN_FALSE, SHELL_FI];
+
+/// A ci.yml change runs the compiler-pack smoke only when the
+/// compiler-precise-hostile job block differs between base and head. Reading
+/// either side fails open: a missing ci.yml, a missing job, or an empty block
+/// runs the smoke.
+const HOSTILE_SMOKE_AFTER_FILTER: &[&str] = &[
+    HOSTILE_RUN_TRUE,
+    "exit 0",
+    SHELL_FI,
+    r#"if ! grep -qxF '.github/workflows/ci.yml' <<<"$changed"; then"#,
+    HOSTILE_RUN_FALSE,
+    "exit 0",
+    SHELL_FI,
+    "hostile_job() {",
+    "local workflow block",
+    r#"workflow="$(git show "$1:.github/workflows/ci.yml")" || return 1"#,
+    concat!(
+        r#"block="$(awk '$0 == "  compiler-precise-hostile:" { found = 1; print; next } "#,
+        r#"found && (/^  [^ #].*:$/ || /^[^ #]/) { exit } found { print }' <<<"$workflow")" "#,
+        "|| return 1",
+    ),
+    r#"[ -n "$block" ] || return 1"#,
+    r#"printf '%s\n' "$block""#,
+    "}",
+    r#"if ! base_job="$(hostile_job "${{ github.event.pull_request.base.sha }}")" ||"#,
+    r#"! head_job="$(hostile_job "${{ github.event.pull_request.head.sha }}")" ||"#,
+    r#"[ "$base_job" != "$head_job" ]; then"#,
+    HOSTILE_RUN_TRUE,
+    SHELL_ELSE,
+    HOSTILE_RUN_FALSE,
+    SHELL_FI,
+];
+
+/// Top-level ci.yml keys that would reach every job's steps. The compiler-pack
+/// smoke decision does not compare them, so ci.yml must not set them.
+const HOSTILE_UNCOMPARED_TOP_LEVEL_KEYS: [&str; 2] = ["env", "defaults"];
 
 fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Result<()> {
     let (_, step) = workflow_step_block(hostile, decision.header)?;
@@ -1224,16 +1458,17 @@ fn verify_hostile_decision_step(hostile: &str, decision: &HostileDecision) -> Re
             bail!("CI compiler-precise hostile step {id:?} must write {output:?}");
         }
     }
-    let branches: Vec<&str> = step
+    let after_filter: Vec<&str> = step
         .lines()
         .skip_while(|line| *line != filter_line)
         .skip(1)
-        .take(HOSTILE_FILTER_BRANCHES.len())
         .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
-    if branches != HOSTILE_FILTER_BRANCHES {
+    if after_filter != decision.after_filter {
         bail!(
-            "CI compiler-precise hostile step {id:?} must follow its filter with {HOSTILE_FILTER_BRANCHES:?}"
+            "CI compiler-precise hostile step {id:?} must follow its filter with {:?}",
+            decision.after_filter
         );
     }
     Ok(())
@@ -2589,7 +2824,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "@tamat-llc/depgraph",
         "@tamat-llc/depgraph-win32-x64",
         "npm Trusted Publishing",
-        "release-post-publish-evidence-v0.7.3.json",
+        "release-post-publish-evidence-v0.7.4.json",
         "stable-v0.5.0-packaged-smoke-v1",
         "| Packaged MCP smoke | `mcp-package-smoke-v3` |",
         "| Code-health finding | `depgraph-health-finding-v1` |",
@@ -2971,7 +3206,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "cargo xtask verify-compiler-pack-assets compiler-artifacts",
         "needs: [quality, compiler-precise-hostile, benchmark, package, verify-assets, compiler-pack, verify-compiler-packs]",
         "name: Bind the stable candidate to main, release/0.7, and exact Full CI",
-        "if [[ \"$GITHUB_REF_NAME\" == \"v0.7.3\" ]]",
+        "if [[ \"$GITHUB_REF_NAME\" == \"v0.7.4\" ]]",
         "api_source_tree=\"$(gh api",
         "test \"$source_tree\" = \"$api_source_tree\"",
         "DEPGRAPH_RELEASE_SOURCE_TREE=$source_tree",
@@ -3101,7 +3336,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
     }
     let ci_workflow = fs::read_to_string(root.join(".github/workflows/ci.yml"))?;
     for required in [
-        "needs: [rust, go, web]",
+        "needs: [rust, go, web, go-loader-scope]",
         "node --test npm/test/*.test.mjs scripts/tests/agent-dogfood.test.mjs scripts/tests/release-post-publish-canary.test.mjs",
         "node --test scripts/tests/benchmark.test.mjs scripts/tests/cache-hit-benchmark.test.mjs scripts/tests/agent-dogfood.test.mjs",
         "scripts/benchmark-mvp.sh",
@@ -3116,7 +3351,7 @@ pub(crate) fn verify_project_metadata(root: &Path) -> Result<()> {
         "DEPGRAPH_RUST_NO_CACHE_SCAN_LIMIT_MS: \"12000\"",
         "crates/depgraph-operation/|xtask/src/compiler_pack_release\\.rs|scripts/compiler-precise-hostile",
         "name: Exact Linux compiler-pack semantic release smoke",
-        "cargo xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
+        "target/debug/xtask compiler-pack-package --channel-manifest channel-rust-nightly-2026-07-17.toml",
     ] {
         if !ci_workflow.contains(required) {
             bail!("CI workflow is missing {required:?}");
@@ -3585,11 +3820,12 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        BENCHMARK_ONLY_INPUT, EXTRA_NATIVE_PACKAGES_INPUT, GithubActionsPolicy,
-        affected_scope_decide_step, extra_native_package_is_manual_and_bounded,
-        integration_job_pins_resource_policy, job_pins_intermediate_state_bound,
-        verify_ci_affected_scope_gates, verify_ci_affected_scope_script_text,
-        verify_compiler_precise_hostile_ci_gate, verify_workflow_policy_text, workflow_job_block,
+        BENCHMARK_ONLY_INPUT, CARGO_PROFILE_HASH_RUN, E2E_CACHE_JOBS, EXTRA_NATIVE_PACKAGES_INPUT,
+        GithubActionsPolicy, affected_scope_decide_step,
+        extra_native_package_is_manual_and_bounded, integration_job_pins_resource_policy,
+        job_pins_intermediate_state_bound, verify_ci_affected_scope_gates,
+        verify_ci_affected_scope_script_text, verify_compiler_precise_hostile_ci_gate,
+        verify_e2e_build_alignment, verify_workflow_policy_text, workflow_job_block,
         workflow_step_block,
     };
 
@@ -3676,8 +3912,7 @@ mod tests {
     #[test]
     fn integration_resource_policy_rejects_cache_and_disk_report_drift() {
         let ci = checked_in_ci_workflow();
-        let cache_key =
-            "          key: integration-${{ matrix.target }}-${{ hashFiles('Cargo.toml') }}\n";
+        let cache_key = "          key: integration-${{ matrix.target }}-${{ steps.cargo-profile.outputs.hash }}\n";
         assert_eq!(ci.matches(cache_key).count(), 1);
         let cache_on_failure = "          cache-on-failure: true\n";
         assert_eq!(
@@ -3687,6 +3922,13 @@ mod tests {
                 .count(),
             1
         );
+        // Other jobs (benchmark precedes integration) also keep
+        // `cache-on-failure: true`, so anchor the mutation on the comment that
+        // only the integration cache step carries.
+        let integration_cache_comment =
+            "          # when a gate fails so the rerun does not start from a cold cache.\n";
+        let integration_cache_on_failure = format!("{integration_cache_comment}{cache_on_failure}");
+        assert_eq!(ci.matches(&integration_cache_on_failure).count(), 1);
         let target_size_report =
             "          du -sh target 2>/dev/null || echo \"target directory is absent\"\n";
         for drift in [
@@ -3695,8 +3937,12 @@ mod tests {
             // for another `with:` entry drops the key without touching the
             // `rust` or `compiler-precise-hostile` cache steps.
             ci.replacen(cache_key, "          cache-all-crates: false\n", 1),
-            ci.replacen(cache_on_failure, "", 1),
-            ci.replacen(cache_on_failure, "          cache-on-failure: false\n", 1),
+            ci.replacen(&integration_cache_on_failure, integration_cache_comment, 1),
+            ci.replacen(
+                &integration_cache_on_failure,
+                &format!("{integration_cache_comment}          cache-on-failure: false\n"),
+                1,
+            ),
             ci.replacen(
                 "      - name: Report runner disk before the integration build\n        shell: bash\n        run: |\n          df -h\n",
                 "",
@@ -3754,6 +4000,79 @@ mod tests {
         }
     }
 
+    /// Mutations of one job's `cargo-profile` step: the step removed, its
+    /// `id` removed, its `run:` line changed, and the step moved after
+    /// rust-cache. Each mutation is applied to that job's block only.
+    fn cargo_profile_step_drifts(ci: &str, job_name: &str) -> Vec<(&'static str, String)> {
+        let job = workflow_job_block(ci, job_name).unwrap();
+        let steps = job.split("\n      - ").collect::<Vec<_>>();
+        let profile_steps = steps
+            .iter()
+            .filter(|step| {
+                step.starts_with("id: cargo-profile\n")
+                    || step.contains("\n        id: cargo-profile\n")
+            })
+            .collect::<Vec<_>>();
+        let [profile_step] = profile_steps.as_slice() else {
+            panic!("{job_name} must have exactly one cargo-profile step");
+        };
+        let profile_step = format!("\n      - {profile_step}");
+        let id_line = if profile_step.starts_with("\n      - id: cargo-profile\n") {
+            "\n      - id: cargo-profile\n"
+        } else {
+            "\n        id: cargo-profile\n"
+        };
+        let id_replacement = if id_line.starts_with("\n      - ") {
+            "\n      - name: Hash the Cargo.toml profiles\n"
+        } else {
+            "\n"
+        };
+        let cache_start = job
+            .find("\n      - uses: Swatinem/rust-cache@")
+            .expect("job has a rust-cache step");
+        let cache_end = job[cache_start + 1..]
+            .find("\n      - ")
+            .map_or(job.len(), |end| cache_start + 1 + end);
+        let cache_step = &job[cache_start..cache_end];
+        let mutate = |changed: String| ci.replace(job, &changed);
+        vec![
+            ("step removed", mutate(job.replacen(&profile_step, "", 1))),
+            ("id removed", mutate(job.replacen(id_line, id_replacement, 1))),
+            (
+                "run line changed",
+                mutate(job.replacen(
+                    CARGO_PROFILE_HASH_RUN,
+                    "        run: echo \"hash=$(git hash-object Cargo.toml)\" >> \"$GITHUB_OUTPUT\"",
+                    1,
+                )),
+            ),
+            (
+                "step moved after rust-cache",
+                mutate(
+                    job.replacen(&profile_step, "", 1)
+                        .replacen(cache_step, &format!("{cache_step}{profile_step}"), 1),
+                ),
+            ),
+        ]
+    }
+
+    #[test]
+    fn integration_resource_policy_rejects_cargo_profile_step_drift() {
+        let ci = checked_in_ci_workflow();
+        assert!(integration_job_pins_resource_policy(&ci).unwrap());
+        for (label, drift) in cargo_profile_step_drifts(&ci, "integration") {
+            assert_ne!(
+                drift, ci,
+                "{label}: drift mutation must change the workflow"
+            );
+            assert!(
+                !integration_job_pins_resource_policy(&drift)
+                    .expect("drifted integration job is extractable"),
+                "{label}: integration job without the cargo-profile step must be rejected"
+            );
+        }
+    }
+
     #[test]
     fn intermediate_state_bound_accepts_the_checked_in_workflow() {
         let ci = checked_in_ci_workflow();
@@ -3803,8 +4122,8 @@ mod tests {
     #[test]
     fn intermediate_state_bound_rejects_a_bound_moved_to_another_job() {
         let ci = checked_in_ci_workflow();
-        let web_job = "  web:\n    runs-on: ubuntu-24.04\n    defaults:\n";
-        assert_eq!(ci.matches(web_job).count(), 1);
+        let go_job = "  go:\n    runs-on: ubuntu-24.04\n    env:\n";
+        assert_eq!(ci.matches(go_job).count(), 1);
         let drift = ci
             .replacen(
                 WINDOWS_SMOKE_BOUND,
@@ -3812,15 +4131,14 @@ mod tests {
                 1,
             )
             .replacen(
-                web_job,
+                go_job,
                 concat!(
-                    "  web:\n",
+                    "  go:\n",
                     "    runs-on: ubuntu-24.04\n",
                     "    env:\n",
                     "      CARGO_INCREMENTAL: \"0\"\n",
                     "      CARGO_PROFILE_DEV_DEBUG: \"0\"\n",
                     "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n",
-                    "    defaults:\n",
                 ),
                 1,
             );
@@ -4032,6 +4350,234 @@ mod tests {
         }
     }
 
+    /// Replaces everything after the smoke step's path filter with `tail`.
+    fn replace_smoke_after_filter(step: &str, pattern: Option<&str>, tail: &str) -> String {
+        let prefix = "          if grep -qE '";
+        let (head, rest) = step
+            .split_once(prefix)
+            .expect("smoke step has a here-string path filter");
+        let (filter, _) = rest
+            .split_once('\n')
+            .expect("smoke step continues after its path filter");
+        let filter = match pattern {
+            Some(pattern) => format!("{pattern}' <<<\"$changed\"; then"),
+            None => filter.to_owned(),
+        };
+        format!("{head}{prefix}{filter}\n{tail}")
+    }
+
+    /// Dropping the job block comparison turns every ci.yml edit into a skip
+    /// when ci.yml stays out of the path filter. Putting ci.yml back into the
+    /// filter instead is the old behavior that ran the smoke for any job.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_smoke_step_without_the_job_comparison() {
+        let ci = checked_in_ci_workflow();
+        let branches = concat!(
+            "            echo \"run=true\" >> \"$GITHUB_OUTPUT\"\n",
+            "          else\n",
+            "            echo \"run=false\" >> \"$GITHUB_OUTPUT\"\n",
+            "          fi\n",
+        );
+        let with_ci_yml = concat!(
+            r"^(Cargo\.(toml|lock)|crates/depgraph-core/src/build\.rs|",
+            r"crates/depgraph-rustc-wrapper/|crates/depgraph-rustc-query/|",
+            r"xtask/src/compiler_pack_release\.rs|scripts/compiler-precise-hostile|",
+            r"\.github/workflows/ci\.yml)",
+        );
+        for pattern in [None, Some(with_ci_yml)] {
+            let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+                replace_smoke_after_filter(step, pattern, branches)
+            });
+            let hostile = workflow_job_block(&drift, "compiler-precise-hostile").unwrap();
+            assert!(
+                !hostile.contains("hostile_job"),
+                "the mutation must remove the job block comparison"
+            );
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "a smoke step without the job comparison (pattern {pattern:?}) must be rejected"
+            );
+        }
+    }
+
+    /// A ci.yml or job that cannot be read on either side must run the smoke.
+    /// Each mutation turns one such failure into run=false.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_smoke_comparison_that_skips_on_unreadable_blocks() {
+        let ci = checked_in_ci_workflow();
+        let fail_open = concat!(
+            "          if ! base_job=\"$(hostile_job \"${{ github.event.pull_request.base.sha }}\")\" ||\n",
+            "            ! head_job=\"$(hostile_job \"${{ github.event.pull_request.head.sha }}\")\" ||\n",
+            "            [ \"$base_job\" != \"$head_job\" ]; then\n",
+        );
+        let fail_closed = concat!(
+            "          if base_job=\"$(hostile_job \"${{ github.event.pull_request.base.sha }}\")\" &&\n",
+            "            head_job=\"$(hostile_job \"${{ github.event.pull_request.head.sha }}\")\" &&\n",
+            "            [ \"$base_job\" != \"$head_job\" ]; then\n",
+        );
+        // A missing ci.yml or job leaves the block empty, and an empty block
+        // on both sides would compare equal.
+        let mutations: [(&str, &str); 2] = [
+            (fail_open, fail_closed),
+            (
+                "            [ -n \"$block\" ] || return 1\n",
+                "            [ -n \"$block\" ] || return 0\n",
+            ),
+        ];
+        for (from, to) in mutations {
+            let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+                assert_eq!(step.matches(from).count(), 1, "{from:?} occurs once");
+                step.replacen(from, to, 1)
+            });
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "replacing {from:?} with {to:?} must be rejected"
+            );
+        }
+    }
+
+    /// A column-0 comment inside the job must not end the extracted block.
+    /// Otherwise base and head both cut there, and a change to a later step
+    /// compares equal and skips the smoke.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_job_block_end_that_stops_at_comments() {
+        let ci = checked_in_ci_workflow();
+        let from = "|| /^[^ #]/) { exit }";
+        let to = "|| /^[^ ]/) { exit }";
+        let drift = drift_hostile_step(&ci, HOSTILE_SMOKE_STEP_HEADER, |step| {
+            assert_eq!(step.matches(from).count(), 1, "{from:?} occurs once");
+            step.replacen(from, to, 1)
+        });
+        assert!(
+            verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+            "a job block end that stops at column-0 comments must be rejected"
+        );
+    }
+
+    /// The smoke decision compares only the compiler-precise-hostile job, so a
+    /// top-level env or defaults would change the smoke without running it.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_top_level_env_and_defaults() {
+        let ci = checked_in_ci_workflow();
+        assert_eq!(
+            ci.matches("\njobs:\n").count(),
+            1,
+            "ci.yml has one jobs key"
+        );
+        for top_level in [
+            "env:\n  RUSTFLAGS: -C debuginfo=0\n",
+            "defaults:\n  run:\n    shell: bash\n",
+            // Quoted keys and a space before the colon are the same YAML key.
+            "\"env\":\n  RUSTFLAGS: -C debuginfo=0\n",
+            "'env': { RUSTFLAGS: -C debuginfo=0 }\n",
+            "\"defaults\":\n  run:\n    shell: bash\n",
+            "'defaults':\n  run:\n    shell: bash\n",
+            "env :\n  RUSTFLAGS: -C debuginfo=0\n",
+        ] {
+            let drift = ci.replacen("\njobs:\n", &format!("\n{top_level}\njobs:\n"), 1);
+            assert_ne!(drift, ci, "drift mutation must change the workflow");
+            let error = verify_compiler_precise_hostile_ci_gate(&drift)
+                .expect_err("a top-level env or defaults must be rejected");
+            assert!(
+                error.to_string().contains("must not set a top-level"),
+                "a top-level {top_level:?} must be rejected by the top-level key check, got {error}"
+            );
+        }
+    }
+
+    const HOSTILE_XTASK_BUILD_STEP_HEADER: &str =
+        "      - name: Build xtask for the exact Linux compiler-pack smoke";
+    const HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER: &str =
+        "      - name: Exact Linux compiler-pack semantic release smoke";
+    const HOSTILE_SMOKE_RUSTFLAGS_LINE: &str = "          RUSTFLAGS: -C linker-features=-lld\n";
+    const HOSTILE_PREBUILT_SMOKE_RUN: &str =
+        "        run: target/debug/xtask compiler-pack-package";
+    const HOSTILE_XTASK_BUILD_RUN: &str = "        run: cargo build --locked -p xtask\n";
+
+    /// The smoke must run the prebuilt xtask under the -lld flag, and the
+    /// build before it must not carry the flag, or the dev build of xtask
+    /// misses every cached unit again.
+    #[test]
+    fn compiler_precise_hostile_gate_rejects_a_drifted_xtask_prebuild() {
+        let ci = checked_in_ci_workflow();
+        let hostile = workflow_job_block(&ci, "compiler-precise-hostile").unwrap();
+        let (_, build) = workflow_step_block(hostile, HOSTILE_XTASK_BUILD_STEP_HEADER).unwrap();
+        let (_, smoke) =
+            workflow_step_block(hostile, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER).unwrap();
+        assert_eq!(build.matches(HOSTILE_XTASK_BUILD_RUN).count(), 1);
+        assert_eq!(smoke.matches(HOSTILE_SMOKE_RUSTFLAGS_LINE).count(), 1);
+        assert_eq!(smoke.matches(HOSTILE_PREBUILT_SMOKE_RUN).count(), 1);
+
+        let job_level_rustflags = {
+            let bound = "      CARGO_PROFILE_TEST_DEBUG: \"0\"\n";
+            assert_eq!(hostile.matches(bound).count(), 1);
+            let changed = hostile.replacen(
+                bound,
+                &format!("{bound}      RUSTFLAGS: -C linker-features=-lld\n"),
+                1,
+            );
+            ci.replacen(hostile, &changed, 1)
+        };
+        let build_after_smoke =
+            drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                format!("{step}{build}")
+            })
+            .replacen(build, "", 1);
+        let drifts = [
+            (
+                "a removed build step",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |_| String::new()),
+            ),
+            (
+                "a build step under RUSTFLAGS",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_XTASK_BUILD_RUN,
+                        &format!(
+                            "        env:\n{HOSTILE_SMOKE_RUSTFLAGS_LINE}{HOSTILE_XTASK_BUILD_RUN}"
+                        ),
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a build step under another profile",
+                drift_hostile_step(&ci, HOSTILE_XTASK_BUILD_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_XTASK_BUILD_RUN,
+                        "        run: cargo build --locked --release -p xtask\n",
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a smoke that rebuilds xtask through cargo xtask",
+                drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                    step.replacen(
+                        HOSTILE_PREBUILT_SMOKE_RUN,
+                        "        run: cargo xtask compiler-pack-package",
+                        1,
+                    )
+                }),
+            ),
+            (
+                "a smoke without the -lld flag",
+                drift_hostile_step(&ci, HOSTILE_COMPILER_PACK_SMOKE_STEP_HEADER, |step| {
+                    step.replacen(HOSTILE_SMOKE_RUSTFLAGS_LINE, "", 1)
+                }),
+            ),
+            ("a build step after the smoke", build_after_smoke),
+            ("a job-level RUSTFLAGS", job_level_rustflags),
+        ];
+        for (label, drift) in drifts {
+            assert_ne!(drift, ci, "{label} must change the workflow");
+            assert!(
+                verify_compiler_precise_hostile_ci_gate(&drift).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
     const CHECKOUT_STEP: &str =
         "      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n";
     const DECIDE_GATE_LINE: &str = "        if: steps.decide.outputs.run == 'true'\n";
@@ -4089,6 +4635,54 @@ mod tests {
                 ci.replacen(
                     "  go:\n    runs-on: ubuntu-24.04\n",
                     "  go:\n    if: false\n    runs-on: ubuntu-24.04\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope job skipped as a whole",
+                ci.replacen(
+                    "  go-loader-scope:\n    runs-on: ubuntu-24.04\n",
+                    "  go-loader-scope:\n    if: false\n    runs-on: ubuntu-24.04\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope decides with the go scope",
+                ci.replacen(
+                    &affected_scope_decide_step("go-loader-scope", "web"),
+                    &affected_scope_decide_step("go-loader-scope", "go"),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope e2e ungated",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true'\n        id: go_loader_scope_e2e\n",
+                    "        id: go_loader_scope_e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "health-range e2e ungated",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    "        id: health_range_e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "health-range e2e drops the decision",
+                ci.replacen(
+                    "        if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    "        if: matrix.scenarios == 'fanout'\n        id: health_range_e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "web runs the fanout-only health-range gate",
+                ci.replacen(
+                    "      - if: steps.decide.outputs.run == 'true'\n        run: pnpm test\n",
+                    "      - if: steps.decide.outputs.run == 'true' && matrix.scenarios == 'fanout'\n        run: pnpm test\n",
                     1,
                 ),
             ),
@@ -4162,6 +4756,85 @@ mod tests {
                 verify_ci_affected_scope_gates(&drift).is_err(),
                 "{label}: drifted workflow must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn e2e_build_alignment_rejects_workflow_drift() {
+        let ci = checked_in_ci_workflow();
+        verify_e2e_build_alignment(&ci).unwrap();
+        let loader_job = "  go-loader-scope:\n    runs-on: ubuntu-24.04\n";
+        let loader_restore = "          shared-key: web-e2e-${{ steps.cargo-profile.outputs.hash }}\n          save-if: false\n";
+        let loader_gate =
+            "        run: cargo run --locked --profile e2e -p xtask -- go-loader-scope-e2e\n";
+        for (label, drift) in [
+            (
+                "go-loader-scope gains a job-level env",
+                ci.replacen(
+                    loader_job,
+                    &format!("{loader_job}    env:\n      CARGO_PROFILE_DEV_DEBUG: \"0\"\n"),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope restores a different key",
+                ci.replacen(
+                    loader_restore,
+                    &loader_restore.replacen("web-e2e-", "go-loader-", 1),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope key drops the profile hash",
+                ci.replacen(
+                    loader_restore,
+                    &loader_restore.replacen("-${{ steps.cargo-profile.outputs.hash }}", "", 1),
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope runs a gate through the dev-profile alias",
+                ci.replacen(
+                    "        run: cargo run --locked --profile e2e -p xtask -- health-range-e2e\n",
+                    "        run: cargo xtask health-range-e2e\n",
+                    1,
+                ),
+            ),
+            (
+                "go-loader-scope overrides the CLI profile",
+                ci.replacen(
+                    loader_gate,
+                    &format!("          DEPGRAPH_E2E_PROFILE: dev\n{loader_gate}"),
+                    1,
+                ),
+            ),
+        ] {
+            assert_ne!(
+                drift, ci,
+                "{label}: drift mutation must change the workflow"
+            );
+            assert!(
+                verify_e2e_build_alignment(&drift).is_err(),
+                "{label}: drifted workflow must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_build_alignment_rejects_cargo_profile_step_drift() {
+        let ci = checked_in_ci_workflow();
+        verify_e2e_build_alignment(&ci).unwrap();
+        for job_name in E2E_CACHE_JOBS {
+            for (label, drift) in cargo_profile_step_drifts(&ci, job_name) {
+                assert_ne!(
+                    drift, ci,
+                    "{job_name} {label}: drift mutation must change the workflow"
+                );
+                assert!(
+                    verify_e2e_build_alignment(&drift).is_err(),
+                    "{job_name} {label}: drifted workflow must be rejected"
+                );
+            }
         }
     }
 

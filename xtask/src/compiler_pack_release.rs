@@ -3,7 +3,7 @@ use std::{
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus},
     time::Instant,
 };
 
@@ -201,7 +201,7 @@ pub(crate) fn package(
     let channel: toml::Value = toml::from_str(&fs::read_to_string(channel_manifest_path)?)
         .context("pinned Rust channel manifest is invalid")?;
 
-    build_release_binaries()?;
+    let driver_build = build_release_binaries()?;
     let sysroot = pinned_sysroot()?;
     let name = format!("depgraph-compiler-pack-{VERSION}-{target}");
     fs::create_dir_all(output_directory)?;
@@ -242,6 +242,9 @@ pub(crate) fn package(
     let requirement_path = output_directory.join(format!("{name}.requirement.json"));
     write_pretty_json(&requirement_path, &requirement)?;
 
+    // Wait before the semantic clock starts: the budget has always measured
+    // extraction, verification, and the fixture with the driver already built.
+    driver_build.wait()?;
     let semantic_start = Instant::now();
     let extracted = TempDir::new()?;
     extract_compiler_pack_archive(&archive, extracted.path())?;
@@ -685,7 +688,12 @@ fn validate_channel_manifest(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_release_binaries() -> Result<()> {
+/// Builds the pack's nightly binaries and starts the stable semantic fixture
+/// driver in the background. Only the nightly wrapper and query enter the
+/// pack, so staging and archiving proceed while `depgraph-cli` and
+/// `depgraph-rust-worker` compile; `package` waits for them before the
+/// semantic fixture runs.
+fn build_release_binaries() -> Result<BackgroundBuild> {
     run(Command::new("rustup").args([
         "run",
         COMPILER_PACK_TOOLCHAIN_CHANNEL,
@@ -696,6 +704,23 @@ fn build_release_binaries() -> Result<()> {
         "-p",
         "depgraph-rustc-wrapper",
     ]))?;
+    // The wrapper and the driver share the workspace target directory, so
+    // Cargo's build directory lock serializes them. Starting the driver first
+    // would hold staging behind the multi-minute LTO build; finishing the
+    // short wrapper build first lets staging start as soon as the query, which
+    // uses its own target directory, is built alongside the driver.
+    let driver = BackgroundBuild::spawn(
+        "semantic fixture driver",
+        Command::new("cargo").args([
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "depgraph-cli",
+            "-p",
+            "depgraph-rust-worker",
+        ]),
+    )?;
     run(Command::new("rustup").args([
         "run",
         COMPILER_PACK_TOOLCHAIN_CHANNEL,
@@ -708,15 +733,64 @@ fn build_release_binaries() -> Result<()> {
         "--release",
         "--locked",
     ]))?;
-    run(Command::new("cargo").args([
-        "build",
-        "--release",
-        "--locked",
-        "-p",
-        "depgraph-cli",
-        "-p",
-        "depgraph-rust-worker",
-    ]))
+    Ok(driver)
+}
+
+/// A child build that runs while packaging continues. Its output goes to the
+/// inherited streams, so failures are reported with `label` and the command.
+/// Dropping it without `wait` kills and reaps the child, so an early packaging
+/// error does not leave Cargo running.
+struct BackgroundBuild {
+    label: &'static str,
+    display: String,
+    child: Option<Child>,
+}
+
+impl BackgroundBuild {
+    fn spawn(label: &'static str, command: &mut Command) -> Result<Self> {
+        let display = format!("{command:?}");
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to start {label} build {display}"))?;
+        eprintln!("started {label} build in the background: {display}");
+        Ok(Self {
+            label,
+            display,
+            child: Some(child),
+        })
+    }
+
+    fn wait(mut self) -> Result<()> {
+        let label = self.label;
+        let display = std::mem::take(&mut self.display);
+        let mut child = self
+            .child
+            .take()
+            .context("background build was already reaped")?;
+        eprintln!("waiting for {label} build: {display}");
+        let status = child
+            .wait()
+            .with_context(|| format!("failed to wait for {label} build {display}"))?;
+        if !status.success() {
+            bail!("{label} build {display} exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BackgroundBuild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            eprintln!("stopping {} build: {}", self.label, self.display);
+            let _ = terminate(&mut child);
+        }
+    }
+}
+
+fn terminate(child: &mut Child) -> io::Result<ExitStatus> {
+    // `kill` fails once the child has exited on its own; `wait` still reaps it.
+    let _ = child.kill();
+    child.wait()
 }
 
 fn pinned_sysroot() -> Result<PathBuf> {
@@ -2311,6 +2385,53 @@ mod tests {
 
         assert_eq!(command.get_program(), executable.canonicalize()?);
         assert_eq!(command.get_current_dir(), Some(repository.path()));
+        Ok(())
+    }
+
+    fn stdin_blocked_rustc() -> Command {
+        // `rustc -` reads the crate from stdin, so it runs until stdin closes
+        // or the process is killed.
+        let mut command = Command::new("rustc");
+        command
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    #[test]
+    fn background_build_wait_reports_the_child_exit_status() -> Result<()> {
+        let mut success = Command::new("rustc");
+        success.arg("--version").stdout(std::process::Stdio::null());
+        BackgroundBuild::spawn("passing fixture", &mut success)?.wait()?;
+
+        let mut failure = Command::new("rustc");
+        failure
+            .arg("--depgraph-unknown-flag")
+            .stderr(std::process::Stdio::null());
+        let error = BackgroundBuild::spawn("failing fixture", &mut failure)?
+            .wait()
+            .expect_err("a failing background build must fail the wait");
+        assert!(error.to_string().contains("failing fixture build"));
+        Ok(())
+    }
+
+    #[test]
+    fn terminating_a_running_build_kills_and_reaps_it() -> Result<()> {
+        let mut child = stdin_blocked_rustc().spawn()?;
+        assert!(child.try_wait()?.is_none());
+
+        let status = terminate(&mut child)?;
+
+        // `wait` closes stdin before waiting, so a rustc that was not killed
+        // would also exit unsuccessfully; on Unix the signal proves the kill.
+        assert!(!status.success());
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9)
+        );
         Ok(())
     }
 }

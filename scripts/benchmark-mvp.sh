@@ -67,7 +67,16 @@ incremental_poll_limit="$((incremental_timeout_seconds * 20))"
 
 cd "$root"
 node scripts/benchmark-fixture.mjs generate "$fixture" "$file_count" > "$raw/fixture.json"
-cargo xtask build --release
+# Build only what the benchmark runs: the CLI, the Rust worker it finds next to
+# itself in target/release, and the operation runner and rustc wrapper that
+# ship beside them. depgraph-mcp and the schema generators are skipped.
+# workspace-hack keeps dependency features identical to a workspace build, so
+# the measured binaries match `cargo xtask build --release`.
+cargo xtask build --release \
+  -p depgraph-cli \
+  -p depgraph-rust-worker \
+  -p depgraph-operation \
+  -p depgraph-rustc-wrapper
 
 now_ms() {
   node -e 'process.stdout.write(String(Date.now()))'

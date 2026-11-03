@@ -30,13 +30,13 @@ use std::{
     time::Duration,
 };
 
+use depgraph_agent_contract::{
+    AgentCapability, CapabilityProfile, LogicalRepositoryId, MAX_TASK_TTL_MS, OperationId,
+    canonical_json_bytes,
+};
 use depgraph_core::{
     DepgraphServiceConfig, RUNTIME_TRACE_MAX_EVENTS,
     service::{DEFAULT_SERVICE_MAX_INLINE_INPUT_BYTES, RepositoryRootSeal},
-};
-use depgraph_mcp_tools::{
-    AgentCapability, CapabilityProfile, LogicalRepositoryId, MAX_TASK_TTL_MS, OperationId,
-    canonical_json_bytes,
 };
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, limits::Limit,
@@ -50,7 +50,7 @@ pub const JOURNAL_SCHEMA_VERSION: i64 = 6;
 /// Portable durable-operation record and recovery contract shipped to Agent hosts.
 pub const OPERATION_CONTRACT_VERSION: &str = "depgraph-operation-v2";
 const BOUNDED_SCAN_JOURNAL_SCHEMA_VERSION: i64 = 5;
-const UNBOUNDED_SCAN_DEADLINE_MS: i64 = depgraph_mcp_tools::UNBOUNDED_SCAN_DEADLINE_MS as i64;
+const UNBOUNDED_SCAN_DEADLINE_MS: i64 = depgraph_agent_contract::UNBOUNDED_SCAN_DEADLINE_MS as i64;
 const LEGACY_JOURNAL_SCHEMA_VERSION: i64 = 1;
 const ROOT_BOUND_JOURNAL_SCHEMA_VERSION: i64 = 2;
 const COMPLETION_INTENT_JOURNAL_SCHEMA_VERSION: i64 = 3;
@@ -3116,7 +3116,7 @@ impl OperationJournal {
 /// Lifecycle callers cannot inject repository or capability authority:
 ///
 /// ```compile_fail
-/// use depgraph_mcp_tools::{LogicalRepositoryId, OperationId};
+/// use depgraph_agent_contract::{LogicalRepositoryId, OperationId};
 /// use depgraph_operation::{CapabilitySet, OperationManager};
 ///
 /// fn inject_authority(

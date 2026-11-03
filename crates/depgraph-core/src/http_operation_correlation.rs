@@ -804,8 +804,10 @@ mod tests {
     use crate::{
         RuntimeHttpObservation, RuntimeHttpOperationFormat, RuntimeTraceEnvironment,
         RuntimeTraceProfile, RuntimeTraceProfileMatch, RuntimeTraceRedaction,
-        RuntimeTraceRepository, RuntimeTraceSession, RuntimeTraceSummary, scan_graphql_repository,
-        scan_openapi_repository, scan_protobuf_repository,
+        RuntimeTraceRepository, RuntimeTraceSession, RuntimeTraceSummary,
+    };
+    use depgraph_contract_scan::{
+        scan_graphql_repository, scan_openapi_repository, scan_protobuf_repository,
     };
 
     const PARENT_PROFILE: &str =

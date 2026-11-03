@@ -69,7 +69,7 @@ semanticsを変更してはならない。
 Issue [#295](https://github.com/TamaT-LLC/depgraph-cli/issues/295)は、このStage 1
 境界のうち、共通request/envelope、closed Agent DTO、typed error、page/cursor、
 portable operation resultとTasks result view、JSON Schema生成を
-`crates/depgraph-mcp-tools`へ実装する。MCP transport、tool handler、operation journal、
+`crates/depgraph-agent-contract`へ実装する。MCP transport、tool handler、operation journal、
 runner、rmcp adapterは同issueのcontract crateへ含めず、後続taskの責務とする。
 
 生成JSON Schemaはclosed field・tag・scalar boundを検査するstructural preflightであり、
@@ -77,7 +77,7 @@ Schema単独の受理をauthorizationやrepository/store accessの根拠にし�
 `returned_items == items.len()`、totalとの大小、source span順序、task時刻/expiryの算術、
 `RepositoryRelativePath`や`AgentLocator`を含むUTF-8 byte長はJSON Schema 2020-12で完全には
 表現できないため、consumerは必ず
-`depgraph-mcp-tools`でDeserializeするか同等のsemantic validationを実施する。
+`depgraph-agent-contract`でDeserializeするか同等のsemantic validationを実施する。
 Rust constructor/Deserializerがこれらのauthoritativeなfail-closed境界であり、
 schema/Serde差分は回帰testで意図的に固定する。
 
@@ -366,7 +366,7 @@ Issue #295の実装はQ-002 Option Aを次の型境界へ写像する。
 | bounded, portable disclosure | Agent DTOはsummary fieldだけを持ち、arbitrary metadata/properties、raw evidence detail、absolute root/store pathを受理しない。repository path scalarはportable relative pathだけを受理する |
 | typed failures and pagination | error codeからcategoryを導出し、wire上のcategory偽装を拒否する。page item/byte bounds、returned count、total count、complete/cursor関係をconstructorとdeserializerで検証する |
 | deterministic schema artifact | `generate-schema`はcanonical JSONを末尾改行なしで出力し、`schemas/depgraph-mcp-tools-v1.schema.json`とのbyte equality、再実行間のbytes/SHA-256、全objectの`additionalProperties: false`をintegration testで固定する |
-| golden evidence | `crates/depgraph-mcp-tools/tests/fixtures`のcanonical contract sampleとschema digestをexact comparisonする |
+| golden evidence | `crates/depgraph-agent-contract/tests/fixtures`のcanonical contract sampleとschema digestをexact comparisonする |
 
 このevidenceはIssue #295のcontract/schema scopeだけを証明する。Q-002で定義した
 protocol negotiation、journal durability、disconnect/restart recovery、Tasks handlerの

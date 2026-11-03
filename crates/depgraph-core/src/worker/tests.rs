@@ -2338,6 +2338,77 @@ fn packaged_layout_without_manifest_is_detected() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn required_release_manifest_denies_a_lookup_outside_the_packaged_layout() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    // A flat directory is not a packaged layout, so only the process policy
+    // can make the missing manifest a violation.
+    assert!(!looks_like_packaged_layout(temp.path()));
+    deny_missing_release_manifest(false, temp.path())?;
+    let error = deny_missing_release_manifest(true, temp.path())
+        .expect_err("a required release manifest must deny the lookup");
+    assert!(
+        error
+            .to_string()
+            .contains("packaged installation is missing release-manifest.json"),
+        "{error:#}"
+    );
+    assert!(is_security_error(&error.to_string()));
+
+    let bin = temp.path().join("bin");
+    std::fs::create_dir_all(&bin)?;
+    std::fs::create_dir_all(temp.path().join("libexec"))?;
+    let error = deny_missing_release_manifest(false, &bin)
+        .expect_err("a packaged layout must deny the lookup without the policy");
+    assert!(is_security_error(&error.to_string()), "{error:#}");
+    Ok(())
+}
+
+#[test]
+fn required_release_manifest_stops_worker_and_web_runtime_lookups() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let executable = temp.path().join(executable_name("depgraph"));
+    std::fs::write(&executable, b"")?;
+    assert!(release_manifest_path(temp.path()).is_none());
+
+    for adapter in [AdapterKind::Rust, AdapterKind::Go, AdapterKind::Web] {
+        let error = locate_worker_for_executable_with_policy(adapter, &executable, true)
+            .expect_err("a required release manifest must stop the worker lookup");
+        assert!(
+            error
+                .to_string()
+                .contains("packaged installation is missing release-manifest.json"),
+            "{}: {error:#}",
+            adapter.name()
+        );
+    }
+    let error = locate_web_build_runtime_for_executable_with_policy(
+        "depgraph-web-build-evidence.mjs",
+        Path::new("/outside-project"),
+        &executable,
+        true,
+    )
+    .expect_err("a required release manifest must stop the Web runtime lookup");
+    assert!(
+        error
+            .to_string()
+            .contains("packaged installation is missing release-manifest.json"),
+        "{error:#}"
+    );
+
+    // Without the policy the same executable takes the development lookup,
+    // which never reports the missing manifest as a policy violation.
+    let message = locate_worker_for_executable_with_policy(AdapterKind::Go, &executable, false)
+        .err()
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_default();
+    assert!(
+        !message.contains("missing release-manifest.json"),
+        "{message}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn external_executable_symlink_uses_the_attested_release_layout() -> Result<()> {

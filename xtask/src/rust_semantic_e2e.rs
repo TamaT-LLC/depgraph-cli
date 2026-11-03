@@ -8,6 +8,8 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 
+use crate::timed;
+
 const RUST_ANALYZER_VERSION: &str = "0.0.330";
 const RUST_ANALYZER_REVISION: &str = "8954b66d43225e62c92e8bbcc8500191b5cceb1e";
 const SALSA_VERSION: &str = "0.26.1";
@@ -122,8 +124,20 @@ pub(crate) fn verify(
     };
     let first_store = root.path().join("semantic-one.db");
     let second_store = root.path().join("semantic-two.db");
-    let first_scan = runner.scan(&first_store, &first_fixture)?;
-    let second_scan = runner.scan(&second_store, &second_fixture)?;
+    // The two checkouts and stores are disjoint, so the scans run at once.
+    // Each result is checked in the original order, so the first scan's
+    // failure is still the one reported when both fail.
+    let (first_scan, second_scan) = timed("rust-semantic/scans", || {
+        let (first, second) = std::thread::scope(|scope| {
+            let second = scope.spawn(|| runner.scan(&second_store, &second_fixture));
+            let first = runner.scan(&first_store, &first_fixture);
+            let second = second
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (first, second)
+        });
+        Ok((first?, second?))
+    })?;
     assert_semantic_scan(&first_scan, expect_attested_sysroot)?;
     assert_semantic_scan(&second_scan, expect_attested_sysroot)?;
     ensure!(

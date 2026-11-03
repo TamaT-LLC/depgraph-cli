@@ -14,11 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    BuildExecutionOutcome,
-    build::BuildOutcomeKind,
-    ffi::{FFI_CAPABILITY, FFI_FORMAT_VERSION},
-};
+use depgraph_protocol::{FFI_CAPABILITY, FFI_FORMAT_VERSION};
+
+use crate::{BuildExecutionOutcome, build::BuildOutcomeKind};
 
 pub const FFI_LINK_OBSERVATION_SCHEMA_VERSION: &str = "ffi-link-observation-v1";
 pub const FFI_LINK_OBSERVATION_SCHEMA_PATH: &str =
@@ -813,7 +811,9 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use crate::{BuildAudit, BuildExecutionOutcome, NetworkIsolation, ffi::scan_ffi_repository};
+    use depgraph_contract_scan::scan_ffi_repository;
+
+    use crate::{BuildAudit, BuildExecutionOutcome, NetworkIsolation};
 
     use super::*;
 

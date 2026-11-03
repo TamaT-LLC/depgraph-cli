@@ -12,6 +12,12 @@ sha2 = "0.10"
 thiserror = "2.0"
 workspace-hack = { version = "0.7", path = "../../workspace-hack" }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 jsonschema = { version = "0.47", default-features = false }
 pretty_assertions = "1.4"

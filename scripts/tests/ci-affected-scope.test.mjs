@@ -47,7 +47,7 @@ const CLASSIFY_CASES = [
   [["crates/depgraph-core/src/lib.rs"], false, true],
   [["crates/depgraph-core/tests/fixtures/health/issue437-go.ndjson"], true, true],
   [["crates/depgraph-mcp/src/main.rs"], false, false],
-  [["crates/depgraph-mcp-tools/src/lib.rs"], false, true],
+  [["crates/depgraph-agent-contract/src/lib.rs"], false, true],
   [["workers/rust/src/lib.rs"], false, false],
   [["npm/depgraph/package.json"], false, false],
   [["schemas/x.json"], false, true],

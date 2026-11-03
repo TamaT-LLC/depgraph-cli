@@ -5,6 +5,7 @@
 //! top level. Unknown optional fields are intentionally accepted for forward
 //! compatibility; unknown event names and malformed required fields are not.
 
+mod bounded_read;
 mod compact_evidence;
 mod condition;
 mod cross_language;
@@ -14,6 +15,7 @@ mod model;
 mod stable_id;
 mod validator;
 
+pub use bounded_read::{BoundedReadError, read_bounded_repository_file};
 pub use compact_evidence::{
     COMPACT_EVIDENCE_ENCODING_V1, COMPACT_EVIDENCE_REQUEST_ENV, CompactEvidenceDecoder,
     EVIDENCE_ENCODING_PROPERTY, EVIDENCE_PROPERTY_DEFAULTS_PROPERTY, EvidencePropertyDefaults,
@@ -27,7 +29,10 @@ pub use cross_language::{
     CrossLanguageAdapterDelta, CrossLanguageCanonicalIdentity, CrossLanguageCapabilityStatus,
     CrossLanguageCompletenessLedger, CrossLanguageEvidenceProperties, CrossLanguageFormat,
     CrossLanguageFormatCoverage, CrossLanguageMappingKind, CrossLanguageNodeKind,
-    CrossLanguageProfileIdentity, CrossLanguageRelationKind, build_cross_language_edge_id,
+    CrossLanguageProfileIdentity, CrossLanguageRelationKind, FFI_CAPABILITY, FFI_FORMAT_VERSION,
+    GRAPHQL_CAPABILITY, GRAPHQL_REPOSITORY_MAPPING_CAPABILITY, OPENAPI_CAPABILITY,
+    OPENAPI_GENERATED_MAPPING_SCHEMA_VERSION, PROTOBUF_CAPABILITY,
+    PROTOBUF_GENERATED_MAPPING_SCHEMA_VERSION, build_cross_language_edge_id,
     build_cross_language_site_id, cross_language_graph_digest, cross_language_node_id,
     cross_language_profile_id, has_cross_language_claim, validate_cross_language_adapter_delta,
     validate_cross_language_contract, validate_cross_language_graph,
