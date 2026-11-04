@@ -37,6 +37,11 @@
       "reviewed_upstream_ref": "v7"
     },
     {
+      "identity": "dependabot/fetch-metadata",
+      "sha": "25dd0e34f4fe68f24cc83900b1fe3fe149efef98",
+      "reviewed_upstream_ref": "v3"
+    },
+    {
       "identity": "pnpm/action-setup",
       "sha": "0977fd99725f1db4007ccb2928dbb4e90d06cc86",
       "reviewed_upstream_ref": "v6"
